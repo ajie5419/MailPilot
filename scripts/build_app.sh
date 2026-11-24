@@ -3,7 +3,35 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="MailPilot"
-APP_VERSION="${APP_VERSION:-0.2.0}"
+
+resolve_app_version() {
+  if [[ -n "${APP_VERSION:-}" ]]; then
+    printf '%s\n' "$APP_VERSION"
+    return
+  fi
+  local desc
+  if desc="$(git -C "$ROOT_DIR" describe --tags --long --match 'v[0-9]*' 2>/dev/null)"; then
+    local rest="${desc%-g*}"
+    local commits="${rest##*-}"
+    local tag="${rest%-*}"
+    local base="${tag#v}"
+    if [[ "$commits" == "0" ]]; then
+      printf '%s\n' "$base"
+    else
+      printf '%s.%s\n' "$base" "$commits"
+    fi
+    return
+  fi
+  local count
+  if count="$(git -C "$ROOT_DIR" rev-list --count HEAD 2>/dev/null)"; then
+    printf '0.0.%s\n' "$count"
+    return
+  fi
+  printf '0.2.0\n'
+}
+
+APP_VERSION="$(resolve_app_version)"
+BUILD_VERSION="$(date +%Y%m%d%H%M)"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/${APP_NAME}.app"
 STAGING_BUNDLE="$DIST_DIR/.${APP_NAME}.staging.app"
@@ -17,7 +45,7 @@ mkdir -p "$MODULE_CACHE" "$DIST_DIR"
 rm -rf "$STAGING_BUNDLE"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
-echo "Compiling ${APP_NAME} with swiftc..."
+echo "Compiling ${APP_NAME} ${APP_VERSION} (build ${BUILD_VERSION}) with swiftc..."
 cd "$ROOT_DIR"
 swiftc \
   -O \
@@ -36,7 +64,6 @@ swiftc \
   Sources/MailPilotCore/*.swift \
   Sources/MailPilotApp/*.swift
 
-BUILD_VERSION="$(date +%Y%m%d%H%M)"
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
