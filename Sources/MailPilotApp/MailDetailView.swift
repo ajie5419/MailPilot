@@ -8,6 +8,12 @@ import WebKit
 
 struct MailDetailView: View {
     @ObservedObject var viewModel: AppViewModel
+    @ObservedObject var ai: AIAssistantController
+
+    init(viewModel: AppViewModel) {
+        self._viewModel = ObservedObject(wrappedValue: viewModel)
+        self._ai = ObservedObject(wrappedValue: viewModel.ai)
+    }
 
     var body: some View {
         if let message = viewModel.selectedMessage {
@@ -18,7 +24,7 @@ struct MailDetailView: View {
                 inlineAIActionBar
                 Divider()
 
-                if viewModel.showInlineSummary {
+                if ai.showInlineSummary {
                     inlineSummaryCard
                     Divider()
                 }
@@ -312,25 +318,25 @@ struct MailDetailView: View {
     private var inlineAIActionBar: some View {
         HStack(spacing: 8) {
             Button {
-                viewModel.summarizeSelectedEmailInline()
+                ai.summarizeSelectedEmailInline()
             } label: {
                 Label(
-                    viewModel.isInlineSummarizing ? "总结中..." : "总结邮件",
+                    ai.isInlineSummarizing ? "总结中..." : "总结邮件",
                     systemImage: "sparkles"
                 )
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(viewModel.isLoadingBody || viewModel.isInlineSummarizing)
+            .disabled(viewModel.isLoadingBody || ai.isInlineSummarizing)
 
             Button {
-                viewModel.generateReplyDraft(tone: "专业简洁")
+                ai.generateReplyDraft(tone: "专业简洁")
             } label: {
                 Label("起草回复", systemImage: "square.and.pencil")
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(viewModel.isLoadingBody || viewModel.isAIThinking)
+            .disabled(viewModel.isLoadingBody || ai.isAIThinking)
 
             Button {
                 viewModel.showAIPanel.toggle()
@@ -349,7 +355,7 @@ struct MailDetailView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "cpu")
                         .font(.caption2)
-                    Text("\(viewModel.activeAIBadge) · \(viewModel.activeModelDisplayName)")
+                    Text("\(ai.activeAIBadge) · \(ai.activeModelDisplayName)")
                         .font(.caption)
                 }
                 .foregroundStyle(.secondary)
@@ -372,15 +378,15 @@ struct MailDetailView: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(Color.accentColor)
 
-                if viewModel.isInlineSummarizing {
+                if ai.isInlineSummarizing {
                     ProgressView().controlSize(.mini)
                 }
 
                 Spacer()
 
-                if !viewModel.inlineSummaryText.isEmpty {
+                if !ai.inlineSummaryText.isEmpty {
                     Button {
-                        viewModel.copyToClipboard(viewModel.inlineSummaryText, label: "已复制摘要")
+                        viewModel.copyToClipboard(ai.inlineSummaryText, label: "已复制摘要")
                     } label: {
                         Image(systemName: "doc.on.doc")
                             .font(.caption)
@@ -389,7 +395,7 @@ struct MailDetailView: View {
                     .help("复制摘要")
 
                     Button {
-                        viewModel.continueInlineSummaryInDrawer()
+                        ai.continueInlineSummaryInDrawer()
                     } label: {
                         Text("继续追问")
                             .font(.caption)
@@ -399,7 +405,7 @@ struct MailDetailView: View {
                 }
 
                 Button {
-                    viewModel.showInlineSummary = false
+                    ai.showInlineSummary = false
                 } label: {
                     Image(systemName: "xmark")
                         .font(.caption2)
@@ -409,12 +415,12 @@ struct MailDetailView: View {
                 .help("收起摘要")
             }
 
-            if viewModel.inlineSummaryText.isEmpty && viewModel.isInlineSummarizing {
+            if ai.inlineSummaryText.isEmpty && ai.isInlineSummarizing {
                 Text("正在生成邮件摘要...")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             } else {
-                MarkdownBlockView(text: viewModel.inlineSummaryText)
+                MarkdownBlockView(text: ai.inlineSummaryText)
             }
         }
         .padding(14)

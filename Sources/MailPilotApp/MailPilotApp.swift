@@ -115,23 +115,11 @@ struct MailPilotApp: App {
 
     var body: some Scene {
         WindowGroup("MailPilot") {
-            ContentView(viewModel: viewModel)
-                .frame(
-                    minWidth: viewModel.accessError != nil ? 460 : 880,
-                    minHeight: viewModel.accessError != nil ? 450 : 560
-                )
-                .onAppear {
-                    configureMainWindow(isOnboarding: viewModel.accessError != nil, animate: false)
-                }
-                .onChange(of: viewModel.accessError == nil) { _, isAuthorized in
-                    configureMainWindow(isOnboarding: !isAuthorized, animate: true)
-                }
-                .sheet(isPresented: $viewModel.showSettings) {
-                    SettingsSheetContainer(viewModel: viewModel)
-                }
-                .sheet(isPresented: $viewModel.showComposeSheet) {
-                    ComposeMailSheet(viewModel: viewModel)
-                }
+            MainWindowRoot(
+                viewModel: viewModel,
+                compose: viewModel.compose,
+                configureMainWindow: configureMainWindow
+            )
         }
         .defaultSize(width: 1120, height: 700)
         .commands {
@@ -228,6 +216,32 @@ struct MailPilotApp: App {
                 window.center()
             }
         }
+    }
+}
+
+private struct MainWindowRoot: View {
+    @ObservedObject var viewModel: AppViewModel
+    @ObservedObject var compose: ComposeCoordinator
+    let configureMainWindow: @MainActor (Bool, Bool) -> Void
+
+    var body: some View {
+        ContentView(viewModel: viewModel)
+            .frame(
+                minWidth: viewModel.accessError != nil ? 460 : 880,
+                minHeight: viewModel.accessError != nil ? 450 : 560
+            )
+            .onAppear {
+                configureMainWindow(viewModel.accessError != nil, false)
+            }
+            .onChange(of: viewModel.accessError == nil) { _, isAuthorized in
+                configureMainWindow(!isAuthorized, true)
+            }
+            .sheet(isPresented: $viewModel.showSettings) {
+                SettingsSheetContainer(viewModel: viewModel)
+            }
+            .sheet(isPresented: $compose.isPresented) {
+                ComposeMailSheet(viewModel: viewModel)
+            }
     }
 }
 

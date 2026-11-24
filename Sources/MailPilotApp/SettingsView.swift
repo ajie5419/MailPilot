@@ -5,6 +5,14 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var viewModel: AppViewModel
+    @ObservedObject var ai: AIAssistantController
+    @ObservedObject var bodyIndex: BodyIndexCoordinator
+
+    init(viewModel: AppViewModel) {
+        self._viewModel = ObservedObject(wrappedValue: viewModel)
+        self._ai = ObservedObject(wrappedValue: viewModel.ai)
+        self._bodyIndex = ObservedObject(wrappedValue: viewModel.bodyIndex)
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -74,7 +82,7 @@ struct SettingsView: View {
             .background(.background)
         }
         .onAppear {
-            viewModel.refreshAuthStatuses()
+            ai.refreshAuthStatuses()
             viewModel.refreshNotificationStatus()
         }
         .sheet(isPresented: $viewModel.showIconPickerSheet) {
@@ -116,11 +124,11 @@ struct SettingsView: View {
                     subtitle: "Ollama / DeepSeek"
                 )
             }
-            .disabled(viewModel.isChatGPTSigningIn || viewModel.isChatGPTSigningOut || viewModel.isTestingChatGPT || viewModel.isAIThinking)
+            .disabled(ai.isChatGPTSigningIn || ai.isChatGPTSigningOut || ai.isTestingChatGPT || ai.isAIThinking)
 
             // Active Mode Configuration Card
             settingsCard {
-                switch viewModel.aiConfig.authMode {
+                switch ai.aiConfig.authMode {
                 case .chatGPT:
                     chatGPTConfigCardBody
                 case .subscriptionCLI:
@@ -134,7 +142,7 @@ struct SettingsView: View {
 
             // Privacy Card
             settingsCard {
-                Toggle(isOn: $viewModel.aiConfig.maskSensitiveData) {
+                Toggle(isOn: $ai.aiConfig.maskSensitiveData) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("发送前本地隐私脱敏")
                             .font(.callout.weight(.medium))
@@ -149,9 +157,9 @@ struct SettingsView: View {
     }
 
     private var chatGPTConfigCardBody: some View {
-        let isSignedIn = viewModel.chatGPTAccount?.signedIn == true
-        let isPlanEnabled = viewModel.chatGPTAccount?.planEnabled == true
-        let isBusy = viewModel.isChatGPTSigningIn || viewModel.isChatGPTSigningOut || viewModel.isTestingChatGPT || viewModel.isAIThinking
+        let isSignedIn = ai.chatGPTAccount?.signedIn == true
+        let isPlanEnabled = ai.chatGPTAccount?.planEnabled == true
+        let isBusy = ai.isChatGPTSigningIn || ai.isChatGPTSigningOut || ai.isTestingChatGPT || ai.isAIThinking
 
         return VStack(alignment: .leading, spacing: 14) {
             // Header row: Title + concise status pill + usage link
@@ -198,17 +206,17 @@ struct SettingsView: View {
 
             // Account section
             VStack(alignment: .leading, spacing: 10) {
-                if !viewModel.chatGPTAccounts.isEmpty {
+                if !ai.chatGPTAccounts.isEmpty {
                     HStack(spacing: 10) {
                         Text("账号")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .frame(width: 36, alignment: .leading)
                         Picker("", selection: Binding(
-                            get: { viewModel.chatGPTAccount?.id ?? "" },
-                            set: { viewModel.selectChatGPTAccount($0) }
+                            get: { ai.chatGPTAccount?.id ?? "" },
+                            set: { ai.selectChatGPTAccount($0) }
                         )) {
-                            ForEach(viewModel.chatGPTAccounts) { account in
+                            ForEach(ai.chatGPTAccounts) { account in
                                 Text(account.label + (account.signedIn ? "" : "（已退出）")).tag(account.id)
                             }
                         }
@@ -218,53 +226,53 @@ struct SettingsView: View {
                 }
 
                 HStack(spacing: 8) {
-                    if viewModel.isChatGPTSigningIn {
+                    if ai.isChatGPTSigningIn {
                         ProgressView().controlSize(.small)
                         Text("等待浏览器完成授权…")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Button("取消") { viewModel.cancelChatGPTSignIn() }
+                        Button("取消") { ai.cancelChatGPTSignIn() }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
                     } else if isSignedIn && isPlanEnabled {
-                        Button("重新授权") { viewModel.startChatGPTSignIn() }
+                        Button("重新授权") { ai.startChatGPTSignIn() }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
                             .disabled(isBusy)
-                        Button("添加账号") { viewModel.startChatGPTSignIn(newAccount: true) }
+                        Button("添加账号") { ai.startChatGPTSignIn(newAccount: true) }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
                             .disabled(isBusy)
                         Spacer()
-                        Button("退出登录", role: .destructive) { viewModel.signOutChatGPT() }
+                        Button("退出登录", role: .destructive) { ai.signOutChatGPT() }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
-                            .disabled(viewModel.isChatGPTSigningOut)
+                            .disabled(ai.isChatGPTSigningOut)
                     } else {
                         Button(isSignedIn ? "重新授权订阅额度" : "使用 ChatGPT 登录") {
-                            viewModel.startChatGPTSignIn()
+                            ai.startChatGPTSignIn()
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.regular)
                         .disabled(isBusy)
-                        if !viewModel.chatGPTAccounts.isEmpty {
-                            Button("添加账号") { viewModel.startChatGPTSignIn(newAccount: true) }
+                        if !ai.chatGPTAccounts.isEmpty {
+                            Button("添加账号") { ai.startChatGPTSignIn(newAccount: true) }
                                 .buttonStyle(.bordered)
                                 .controlSize(.regular)
                                 .disabled(isBusy)
                         }
                         if isSignedIn {
                             Spacer()
-                            Button("退出登录", role: .destructive) { viewModel.signOutChatGPT() }
+                            Button("退出登录", role: .destructive) { ai.signOutChatGPT() }
                                 .buttonStyle(.bordered)
                                 .controlSize(.regular)
-                                .disabled(viewModel.isChatGPTSigningOut)
+                                .disabled(ai.isChatGPTSigningOut)
                         }
                     }
                 }
 
-                if let message = viewModel.chatGPTStatusMessage, !message.isEmpty {
+                if let message = ai.chatGPTStatusMessage, !message.isEmpty {
                     HStack(alignment: .top, spacing: 6) {
                         Image(systemName: "info.circle.fill")
                             .font(.caption)
@@ -290,13 +298,13 @@ struct SettingsView: View {
                             .frame(width: 36, alignment: .leading)
 
                         Picker("", selection: Binding(
-                            get: { viewModel.aiConfig.chatGPTModel ?? "" },
-                            set: { viewModel.aiConfig.chatGPTModel = $0 }
+                            get: { ai.aiConfig.chatGPTModel ?? "" },
+                            set: { ai.aiConfig.chatGPTModel = $0 }
                         )) {
-                            if viewModel.aiConfig.chatGPTModel == nil {
+                            if ai.aiConfig.chatGPTModel == nil {
                                 Text("请选择模型").tag("")
                             }
-                            ForEach(viewModel.availableModels) { option in
+                            ForEach(ai.availableModels) { option in
                                 Text(option.displayName).tag(option.id)
                             }
                         }
@@ -304,9 +312,9 @@ struct SettingsView: View {
                         .disabled(isBusy)
 
                         Button {
-                            viewModel.refreshAvailableModels()
+                            ai.refreshAvailableModels()
                         } label: {
-                            if viewModel.isLoadingModels {
+                            if ai.isLoadingModels {
                                 ProgressView().controlSize(.mini)
                                     .frame(width: 14, height: 14)
                             } else {
@@ -315,29 +323,29 @@ struct SettingsView: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.regular)
-                        .disabled(isBusy || viewModel.isLoadingModels)
+                        .disabled(isBusy || ai.isLoadingModels)
                         .help("刷新可用模型列表")
 
                         Button {
-                            viewModel.testChatGPTConnection()
+                            ai.testChatGPTConnection()
                         } label: {
                             HStack(spacing: 5) {
-                                if viewModel.isTestingChatGPT {
+                                if ai.isTestingChatGPT {
                                     ProgressView().controlSize(.mini)
                                 } else {
                                     Image(systemName: "bolt.horizontal.fill")
                                         .font(.caption)
                                 }
-                                Text(viewModel.isTestingChatGPT ? "验证中…" : "验证连接")
+                                Text(ai.isTestingChatGPT ? "验证中…" : "验证连接")
                             }
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.regular)
-                        .disabled(viewModel.aiConfig.chatGPTModel == nil || isBusy)
+                        .disabled(ai.aiConfig.chatGPTModel == nil || isBusy)
                     }
 
                     // Immediate, high-visibility connection test feedback directly below the action row
-                    switch viewModel.chatGPTTestState {
+                    switch ai.chatGPTTestState {
                     case .idle:
                         Text("点击「验证连接」会发送一条极短测试消息（不含邮件内容），确认当前模型可正常响应。")
                             .font(.caption2)
@@ -345,7 +353,7 @@ struct SettingsView: View {
                     case .testing:
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)
-                            Text("正在向 \(viewModel.aiConfig.chatGPTModel ?? "模型") 发送不含邮件内容的测试请求…")
+                            Text("正在向 \(ai.aiConfig.chatGPTModel ?? "模型") 发送不含邮件内容的测试请求…")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -396,9 +404,9 @@ struct SettingsView: View {
     }
 
     private func modeCard(mode: AIAuthMode, icon: String, title: String, subtitle: String) -> some View {
-        let isSelected = viewModel.aiConfig.authMode == mode
+        let isSelected = ai.aiConfig.authMode == mode
         return Button {
-            viewModel.aiConfig.authMode = mode
+            ai.aiConfig.authMode = mode
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: icon)
@@ -451,7 +459,7 @@ struct SettingsView: View {
                     .font(.callout.weight(.semibold))
                 Spacer()
                 Button("刷新检测") {
-                    viewModel.refreshAuthStatuses()
+                    ai.refreshAuthStatuses()
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -459,8 +467,8 @@ struct SettingsView: View {
 
             VStack(spacing: 8) {
                 ForEach(SubscriptionCLIProvider.allCases) { provider in
-                    let status = viewModel.cliStatuses.first(where: { $0.provider == provider })
-                    let isSelected = viewModel.aiConfig.cliProvider == provider
+                    let status = ai.cliStatuses.first(where: { $0.provider == provider })
+                    let isSelected = ai.aiConfig.cliProvider == provider
                     HStack(spacing: 10) {
                         Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
                             .foregroundStyle(isSelected ? Color.accentColor : .secondary)
@@ -474,7 +482,7 @@ struct SettingsView: View {
                         Spacer()
                         if status?.isInstalled == true {
                             Button("终端登录") {
-                                viewModel.openCLILoginInTerminal(provider)
+                                ai.openCLILoginInTerminal(provider)
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
@@ -487,7 +495,7 @@ struct SettingsView: View {
                     )
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        viewModel.aiConfig.cliProvider = provider
+                        ai.aiConfig.cliProvider = provider
                     }
                 }
             }
@@ -500,22 +508,22 @@ struct SettingsView: View {
                         .font(.callout.weight(.medium))
                     Spacer()
                     Button("刷新模型") {
-                        viewModel.refreshAvailableModels()
+                        ai.refreshAvailableModels()
                     }
                     .buttonStyle(.borderless)
                     .font(.caption)
                 }
                 HStack(spacing: 8) {
-                    Picker("", selection: $viewModel.aiConfig.cliModelOverride) {
+                    Picker("", selection: $ai.aiConfig.cliModelOverride) {
                         Text("默认模型（跟随订阅）").tag("")
-                        ForEach(viewModel.availableModels) { option in
+                        ForEach(ai.availableModels) { option in
                             Text(option.displayName).tag(option.id)
                         }
                     }
                     .labelsHidden()
                     .frame(width: 220)
 
-                    TextField("或输入自定义模型名", text: $viewModel.aiConfig.cliModelOverride)
+                    TextField("或输入自定义模型名", text: $ai.aiConfig.cliModelOverride)
                         .textFieldStyle(.roundedBorder)
                 }
             }
@@ -524,7 +532,7 @@ struct SettingsView: View {
                 Text("自定义可执行路径（可选）")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                TextField("留空自动探测 Homebrew / ~/.local/bin", text: $viewModel.aiConfig.cliCustomPath)
+                TextField("留空自动探测 Homebrew / ~/.local/bin", text: $ai.aiConfig.cliCustomPath)
                     .textFieldStyle(.roundedBorder)
             }
         }
@@ -536,25 +544,25 @@ struct SettingsView: View {
                 Text("OAuth 平台")
                     .font(.callout.weight(.medium))
                 Spacer()
-                Picker("", selection: $viewModel.aiConfig.oauth.kind) {
+                Picker("", selection: $ai.aiConfig.oauth.kind) {
                     ForEach(OAuthProviderKind.allCases) { kind in
                         Text(kind.displayName).tag(kind)
                     }
                 }
                 .labelsHidden()
                 .frame(width: 240)
-                .onChange(of: viewModel.aiConfig.oauth.kind) { _, newKind in
+                .onChange(of: ai.aiConfig.oauth.kind) { _, newKind in
                     if newKind == .openRouter {
-                        viewModel.aiConfig.oauth.authorizationURL = "https://openrouter.ai/auth"
-                        viewModel.aiConfig.oauth.tokenURL = "https://openrouter.ai/api/v1/auth/keys"
-                        viewModel.aiConfig.oauth.apiBaseURL = "https://openrouter.ai/api/v1"
+                        ai.aiConfig.oauth.authorizationURL = "https://openrouter.ai/auth"
+                        ai.aiConfig.oauth.tokenURL = "https://openrouter.ai/api/v1/auth/keys"
+                        ai.aiConfig.oauth.apiBaseURL = "https://openrouter.ai/api/v1"
                     }
-                    viewModel.refreshAuthStatuses()
+                    ai.refreshAuthStatuses()
                 }
             }
 
             HStack {
-                if let bundle = viewModel.oauthTokenBundle {
+                if let bundle = ai.oauthTokenBundle {
                     VStack(alignment: .leading, spacing: 2) {
                         Label("已登录：\(bundle.accountLabel ?? "订阅账号")", systemImage: "checkmark.seal.fill")
                             .foregroundStyle(.green)
@@ -565,15 +573,15 @@ struct SettingsView: View {
                     }
                     Spacer()
                     Button("退出登录", role: .destructive) {
-                        viewModel.signOutOAuth()
+                        ai.signOutOAuth()
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                 } else {
                     Button {
-                        viewModel.startOAuthSignIn()
+                        ai.startOAuthSignIn()
                     } label: {
-                        if viewModel.isOAuthSigningIn {
+                        if ai.isOAuthSigningIn {
                             HStack(spacing: 6) {
                                 ProgressView().controlSize(.small)
                                 Text("等待浏览器授权...")
@@ -583,12 +591,12 @@ struct SettingsView: View {
                         }
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(viewModel.isOAuthSigningIn)
+                    .disabled(ai.isOAuthSigningIn)
                     Spacer()
                 }
             }
 
-            if let msg = viewModel.oauthStatusMessage {
+            if let msg = ai.oauthStatusMessage {
                 Text(msg)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -601,24 +609,24 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack(spacing: 8) {
-                    Picker("", selection: $viewModel.aiConfig.oauth.model) {
-                        ForEach(viewModel.currentSuggestedModels, id: \.self) { m in
+                    Picker("", selection: $ai.aiConfig.oauth.model) {
+                        ForEach(ai.currentSuggestedModels, id: \.self) { m in
                             Text(m).tag(m)
                         }
                     }
                     .labelsHidden()
                     .frame(width: 210)
-                    TextField("自定义模型", text: $viewModel.aiConfig.oauth.model)
+                    TextField("自定义模型", text: $ai.aiConfig.oauth.model)
                         .textFieldStyle(.roundedBorder)
                 }
             }
 
-            if viewModel.aiConfig.oauth.kind == .customPKCE {
+            if ai.aiConfig.oauth.kind == .customPKCE {
                 VStack(alignment: .leading, spacing: 8) {
-                    labeledField("Authorization URL", text: $viewModel.aiConfig.oauth.authorizationURL)
-                    labeledField("Token URL", text: $viewModel.aiConfig.oauth.tokenURL)
-                    labeledField("Client ID", text: $viewModel.aiConfig.oauth.clientID)
-                    labeledField("API Base URL", text: $viewModel.aiConfig.oauth.apiBaseURL)
+                    labeledField("Authorization URL", text: $ai.aiConfig.oauth.authorizationURL)
+                    labeledField("Token URL", text: $ai.aiConfig.oauth.tokenURL)
+                    labeledField("Client ID", text: $ai.aiConfig.oauth.clientID)
+                    labeledField("API Base URL", text: $ai.aiConfig.oauth.apiBaseURL)
                 }
             }
         }
@@ -631,30 +639,30 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("本地 Ollama") {
-                    viewModel.applyAPIPreset(baseURL: "http://localhost:11434/v1", model: "qwen2.5:14b")
+                    ai.applyAPIPreset(baseURL: "http://localhost:11434/v1", model: "qwen2.5:14b")
                 }
                 Button("DeepSeek") {
-                    viewModel.applyAPIPreset(baseURL: "https://api.deepseek.com/v1", model: "deepseek-chat")
+                    ai.applyAPIPreset(baseURL: "https://api.deepseek.com/v1", model: "deepseek-chat")
                 }
                 Button("OpenAI") {
-                    viewModel.applyAPIPreset(baseURL: "https://api.openai.com/v1", model: "gpt-4o-mini")
+                    ai.applyAPIPreset(baseURL: "https://api.openai.com/v1", model: "gpt-4o-mini")
                 }
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
 
             labeledField("Base URL", text: Binding(
-                get: { viewModel.aiConfig.baseURL },
-                set: { viewModel.updateAPIBaseURL($0) }
+                get: { ai.aiConfig.baseURL },
+                set: { ai.updateAPIBaseURL($0) }
             ))
-            labeledField("Model", text: $viewModel.aiConfig.model)
+            labeledField("Model", text: $ai.aiConfig.model)
             VStack(alignment: .leading, spacing: 4) {
                 Text("API Key（按服务域名隔离加密存入系统钥匙串，本地 Ollama 可留空）")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 SecureField("sk-...", text: Binding(
-                    get: { viewModel.aiConfig.apiKey },
-                    set: { viewModel.updateAPIKey($0) }
+                    get: { ai.aiConfig.apiKey },
+                    set: { ai.updateAPIKey($0) }
                 ))
                 .textFieldStyle(.roundedBorder)
             }
@@ -997,11 +1005,24 @@ struct SettingsView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("本地正文全文搜索缓存")
                                 .font(.callout.weight(.medium))
-                            Text("当前已索引 \(viewModel.indexedBodyCount) 封邮件正文（仅保存在本机缓存，绝不改动原邮件库）")
+                            Text("当前已索引 \(bodyIndex.indexedBodyCount) 封邮件正文（仅保存在本机缓存，绝不改动原邮件库）")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            if let errorMsg = bodyIndex.errorMessage, !errorMsg.isEmpty {
+                                Text("最近索引异常：\(errorMsg)")
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                            }
                         }
                         Spacer()
+                        if bodyIndex.errorMessage != nil {
+                            Button("重试索引") {
+                                viewModel.retryBodySearchIndexing()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        }
+
                         Button("重建索引") {
                             viewModel.rebuildBodySearchIndex()
                         }

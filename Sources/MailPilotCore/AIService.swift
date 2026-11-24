@@ -25,7 +25,107 @@ public enum AIServiceError: LocalizedError, Sendable {
 /// 2. Standard OAuth 2.0 PKCE browser sign-in (tokens persisted in macOS Keychain)
 /// 3. Direct OpenAI-compatible API Key / local Ollama endpoints
 public struct AIService: Sendable {
-    public init() {}
+    public struct ContextBudget: Sendable, Equatable {
+        public let maxHistoryMessages: Int
+        public let maxHistoryChars: Int
+        public let maxMessageChars: Int
+
+        public init(
+            maxHistoryMessages: Int = 12,
+            maxHistoryChars: Int = 12_000,
+            maxMessageChars: Int = 4_000
+        ) {
+            self.maxHistoryMessages = max(0, maxHistoryMessages)
+            self.maxHistoryChars = max(0, maxHistoryChars)
+            self.maxMessageChars = max(0, maxMessageChars)
+        }
+
+        public static let `default` = ContextBudget()
+    }
+
+    public struct PreparedHistory: Sendable {
+        public let messages: [AIChatMessage]
+        public let droppedCount: Int
+
+        public init(messages: [AIChatMessage], droppedCount: Int) {
+            self.messages = messages
+            self.droppedCount = droppedCount
+        }
+    }
+
+    public let contextBudget: ContextBudget
+
+    public init(contextBudget: ContextBudget = .default) {
+        self.contextBudget = contextBudget
+    }
+
+    /// Filters error/empty placeholders and keeps a bounded recent window of conversation history
+    /// so long threads stay within context limits and avoid unnecessary token usage.
+    public static func prepareHistory(
+        _ history: [AIChatMessage],
+        budget: ContextBudget = .default
+    ) -> PreparedHistory {
+        let validMessages = history.filter {
+            !$0.isError && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !validMessages.isEmpty else {
+            return PreparedHistory(messages: [], droppedCount: 0)
+        }
+        guard budget.maxHistoryMessages > 0, budget.maxHistoryChars > 0 else {
+            return PreparedHistory(messages: [], droppedCount: validMessages.count)
+        }
+
+        var selectedReversed: [AIChatMessage] = []
+        selectedReversed.reserveCapacity(min(validMessages.count, budget.maxHistoryMessages))
+        var usedChars = 0
+
+        for msg in validMessages.reversed() {
+            if selectedReversed.count >= budget.maxHistoryMessages {
+                break
+            }
+            let clipped = clipContent(msg.content, maxChars: budget.maxMessageChars)
+            let cost = clipped.count
+            if usedChars + cost <= budget.maxHistoryChars {
+                selectedReversed.append(
+                    AIChatMessage(
+                        id: msg.id,
+                        role: msg.role,
+                        content: clipped,
+                        createdAt: msg.createdAt,
+                        isError: false
+                    )
+                )
+                usedChars += cost
+            } else if selectedReversed.isEmpty {
+                let fitted = clipContent(clipped, maxChars: budget.maxHistoryChars)
+                selectedReversed.append(
+                    AIChatMessage(
+                        id: msg.id,
+                        role: msg.role,
+                        content: fitted,
+                        createdAt: msg.createdAt,
+                        isError: false
+                    )
+                )
+                break
+            } else {
+                break
+            }
+        }
+
+        let kept = Array(selectedReversed.reversed())
+        let dropped = max(0, validMessages.count - kept.count)
+        return PreparedHistory(messages: kept, droppedCount: dropped)
+    }
+
+    private static func clipContent(_ text: String, maxChars: Int) -> String {
+        guard maxChars > 0, text.count > maxChars else { return text }
+        let suffix = "\n…（已截断）"
+        if maxChars <= suffix.count {
+            return String(text.prefix(maxChars))
+        }
+        return String(text.prefix(maxChars - suffix.count)) + suffix
+    }
 
     public func chat(
         config: AIConfig,
@@ -34,14 +134,23 @@ public struct AIService: Sendable {
         userMessage: String,
         onPartial: (@Sendable (String) -> Void)? = nil
     ) async throws -> String {
-        let processedSystem = config.maskSensitiveData ? PrivacyMasker.mask(systemPrompt) : systemPrompt
+        let prepared = Self.prepareHistory(history, budget: contextBudget)
+        let effectiveSystemPrompt: String
+        if prepared.droppedCount > 0 {
+            effectiveSystemPrompt = systemPrompt + "\n\n（注：为控制上下文长度，已省略更早的 \(prepared.droppedCount) 条历史对话，仅保留最近记录。）"
+        } else {
+            effectiveSystemPrompt = systemPrompt
+        }
+
+        let processedSystem = config.maskSensitiveData ? PrivacyMasker.mask(effectiveSystemPrompt) : effectiveSystemPrompt
         let processedUser = config.maskSensitiveData ? PrivacyMasker.mask(userMessage) : userMessage
-        let processedHistory = history.map { msg in
+        let processedHistory = prepared.messages.map { msg in
             AIChatMessage(
                 id: msg.id,
                 role: msg.role,
                 content: config.maskSensitiveData ? PrivacyMasker.mask(msg.content) : msg.content,
-                createdAt: msg.createdAt
+                createdAt: msg.createdAt,
+                isError: msg.isError
             )
         }
 
@@ -99,7 +208,12 @@ public struct AIService: Sendable {
         sections.append("### 系统上下文\n\(systemPrompt)")
         if !history.isEmpty {
             let transcript = history.map { msg -> String in
-                let speaker = msg.role == .user ? "用户" : "助手"
+                let speaker: String
+                switch msg.role {
+                case .user: speaker = "用户"
+                case .assistant: speaker = "助手"
+                case .system: speaker = "系统"
+                }
                 return "\(speaker)：\(msg.content)"
             }.joined(separator: "\n\n")
             sections.append("### 对话历史\n\(transcript)")

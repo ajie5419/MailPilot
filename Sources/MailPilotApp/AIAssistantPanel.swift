@@ -5,6 +5,12 @@ import SwiftUI
 
 struct AIAssistantPanel: View {
     @ObservedObject var viewModel: AppViewModel
+    @ObservedObject var ai: AIAssistantController
+
+    init(viewModel: AppViewModel) {
+        self._viewModel = ObservedObject(wrappedValue: viewModel)
+        self._ai = ObservedObject(wrappedValue: viewModel.ai)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -13,7 +19,7 @@ struct AIAssistantPanel: View {
                 Label("AI 助手", systemImage: "sparkles")
                     .font(.headline)
                 Spacer()
-                if viewModel.aiConfig.maskSensitiveData {
+                if ai.aiConfig.maskSensitiveData {
                     Text("已脱敏")
                         .font(.caption2.weight(.medium))
                         .padding(.horizontal, 6)
@@ -40,23 +46,23 @@ struct AIAssistantPanel: View {
             HStack(spacing: 6) {
                 Menu {
                     Section("当前模式模型") {
-                        if viewModel.aiConfig.authMode == .subscriptionCLI {
+                        if ai.aiConfig.authMode == .subscriptionCLI {
                             Button {
-                                viewModel.selectModel("")
+                                ai.selectModel("")
                             } label: {
-                                if viewModel.aiConfig.cliModelOverride.isEmpty {
+                                if ai.aiConfig.cliModelOverride.isEmpty {
                                     Label("默认模型（跟随订阅）", systemImage: "checkmark")
                                 } else {
                                     Text("默认模型（跟随订阅）")
                                 }
                             }
                         }
-                        ForEach(viewModel.availableModels) { option in
+                        ForEach(ai.availableModels) { option in
                             Button {
-                                viewModel.selectModel(option.id)
+                                ai.selectModel(option.id)
                             } label: {
                                 let title = option.displayName == option.id ? option.id : "\(option.displayName) (\(option.id))"
-                                if viewModel.activeModelDisplayName == option.id {
+                                if ai.activeModelDisplayName == option.id {
                                     Label(title, systemImage: "checkmark")
                                 } else {
                                     Text(title)
@@ -65,7 +71,7 @@ struct AIAssistantPanel: View {
                         }
 
                         Button {
-                            viewModel.refreshAvailableModels()
+                            ai.refreshAvailableModels()
                         } label: {
                             Label("刷新最新模型列表", systemImage: "arrow.clockwise")
                         }
@@ -75,15 +81,15 @@ struct AIAssistantPanel: View {
 
                     Section("快捷切换订阅 / 通道") {
                         Button("ChatGPT 订阅（浏览器登录）") {
-                            viewModel.aiConfig.authMode = .chatGPT
+                            ai.aiConfig.authMode = .chatGPT
                         }
                         ForEach(SubscriptionCLIProvider.allCases) { provider in
                             Button {
-                                viewModel.switchCLIProvider(provider)
+                                ai.switchCLIProvider(provider)
                             } label: {
-                                let installed = viewModel.cliStatuses.first(where: { $0.provider == provider })?.isInstalled == true
+                                let installed = ai.cliStatuses.first(where: { $0.provider == provider })?.isInstalled == true
                                 let suffix = installed ? "" : "（未安装）"
-                                if viewModel.aiConfig.authMode == .subscriptionCLI && viewModel.aiConfig.cliProvider == provider {
+                                if ai.aiConfig.authMode == .subscriptionCLI && ai.aiConfig.cliProvider == provider {
                                     Label("\(provider.shortBadge)\(suffix)", systemImage: "checkmark")
                                 } else {
                                     Text("\(provider.shortBadge)\(suffix)")
@@ -92,9 +98,9 @@ struct AIAssistantPanel: View {
                         }
 
                         Button {
-                            viewModel.aiConfig.authMode = .oauthPKCE
+                            ai.aiConfig.authMode = .oauthPKCE
                         } label: {
-                            if viewModel.aiConfig.authMode == .oauthPKCE {
+                            if ai.aiConfig.authMode == .oauthPKCE {
                                 Label("浏览器 OAuth 登录", systemImage: "checkmark")
                             } else {
                                 Text("浏览器 OAuth 登录")
@@ -102,9 +108,9 @@ struct AIAssistantPanel: View {
                         }
 
                         Button {
-                            viewModel.aiConfig.authMode = .apiKey
+                            ai.aiConfig.authMode = .apiKey
                         } label: {
-                            if viewModel.aiConfig.authMode == .apiKey {
+                            if ai.aiConfig.authMode == .apiKey {
                                 Label("API Key / 本地模型", systemImage: "checkmark")
                             } else {
                                 Text("API Key / 本地模型")
@@ -123,11 +129,11 @@ struct AIAssistantPanel: View {
                         Image(systemName: "cpu")
                             .font(.caption)
                             .foregroundStyle(Color.accentColor)
-                        Text(viewModel.activeAIBadge)
+                        Text(ai.activeAIBadge)
                             .font(.caption.weight(.medium))
                         Text("·")
                             .foregroundStyle(.secondary)
-                        Text(viewModel.activeModelDisplayName)
+                        Text(ai.activeModelDisplayName)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -150,27 +156,27 @@ struct AIAssistantPanel: View {
             VStack(spacing: 8) {
                 HStack(spacing: 8) {
                     Button {
-                        viewModel.summarizeSelectedEmail()
+                        ai.summarizeSelectedEmail()
                     } label: {
                         Label("总结邮件", systemImage: "text.alignleft")
                             .frame(maxWidth: .infinity)
                     }
-                    .disabled(viewModel.selectedMessage == nil || viewModel.isAIThinking)
+                    .disabled(viewModel.selectedMessage == nil || ai.isAIThinking)
 
                     Button {
-                        viewModel.generateReplyDraft(tone: "专业简洁")
+                        ai.generateReplyDraft(tone: "专业简洁")
                     } label: {
                         Label("起草回复", systemImage: "square.and.pencil")
                             .frame(maxWidth: .infinity)
                     }
-                    .disabled(viewModel.selectedMessage == nil || viewModel.isAIThinking)
+                    .disabled(viewModel.selectedMessage == nil || ai.isAIThinking)
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
 
-                if let draft = viewModel.lastGeneratedDraft {
+                if let draft = ai.lastGeneratedDraft {
                     Button {
-                        viewModel.sendDraftToMailApp(body: draft)
+                        ai.sendDraftToMailApp(body: draft)
                     } label: {
                         Label("填入应用内回复窗口并发送", systemImage: "paperplane.circle.fill")
                             .frame(maxWidth: .infinity)
@@ -188,7 +194,7 @@ struct AIAssistantPanel: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
-                        if viewModel.aiMessages.isEmpty {
+                        if ai.aiMessages.isEmpty {
                             VStack(spacing: 10) {
                                 Image(systemName: "sparkles")
                                     .font(.title2)
@@ -205,7 +211,7 @@ struct AIAssistantPanel: View {
                             .padding(.top, 8)
                         }
 
-                        ForEach(viewModel.aiMessages.filter { !$0.content.isEmpty }) { msg in
+                        ForEach(ai.aiMessages.filter { !$0.content.isEmpty }) { msg in
                             if msg.role == .user {
                                 HStack {
                                     Spacer(minLength: 24)
@@ -221,9 +227,12 @@ struct AIAssistantPanel: View {
                             } else {
                                 VStack(alignment: .leading, spacing: 10) {
                                     HStack {
-                                        Label("AI 摘要", systemImage: "sparkles")
+                                        Label(
+                                            msg.isError ? "请求失败" : "AI 摘要",
+                                            systemImage: msg.isError ? "exclamationmark.triangle.fill" : "sparkles"
+                                        )
                                             .font(.caption.weight(.semibold))
-                                            .foregroundStyle(Color.accentColor)
+                                            .foregroundStyle(msg.isError ? Color.orange : Color.accentColor)
                                         Spacer()
                                         Button {
                                             viewModel.copyToClipboard(msg.content, label: "已复制内容")
@@ -250,7 +259,7 @@ struct AIAssistantPanel: View {
                             }
                         }
 
-                        if viewModel.isAIThinking {
+                        if ai.isAIThinking {
                             HStack(spacing: 8) {
                                 ProgressView().controlSize(.small)
                                 Text("AI 思考中...")
@@ -261,8 +270,8 @@ struct AIAssistantPanel: View {
                     }
                     .padding(12)
                 }
-                .onChange(of: viewModel.aiMessages.count) { _, _ in
-                    if let last = viewModel.aiMessages.last {
+                .onChange(of: ai.aiMessages.count) { _, _ in
+                    if let last = ai.aiMessages.last {
                         withAnimation {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
@@ -274,22 +283,22 @@ struct AIAssistantPanel: View {
 
             // Prompt Input
             HStack(spacing: 8) {
-                TextField("问这封邮件任何问题...", text: $viewModel.aiInput)
+                TextField("问这封邮件任何问题...", text: $ai.aiInput)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit {
-                        viewModel.sendCustomAIQuestion()
+                        ai.sendCustomAIQuestion()
                     }
-                    .disabled(viewModel.isAIThinking)
+                    .disabled(ai.isAIThinking)
 
                 Button {
-                    viewModel.sendCustomAIQuestion()
+                    ai.sendCustomAIQuestion()
                 } label: {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.title3)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(Color.accentColor)
-                .disabled(viewModel.aiInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isAIThinking)
+                .disabled(ai.aiInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || ai.isAIThinking)
             }
             .padding(10)
         }

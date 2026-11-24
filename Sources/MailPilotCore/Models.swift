@@ -220,12 +220,20 @@ public struct AIChatMessage: Identifiable, Sendable {
     public let role: Role
     public let content: String
     public let createdAt: Date
+    public let isError: Bool
 
-    public init(id: UUID = UUID(), role: Role, content: String, createdAt: Date = Date()) {
+    public init(
+        id: UUID = UUID(),
+        role: Role,
+        content: String,
+        createdAt: Date = Date(),
+        isError: Bool = false
+    ) {
         self.id = id
         self.role = role
         self.content = content
         self.createdAt = createdAt
+        self.isError = isError
     }
 }
 

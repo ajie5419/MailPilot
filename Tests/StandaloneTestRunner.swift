@@ -272,7 +272,7 @@ struct StandaloneTestRunner {
             .appendingPathComponent("mailpilot-fts-\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: ftsTmpURL) }
         let ftsIndex = BodySearchIndex(databaseURL: ftsTmpURL)
-        await ftsIndex.upsertBatch([
+        try await ftsIndex.upsertBatch([
             (rowID: 501, subject: "会议纪要", sender: "alice@corp.com", body: "合同编号 HT-2026-8899 已审批通过，请财务安排付款。"),
             (rowID: 502, subject: "Welcome", sender: "team@app.io", body: "Thanks for signing up for our annual plan.")
         ])
@@ -374,12 +374,12 @@ struct StandaloneTestRunner {
             .appendingPathComponent("mailpilot-fts-upd-\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: ftsUpdateURL) }
         let ftsUpd = BodySearchIndex(databaseURL: ftsUpdateURL)
-        await ftsUpd.upsertBatch([(rowID: 1, subject: "S", sender: "a@b.com", body: "olduniquetoken 旧合同内容")])
-        await ftsUpd.upsertBatch([(rowID: 1, subject: "S", sender: "a@b.com", body: "newuniquetoken 新审批内容")])
+        try await ftsUpd.upsertBatch([(rowID: 1, subject: "S", sender: "a@b.com", body: "olduniquetoken 旧合同内容")])
+        try await ftsUpd.upsertBatch([(rowID: 1, subject: "S", sender: "a@b.com", body: "newuniquetoken 新审批内容")])
         assertEqual(await ftsUpd.searchRowIDs(query: "olduniquetoken"), [], "FTS5 removes old token after update")
         assertEqual(await ftsUpd.searchRowIDs(query: "newuniquetoken"), [1], "FTS5 indexes new token after update")
         assertEqual(await ftsUpd.searchRowIDs(query: "新审批内容"), [1], "FTS5 trigram matches Chinese substring")
-        await ftsUpd.deleteRowIDs([1])
+        try await ftsUpd.deleteRowIDs([1])
         assertEqual(await ftsUpd.searchRowIDs(query: "newuniquetoken"), [], "FTS5 removes token after delete")
 
         // 20. Gmail multi-label body search hydration via SQL (F08)
@@ -429,7 +429,7 @@ struct StandaloneTestRunner {
             let body = (i == 101) ? "sharedneedle \(padding) TAILMARKER_99999" : "sharedneedle item \(i)"
             bulkEntries.append((rowID: i, subject: "S\(i)", sender: "u@example.com", body: body, fileMTime: 100.0))
         }
-        await bigFTS.upsertBatchWithMTime(bulkEntries)
+        try await bigFTS.upsertBatchWithMTime(bulkEntries)
         let allNeedleHits = await bigFTS.searchRowIDs(query: "sharedneedle", limit: nil)
         assertEqual(allNeedleHits.count, 2301, "unbounded FTS5 search returns all 2,301 hits")
 
@@ -713,7 +713,101 @@ struct StandaloneTestRunner {
         assertTrue(boundedPage.hasMore, "bounded top-K reports hasMore = true for 210 inbox hits")
         assertEqual(boundedPage.messages.first?.id, 10, "bounded top-K still finds newest-dated inbox hit at low ROWID=10")
 
-        print("ALL 32 CORE TEST SUITES PASSED")
+        // 33. BodySearchIndex surfaces SQLite write errors and rolls back failed batches atomically
+        let invalidDBDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-invalid-fts-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: invalidDBDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: invalidDBDir) }
+        let brokenIndex = BodySearchIndex(databaseURL: invalidDBDir)
+        var threwOpenError = false
+        do {
+            try await brokenIndex.upsertBatch([(rowID: 1, subject: "S", sender: "a@b.com", body: "content")])
+        } catch let err as BodySearchIndexError {
+            if case .openFailed = err {
+                threwOpenError = true
+            }
+        }
+        assertTrue(threwOpenError, "opening directory as BodySearchIndex throws BodySearchIndexError.openFailed")
+
+        let rollbackFTSURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-fts-rollback-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: rollbackFTSURL) }
+        let rollbackIndex = BodySearchIndex(databaseURL: rollbackFTSURL)
+        try await rollbackIndex.upsertBatch([(rowID: 1, subject: "Keep", sender: "a@b.com", body: "initial_keep_token")])
+        var faultDB: OpaquePointer?
+        assertEqual(sqlite3_open(rollbackFTSURL.path, &faultDB), SQLITE_OK, "open rollback db for fault trigger")
+        assertEqual(
+            sqlite3_exec(
+                faultDB,
+                "CREATE TRIGGER fail_row_3 BEFORE INSERT ON indexed_rows WHEN new.row_id = 3 BEGIN SELECT RAISE(ABORT, 'simulated write fault'); END;",
+                nil, nil, nil
+            ),
+            SQLITE_OK,
+            "install fault trigger"
+        )
+        sqlite3_close(faultDB)
+
+        var threwWriteError = false
+        do {
+            try await rollbackIndex.upsertBatch([
+                (rowID: 2, subject: "Partial", sender: "a@b.com", body: "partial_should_rollback"),
+                (rowID: 3, subject: "Boom", sender: "a@b.com", body: "fault_trigger_row")
+            ])
+        } catch let err as BodySearchIndexError {
+            if case .sqliteError = err {
+                threwWriteError = true
+            }
+        }
+        assertTrue(threwWriteError, "mid-batch SQLite failure throws BodySearchIndexError.sqliteError")
+        assertEqual(await rollbackIndex.allIndexedRowIDs(), [1], "failed batch rolls back row 2 atomically and preserves row 1")
+        assertEqual(await rollbackIndex.searchRowIDs(query: "partial_should_rollback"), [], "rolled-back row leaves no FTS tokens")
+
+        var recoverDB: OpaquePointer?
+        assertEqual(sqlite3_open(rollbackFTSURL.path, &recoverDB), SQLITE_OK, "open rollback db to remove fault trigger")
+        assertEqual(sqlite3_exec(recoverDB, "DROP TRIGGER fail_row_3;", nil, nil, nil), SQLITE_OK, "drop fault trigger")
+        sqlite3_close(recoverDB)
+        try await rollbackIndex.upsertBatch([
+            (rowID: 2, subject: "Recovered", sender: "a@b.com", body: "partial_should_rollback"),
+            (rowID: 3, subject: "Recovered3", sender: "a@b.com", body: "recovered_row_3")
+        ])
+        assertEqual(await rollbackIndex.totalIndexedCount(), 3, "retry after rollback commits full batch cleanly")
+
+        // 34. AIService context budget filters error/blank messages and trims older history deterministically
+        let noisyHistory: [AIChatMessage] = [
+            AIChatMessage(role: .user, content: "m1_oldest"),
+            AIChatMessage(role: .assistant, content: "   \n  "),
+            AIChatMessage(role: .assistant, content: "请求失败：网络超时", isError: true),
+            AIChatMessage(role: .assistant, content: "m2_reply"),
+            AIChatMessage(role: .user, content: "m3_question"),
+            AIChatMessage(role: .assistant, content: "m4_newest")
+        ]
+        let countTrimmed = AIService.prepareHistory(
+            noisyHistory,
+            budget: AIService.ContextBudget(maxHistoryMessages: 2, maxHistoryChars: 1000, maxMessageChars: 500)
+        )
+        assertEqual(countTrimmed.messages.map(\.content), ["m3_question", "m4_newest"], "prepareHistory keeps newest 2 valid messages in chronological order")
+        assertEqual(countTrimmed.droppedCount, 2, "prepareHistory counts only omitted valid messages (excluding error/blank)")
+
+        let charTrimmed = AIService.prepareHistory(
+            [
+                AIChatMessage(role: .user, content: String(repeating: "a", count: 30)),
+                AIChatMessage(role: .assistant, content: String(repeating: "b", count: 30)),
+                AIChatMessage(role: .user, content: String(repeating: "c", count: 30))
+            ],
+            budget: AIService.ContextBudget(maxHistoryMessages: 10, maxHistoryChars: 65, maxMessageChars: 100)
+        )
+        assertEqual(charTrimmed.messages.count, 2, "prepareHistory enforces total character budget")
+        assertEqual(charTrimmed.droppedCount, 1, "prepareHistory reports 1 dropped message under char budget")
+        assertEqual(charTrimmed.messages.first?.content, String(repeating: "b", count: 30), "prepareHistory keeps contiguous newest tail")
+
+        let clippedSingle = AIService.prepareHistory(
+            [AIChatMessage(role: .assistant, content: String(repeating: "x", count: 120))],
+            budget: AIService.ContextBudget(maxHistoryMessages: 5, maxHistoryChars: 50, maxMessageChars: 80)
+        )
+        assertEqual(clippedSingle.messages.count, 1, "oversized newest message is clipped instead of dropping all history")
+        assertTrue((clippedSingle.messages.first?.content.count ?? 999) <= 50, "oversized newest message fits within maxHistoryChars")
+
+        print("ALL 34 CORE TEST SUITES PASSED")
         try await ChatGPTTests.run()
     }
 }

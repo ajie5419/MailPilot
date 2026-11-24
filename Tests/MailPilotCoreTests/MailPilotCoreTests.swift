@@ -104,4 +104,58 @@ final class MailPilotCoreTests: XCTestCase {
         XCTAssertEqual(searched.count, 1)
         XCTAssertEqual(searched[0].id, 100)
     }
+
+    func testBodySearchIndexRollbackOnWriteError() async throws {
+        let dbURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MailPilotRollback-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: dbURL) }
+
+        let index = BodySearchIndex(databaseURL: dbURL)
+        try await index.upsertBatch([(rowID: 1, subject: "Keep", sender: "a@b.com", body: "initial_token")])
+
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(dbURL.path, &db), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(
+                db,
+                "CREATE TRIGGER fail_row_3 BEFORE INSERT ON indexed_rows WHEN new.row_id = 3 BEGIN SELECT RAISE(ABORT, 'fault'); END;",
+                nil, nil, nil
+            ),
+            SQLITE_OK
+        )
+        sqlite3_close(db)
+
+        do {
+            try await index.upsertBatch([
+                (rowID: 2, subject: "Partial", sender: "a@b.com", body: "should_rollback"),
+                (rowID: 3, subject: "Fail", sender: "a@b.com", body: "boom")
+            ])
+            XCTFail("Expected BodySearchIndexError.sqliteError")
+        } catch let error as BodySearchIndexError {
+            if case .sqliteError = error {
+                // expected
+            } else {
+                XCTFail("Unexpected error variant: \(error)")
+            }
+        }
+
+        let remaining = await index.allIndexedRowIDs()
+        XCTAssertEqual(remaining, [1])
+    }
+
+    func testAIServicePrepareHistoryBudget() {
+        let history: [AIChatMessage] = [
+            AIChatMessage(role: .user, content: "old"),
+            AIChatMessage(role: .assistant, content: "请求失败：timeout", isError: true),
+            AIChatMessage(role: .assistant, content: "   "),
+            AIChatMessage(role: .assistant, content: "mid"),
+            AIChatMessage(role: .user, content: "latest")
+        ]
+        let prepared = AIService.prepareHistory(
+            history,
+            budget: AIService.ContextBudget(maxHistoryMessages: 2, maxHistoryChars: 100, maxMessageChars: 50)
+        )
+        XCTAssertEqual(prepared.messages.map(\.content), ["mid", "latest"])
+        XCTAssertEqual(prepared.droppedCount, 1)
+    }
 }
