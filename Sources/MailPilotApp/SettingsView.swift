@@ -14,6 +14,10 @@ struct SettingsView: View {
         self._bodyIndex = ObservedObject(wrappedValue: viewModel.bodyIndex)
     }
 
+    private var appVersionLabel: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0"
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             // Left Sidebar Navigation
@@ -48,7 +52,7 @@ struct SettingsView: View {
                     .buttonStyle(.plain)
                 }
                 Spacer()
-                Text("MailPilot 0.1")
+                Text("MailPilot \(appVersionLabel)")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .padding(.horizontal, 10)
