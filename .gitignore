@@ -1,0 +1,26 @@
+# Build & packaging outputs
+.build/
+.swiftpm/
+dist/
+*.app
+*.icns
+*.iconset/
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode / IDE
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+
+# Certificates & local secrets
+*.p12
+*.pem
+*.key
+*.crt
+*.cer
+.env
+.env.*
