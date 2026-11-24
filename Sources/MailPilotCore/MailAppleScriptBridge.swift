@@ -40,7 +40,10 @@ public enum MailAppleScriptBridge {
             return "NOT_FOUND"
         end tell
         """
-        _ = try await runAppleScript(script)
+        let result = try await runAppleScript(script)
+        if result == "NOT_FOUND" {
+            throw MailAccessError.appleScriptFailed(message: "未在 Mail.app 中找到该邮件")
+        }
     }
 
     /// Toggles flagged status in Mail.app by matching its numeric ROWID (`id`).
@@ -69,7 +72,10 @@ public enum MailAppleScriptBridge {
             return "NOT_FOUND"
         end tell
         """
-        _ = try await runAppleScript(script)
+        let result = try await runAppleScript(script)
+        if result == "NOT_FOUND" {
+            throw MailAccessError.appleScriptFailed(message: "未在 Mail.app 中找到该邮件")
+        }
     }
 
     /// Opens the original email in Mail.app.
@@ -359,7 +365,17 @@ public enum MailAppleScriptBridge {
         }
 
         let innerBlock = recipientLines.joined(separator: "\n        ")
-        let finalAction = shouldSend ? "send newMsg" : "save newMsg"
+        let finalAction: String
+        if shouldSend {
+            finalAction = """
+                set didSend to send newMsg
+                if didSend is not true then
+                    return "SEND_FAILED"
+                end if
+            """
+        } else {
+            finalAction = "    save newMsg"
+        }
 
         let script = """
         tell application "Mail"
@@ -367,34 +383,68 @@ public enum MailAppleScriptBridge {
             tell newMsg
                 \(innerBlock)
             end tell
-            \(finalAction)
+        \(finalAction)
             return "OK"
         end tell
         """
-        _ = try await runAppleScript(script)
+        let result = try await runAppleScript(script)
+        if shouldSend && result != "OK" {
+            throw MailAccessError.appleScriptFailed(message: "系统 Mail.app 未确认发送成功（状态：\(result.isEmpty ? "未知" : result)），已保留草稿")
+        }
     }
 
     // MARK: - Execution (Serialized to prevent concurrent osascript storms against Mail.app)
 
     private static let scriptQueue = DispatchQueue(label: "com.mailpilot.applescript.serial", qos: .userInitiated)
 
-    private static func runAppleScript(_ source: String) async throws -> String {
+    private static func runAppleScript(_ source: String, timeoutSeconds: TimeInterval = 30) async throws -> String {
         try await withCheckedThrowingContinuation { continuation in
             scriptQueue.async {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                process.arguments = ["-e", source]
+                // Pass AppleScript via stdin to avoid ARG_MAX limits on long email bodies.
+                process.arguments = ["-"]
 
+                let stdinPipe = Pipe()
                 let stdoutPipe = Pipe()
                 let stderrPipe = Pipe()
+                process.standardInput = stdinPipe
                 process.standardOutput = stdoutPipe
                 process.standardError = stderrPipe
 
+                let ioGroup = DispatchGroup()
+                var outData = Data()
+                var errData = Data()
+
                 do {
                     try process.run()
-                    process.waitUntilExit()
-                    let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                    let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                    if let scriptBytes = source.data(using: .utf8) {
+                        stdinPipe.fileHandleForWriting.write(scriptBytes)
+                    }
+                    try? stdinPipe.fileHandleForWriting.close()
+
+                    // Drain stdout and stderr concurrently to avoid pipe-buffer deadlock.
+                    ioGroup.enter()
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                        ioGroup.leave()
+                    }
+                    ioGroup.enter()
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                        ioGroup.leave()
+                    }
+
+                    let exitSem = DispatchSemaphore(value: 0)
+                    process.terminationHandler = { _ in exitSem.signal() }
+                    let waitResult = exitSem.wait(timeout: .now() + timeoutSeconds)
+                    if waitResult == .timedOut {
+                        process.terminate()
+                        _ = exitSem.wait(timeout: .now() + 2)
+                        continuation.resume(throwing: MailAccessError.appleScriptFailed(message: "Mail.app 响应超时（\(Int(timeoutSeconds)) 秒），操作已中止"))
+                        return
+                    }
+                    ioGroup.wait()
 
                     if process.terminationStatus == 0 {
                         let output = String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

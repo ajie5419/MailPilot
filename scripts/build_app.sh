@@ -5,14 +5,15 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="MailPilot"
 DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/${APP_NAME}.app"
-CONTENTS_DIR="$APP_BUNDLE/Contents"
+STAGING_BUNDLE="$DIST_DIR/.${APP_NAME}.staging.app"
+CONTENTS_DIR="$STAGING_BUNDLE/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 MODULE_CACHE="${TMPDIR:-/tmp}/mailpilot-clang-module-cache"
 DEFAULT_CERT_NAME="MailPilot Dev"
 
-mkdir -p "$MODULE_CACHE"
-rm -rf "$APP_BUNDLE"
+mkdir -p "$MODULE_CACHE" "$DIST_DIR"
+rm -rf "$STAGING_BUNDLE"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 echo "Compiling ${APP_NAME} with swiftc..."
@@ -99,12 +100,16 @@ fi
 
 if [[ -n "$SIGN_IDENTITY" ]]; then
   echo "Signing with stable certificate: ${SIGN_IDENTITY}"
-  codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
+  codesign --force --deep --sign "$SIGN_IDENTITY" "$STAGING_BUNDLE"
 else
   echo "Note: '${DEFAULT_CERT_NAME}' certificate not found; falling back to ad-hoc signing."
   echo "Run ./scripts/setup_dev_cert.sh once to preserve macOS permissions across rebuilds."
-  codesign --force --deep --sign - "$APP_BUNDLE"
+  codesign --force --deep --sign - "$STAGING_BUNDLE"
 fi
+
+# Atomically swap the verified staging bundle into place so a failed build never deletes the previous working app.
+rm -rf "$APP_BUNDLE"
+mv "$STAGING_BUNDLE" "$APP_BUNDLE"
 
 # Refresh macOS LaunchServices icon registration so Finder & Notification Center pick up AppIcon.icns
 touch "$APP_BUNDLE"

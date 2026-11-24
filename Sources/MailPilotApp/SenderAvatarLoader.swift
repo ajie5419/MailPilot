@@ -8,10 +8,32 @@ import MailPilotCore
 @MainActor
 final class SenderAvatarLoader: ObservableObject {
     static let shared = SenderAvatarLoader()
+    private static let onlineAvatarsEnabledKey = "MailPilot.AllowOnlineBrandAvatars.v1"
 
+    /// Privacy default: `false` so sender domains are never sent to external favicon services unless explicitly enabled.
+    @Published var allowOnlineBrandAvatars: Bool {
+        didSet {
+            UserDefaults.standard.set(allowOnlineBrandAvatars, forKey: Self.onlineAvatarsEnabledKey)
+            if !allowOnlineBrandAvatars {
+                failedDomains.removeAll()
+            }
+            objectWillChange.send()
+        }
+    }
     @Published private(set) var images: [String: NSImage] = [:]
     private var customImages: [String: NSImage] = [:]
     private var inFlight: Set<String> = []
+    private var pendingImages: [String: NSImage] = [:]
+    private var pendingFailed: [String] = []
+    private var flushTask: Task<Void, Never>?
+
+    private static let sharedSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 6
+        config.timeoutIntervalForResource = 8
+        config.httpMaximumConnectionsPerHost = 4
+        return URLSession(configuration: config)
+    }()
 
     func customIcon(at path: String?) -> NSImage? {
         guard let path, !path.isEmpty else { return nil }
@@ -19,6 +41,9 @@ final class SenderAvatarLoader: ObservableObject {
             return cached
         }
         guard let img = NSImage(contentsOfFile: path) else { return nil }
+        if customImages.count >= 50 {
+            customImages.removeAll(keepingCapacity: true)
+        }
         customImages[path] = img
         return img
     }
@@ -32,6 +57,7 @@ final class SenderAvatarLoader: ObservableObject {
     private let cacheDirectory: URL
 
     private init() {
+        self.allowOnlineBrandAvatars = UserDefaults.standard.bool(forKey: Self.onlineAvatarsEnabledKey)
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         self.cacheDirectory = caches.appendingPathComponent("MailPilot/BrandIcons", isDirectory: true)
@@ -67,6 +93,9 @@ final class SenderAvatarLoader: ObservableObject {
     }
 
     private func loadOrFetch(domain: String) -> NSImage? {
+        guard allowOnlineBrandAvatars else {
+            return nil
+        }
         if let cached = images[domain] {
             return cached
         }
@@ -74,34 +103,58 @@ final class SenderAvatarLoader: ObservableObject {
             return nil
         }
 
-        // Fast disk cache hit
-        let diskURL = cacheDirectory.appendingPathComponent("\(domain).png")
-        if let diskImage = NSImage(contentsOf: diskURL), diskImage.size.width >= 16 {
-            images[domain] = diskImage
-            return diskImage
-        }
-
         inFlight.insert(domain)
         let cacheDir = cacheDirectory
+        let diskURL = cacheDir.appendingPathComponent("\(domain).png")
         Task.detached(priority: .utility) {
+            // Fast disk cache hit off the main thread (never block SwiftUI view body with disk I/O).
+            if let diskImage = NSImage(contentsOf: diskURL), diskImage.size.width >= 16 {
+                await MainActor.run {
+                    SenderAvatarLoader.shared.enqueueLoaded(domain: domain, image: diskImage)
+                }
+                return
+            }
+
             let fetched = await Self.fetchBrandIcon(for: domain)
             if let fetched, let tiff = fetched.tiffRepresentation,
                let rep = NSBitmapImageRep(data: tiff),
                let pngData = rep.representation(using: .png, properties: [:]) {
-                let target = cacheDir.appendingPathComponent("\(domain).png")
-                try? pngData.write(to: target, options: .atomic)
+                try? pngData.write(to: diskURL, options: .atomic)
             }
             await MainActor.run {
-                let loader = SenderAvatarLoader.shared
-                loader.inFlight.remove(domain)
-                if let fetched {
-                    loader.images[domain] = fetched
-                } else {
-                    loader.failedDomains.insert(domain)
-                }
+                SenderAvatarLoader.shared.enqueueLoaded(domain: domain, image: fetched)
             }
         }
         return nil
+    }
+
+    private func enqueueLoaded(domain: String, image: NSImage?) {
+        inFlight.remove(domain)
+        if let image {
+            pendingImages[domain] = image
+        } else {
+            pendingFailed.append(domain)
+        }
+        guard flushTask == nil else { return }
+        flushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(60))
+            guard let self else { return }
+            self.flushTask = nil
+            if !self.pendingFailed.isEmpty {
+                for d in self.pendingFailed {
+                    self.failedDomains.insert(d)
+                }
+                self.pendingFailed.removeAll(keepingCapacity: true)
+            }
+            guard !self.pendingImages.isEmpty else { return }
+            if self.images.count + self.pendingImages.count > 200 {
+                self.images.removeAll(keepingCapacity: true)
+            }
+            for (d, img) in self.pendingImages {
+                self.images[d] = img
+            }
+            self.pendingImages.removeAll(keepingCapacity: true)
+        }
     }
 
     private static func fetchBrandIcon(for domain: String) async -> NSImage? {
@@ -112,12 +165,7 @@ final class SenderAvatarLoader: ObservableObject {
             "https://\(domain)/favicon.ico"
         ]
 
-        let sessionConfig = URLSessionConfiguration.default
-        sessionConfig.timeoutIntervalForRequest = 6
-        sessionConfig.timeoutIntervalForResource = 8
-        let session = URLSession(configuration: sessionConfig)
-        defer { session.finishTasksAndInvalidate() }
-
+        let session = sharedSession
         for urlString in candidates {
             guard let url = URL(string: urlString) else { continue }
             do {

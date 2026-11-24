@@ -9,7 +9,7 @@ import Foundation
 ///    and recreated WAL files are automatically re-attached.
 public final class MailDirectoryWatcher: @unchecked Sendable {
     private let directoryURL: URL
-    private let queue = DispatchQueue(label: "com.mailpilot.fsevents", qos: .userInteractive)
+    private let queue = DispatchQueue(label: "com.mailpilot.fsevents", qos: .utility)
     private let stateLock = NSLock()
     private var streamRef: FSEventStreamRef?
     private var walSource: DispatchSourceFileSystemObject?
@@ -205,6 +205,6 @@ public final class MailDirectoryWatcher: @unchecked Sendable {
         debounceWorkItem = item
         stateLock.unlock()
 
-        queue.asyncAfter(deadline: .now() + 0.2, execute: item)
+        queue.asyncAfter(deadline: .now() + 0.35, execute: item)
     }
 }

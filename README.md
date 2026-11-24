@@ -21,11 +21,11 @@
 # 运行核心单元测试（仅需 CommandLineTools，无需完整 Xcode）
 ./scripts/run_tests.sh
 
-# 打包为标准 macOS .app
+# 打包为标准 macOS .app（原子替换，编译失败不破坏上一版本）
 ./scripts/build_app.sh
 
-# 启动应用
-open dist/MailPilot.app
+# 一键构建并通过 ditto 安全安装到 /Applications 并启动（推荐）
+./scripts/install_app.sh
 ```
 
 ## 首次使用权限配置
@@ -50,4 +50,4 @@ open dist/MailPilot.app
 
 ## 验证范围
 
-`./scripts/run_tests.sh` 包含原有 8 组核心测试，以及新增 OAuth 参数、身份签名、防伪回调、取消登录、并发续期、令牌轮换、订阅权限、账号退出和流式响应测试。网络调用使用本地模拟，不读取真实凭据、不发送真实邮件。真实账号登录及可用额度仍需在 OpenAI 授权后通过「验证连接」确认。
+`./scripts/run_tests.sh` 包含 22 组核心测试（涵盖只读索引、Gmail 多标签、FTS5 trigram 全文更新/删除、8bit GB18030 编码、内嵌 `cid:` 图片、O(1) `.emlx` 分桶定位、kqueue WAL 监听、API Key 钥匙串隔离、OAuth 表单编码等）以及 ChatGPT 专项测试。网络调用使用本地模拟，不读取真实凭据、不发送真实邮件。真实账号登录及可用额度仍需在 OpenAI 授权后通过「验证连接」确认。

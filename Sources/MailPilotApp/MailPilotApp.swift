@@ -5,13 +5,106 @@ import MailPilotCore
 import SwiftUI
 
 final class MailPilotAppDelegate: NSObject, NSApplicationDelegate {
+    @MainActor static weak var shared: MailPilotAppDelegate?
+    @MainActor private weak var mainWindow: NSWindow?
+    @MainActor private var closeInterceptor: WindowCloseInterceptor?
+    @MainActor private var isQuitting = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            Self.shared = self
+        }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        MainActor.assumeIsolated {
+            isQuitting = true
+            closeInterceptor?.isQuitting = true
+        }
+        return .terminateNow
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        MainActor.assumeIsolated {
+            if !flag, let window = mainWindow {
+                if window.isMiniaturized {
+                    window.deminiaturize(nil)
+                }
+                window.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+                return false
+            }
+            return true
+        }
+    }
+
+    @MainActor
+    func registerMainWindow(_ window: NSWindow) {
+        guard mainWindow !== window else { return }
+        mainWindow = window
+        // Intercept red close button (`⌘W` / `×`) to hide the window via `orderOut` instead of destroying
+        // the SwiftUI view tree & WKWebView, making reopening from Dock instantaneous (<16ms).
+        if !(window.delegate is WindowCloseInterceptor) {
+            let proxy = WindowCloseInterceptor(forwardingTo: window.delegate)
+            proxy.isQuitting = isQuitting
+            closeInterceptor = proxy
+            window.delegate = proxy
+        }
+    }
+
+    @MainActor
+    func showMainWindow() {
+        guard let window = mainWindow ?? NSApp.windows.first(where: { !$0.isSheet && $0.canBecomeMain }) else {
+            return
+        }
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+/// Forwarding `NSWindowDelegate` proxy that keeps SwiftUI's internal delegate intact while hiding
+/// the main window on close (`orderOut`) instead of tearing down WebKit & SwiftUI state.
+private final class WindowCloseInterceptor: NSObject, NSWindowDelegate {
+    private weak var originalDelegate: NSWindowDelegate?
+    var isQuitting = false
+
+    init(forwardingTo delegate: NSWindowDelegate?) {
+        self.originalDelegate = delegate
+        super.init()
+    }
+
+    override func responds(to aSelector: Selector!) -> Bool {
+        if super.responds(to: aSelector) {
+            return true
+        }
+        return originalDelegate?.responds(to: aSelector) ?? false
+    }
+
+    override func forwardingTarget(for aSelector: Selector!) -> Any? {
+        if let original = originalDelegate, original.responds(to: aSelector) {
+            return original
+        }
+        return super.forwardingTarget(for: aSelector)
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if isQuitting {
+            return originalDelegate?.windowShouldClose?(sender) ?? true
+        }
+        guard sender.attachedSheet == nil else {
+            return false
+        }
+        sender.orderOut(nil)
+        return false
     }
 }
 
@@ -28,10 +121,10 @@ struct MailPilotApp: App {
                     minHeight: viewModel.accessError != nil ? 450 : 560
                 )
                 .onAppear {
-                    resizeMainWindow(isOnboarding: viewModel.accessError != nil, animate: false)
+                    configureMainWindow(isOnboarding: viewModel.accessError != nil, animate: false)
                 }
                 .onChange(of: viewModel.accessError == nil) { _, isAuthorized in
-                    resizeMainWindow(isOnboarding: !isAuthorized, animate: true)
+                    configureMainWindow(isOnboarding: !isAuthorized, animate: true)
                 }
                 .sheet(isPresented: $viewModel.showSettings) {
                     SettingsSheetContainer(viewModel: viewModel)
@@ -40,7 +133,7 @@ struct MailPilotApp: App {
                     ComposeMailSheet(viewModel: viewModel)
                 }
         }
-        .defaultSize(width: 460, height: 470)
+        .defaultSize(width: 1120, height: 700)
         .commands {
             CommandGroup(replacing: .appSettings) {
                 Button("设置与 AI 订阅登录...") {
@@ -109,15 +202,22 @@ struct MailPilotApp: App {
     }
 
     @MainActor
-    private func resizeMainWindow(isOnboarding: Bool, animate: Bool) {
+    private func configureMainWindow(isOnboarding: Bool, animate: Bool) {
         DispatchQueue.main.async {
-            guard let window = NSApp.windows.first(where: { $0.isVisible && !$0.isSheet })
+            guard let window = NSApp.windows.first(where: { $0.isVisible && !$0.isSheet && $0.canBecomeMain })
                     ?? NSApp.keyWindow
-                    ?? NSApp.windows.first else {
+                    ?? NSApp.windows.first(where: { !$0.isSheet && $0.canBecomeMain }) else {
                 return
             }
+            MailPilotAppDelegate.shared?.registerMainWindow(window)
+
             let targetSize = isOnboarding ? NSSize(width: 460, height: 470) : NSSize(width: 1120, height: 700)
             let current = window.frame
+            let needsResize = isOnboarding
+                ? (abs(current.width - targetSize.width) > 40 || abs(current.height - targetSize.height) > 40)
+                : (current.width < 880 || current.height < 560)
+            guard needsResize else { return }
+
             let newOrigin = NSPoint(
                 x: current.midX - targetSize.width / 2,
                 y: current.midY - targetSize.height / 2

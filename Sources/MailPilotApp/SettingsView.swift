@@ -149,75 +149,249 @@ struct SettingsView: View {
     }
 
     private var chatGPTConfigCardBody: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("使用你的 ChatGPT 订阅")
-                .font(.headline)
-            Text("通过 OpenAI 官方页面授权，使用符合条件账号的订阅额度。邮件只在你使用 AI 功能时发送；登录和验证连接不会发送邮件。")
-                .font(.caption).foregroundStyle(.secondary)
+        let isSignedIn = viewModel.chatGPTAccount?.signedIn == true
+        let isPlanEnabled = viewModel.chatGPTAccount?.planEnabled == true
+        let isBusy = viewModel.isChatGPTSigningIn || viewModel.isChatGPTSigningOut || viewModel.isTestingChatGPT || viewModel.isAIThinking
 
-            if !viewModel.chatGPTAccounts.isEmpty {
-                Picker("账号", selection: Binding(
-                    get: { viewModel.chatGPTAccount?.id ?? "" },
-                    set: { viewModel.selectChatGPTAccount($0) }
-                )) {
-                    ForEach(viewModel.chatGPTAccounts) { account in
-                        Text(account.label + (account.signedIn ? "" : "（已退出）")).tag(account.id)
+        return VStack(alignment: .leading, spacing: 14) {
+            // Header row: Title + concise status pill + usage link
+            HStack(spacing: 8) {
+                Text("ChatGPT 订阅")
+                    .font(.headline)
+
+                if isSignedIn {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(isPlanEnabled ? Color.green : Color.orange)
+                            .frame(width: 6, height: 6)
+                        Text(isPlanEnabled ? "已授权" : "未授权额度")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(isPlanEnabled ? Color.green : Color.orange)
                     }
-                }
-                .disabled(viewModel.isChatGPTSigningIn || viewModel.isChatGPTSigningOut || viewModel.isTestingChatGPT || viewModel.isAIThinking)
-            }
-            if let account = viewModel.chatGPTAccount, account.signedIn {
-                Label(account.planEnabled ? "已登录 · 已授权订阅额度" : "已登录 · 未授权订阅额度",
-                      systemImage: account.planEnabled ? "checkmark.seal.fill" : "exclamationmark.circle")
-                    .foregroundStyle(account.planEnabled ? Color.green : Color.orange)
-                    .font(.callout)
-            }
-            HStack {
-                if viewModel.isChatGPTSigningIn {
-                    ProgressView().controlSize(.small)
-                    Text("等待浏览器授权…").font(.callout)
-                    Button("取消") { viewModel.cancelChatGPTSignIn() }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2.5)
+                    .background((isPlanEnabled ? Color.green : Color.orange).opacity(0.11), in: Capsule())
                 } else {
-                    Button(viewModel.chatGPTAccount?.signedIn == true ? "重新授权 ChatGPT" : "使用 ChatGPT 登录") {
-                        viewModel.startChatGPTSignIn()
+                    Text("未登录")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2.5)
+                        .background(Color.secondary.opacity(0.10), in: Capsule())
+                }
+
+                Spacer()
+
+                Link(destination: URL(string: "https://chatgpt.com/settings/usage")!) {
+                    HStack(spacing: 3) {
+                        Text("用量与授权")
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 9, weight: .semibold))
                     }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(viewModel.isChatGPTSigningOut || viewModel.isAIThinking || viewModel.isTestingChatGPT)
-                    if !viewModel.chatGPTAccounts.isEmpty {
-                        Button("添加账号") { viewModel.startChatGPTSignIn(newAccount: true) }
-                            .disabled(viewModel.isChatGPTSigningOut || viewModel.isAIThinking || viewModel.isTestingChatGPT)
-                    }
-                    if viewModel.chatGPTAccount?.signedIn == true {
-                        Button("退出登录") { viewModel.signOutChatGPT() }
-                            .disabled(viewModel.isChatGPTSigningOut)
-                    }
+                    .font(.caption)
                 }
             }
-            if let message = viewModel.chatGPTStatusMessage {
-                Text(message).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-            }
-            if viewModel.chatGPTAccount?.signedIn == true && viewModel.chatGPTAccount?.planEnabled == true {
-                Divider()
-                HStack {
-                    Picker("模型", selection: Binding(
-                        get: { viewModel.aiConfig.chatGPTModel ?? "" },
-                        set: { viewModel.aiConfig.chatGPTModel = $0 }
-                    )) {
-                        if viewModel.aiConfig.chatGPTModel == nil { Text("请刷新模型列表").tag("") }
-                        ForEach(viewModel.availableModels) { option in Text(option.displayName).tag(option.id) }
-                    }
-                    Button { viewModel.refreshAvailableModels() } label: { Image(systemName: "arrow.clockwise") }
-                        .help("刷新此账号的可用模型")
-                    if viewModel.isLoadingModels { ProgressView().controlSize(.small) }
-                }
-                .disabled(viewModel.isChatGPTSigningIn || viewModel.isChatGPTSigningOut || viewModel.isTestingChatGPT || viewModel.isAIThinking)
-                Button(viewModel.isTestingChatGPT ? "验证中…" : "验证连接") { viewModel.testChatGPTConnection() }
-                    .disabled(viewModel.aiConfig.chatGPTModel == nil || viewModel.isTestingChatGPT || viewModel.isAIThinking || viewModel.isChatGPTSigningOut || viewModel.isChatGPTSigningIn)
-                Text("验证会发送一条简短测试消息，并占用少量订阅额度。")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-            Link("查看 ChatGPT 使用量与应用授权", destination: URL(string: "https://chatgpt.com/settings/usage")!)
+
+            Text("通过 OpenAI 官方页面授权使用订阅额度；仅在你主动触发 AI 功能时发送邮件内容。")
                 .font(.caption)
+                .foregroundStyle(.secondary)
+
+            // Account section
+            VStack(alignment: .leading, spacing: 10) {
+                if !viewModel.chatGPTAccounts.isEmpty {
+                    HStack(spacing: 10) {
+                        Text("账号")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 36, alignment: .leading)
+                        Picker("", selection: Binding(
+                            get: { viewModel.chatGPTAccount?.id ?? "" },
+                            set: { viewModel.selectChatGPTAccount($0) }
+                        )) {
+                            ForEach(viewModel.chatGPTAccounts) { account in
+                                Text(account.label + (account.signedIn ? "" : "（已退出）")).tag(account.id)
+                            }
+                        }
+                        .labelsHidden()
+                        .disabled(isBusy)
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    if viewModel.isChatGPTSigningIn {
+                        ProgressView().controlSize(.small)
+                        Text("等待浏览器完成授权…")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("取消") { viewModel.cancelChatGPTSignIn() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    } else if isSignedIn && isPlanEnabled {
+                        Button("重新授权") { viewModel.startChatGPTSignIn() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(isBusy)
+                        Button("添加账号") { viewModel.startChatGPTSignIn(newAccount: true) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(isBusy)
+                        Spacer()
+                        Button("退出登录", role: .destructive) { viewModel.signOutChatGPT() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(viewModel.isChatGPTSigningOut)
+                    } else {
+                        Button(isSignedIn ? "重新授权订阅额度" : "使用 ChatGPT 登录") {
+                            viewModel.startChatGPTSignIn()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.regular)
+                        .disabled(isBusy)
+                        if !viewModel.chatGPTAccounts.isEmpty {
+                            Button("添加账号") { viewModel.startChatGPTSignIn(newAccount: true) }
+                                .buttonStyle(.bordered)
+                                .controlSize(.regular)
+                                .disabled(isBusy)
+                        }
+                        if isSignedIn {
+                            Spacer()
+                            Button("退出登录", role: .destructive) { viewModel.signOutChatGPT() }
+                                .buttonStyle(.bordered)
+                                .controlSize(.regular)
+                                .disabled(viewModel.isChatGPTSigningOut)
+                        }
+                    }
+                }
+
+                if let message = viewModel.chatGPTStatusMessage, !message.isEmpty {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "info.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 1)
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+
+            // Model & Connection Verification section
+            if isSignedIn && isPlanEnabled {
+                Divider()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        Text("模型")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 36, alignment: .leading)
+
+                        Picker("", selection: Binding(
+                            get: { viewModel.aiConfig.chatGPTModel ?? "" },
+                            set: { viewModel.aiConfig.chatGPTModel = $0 }
+                        )) {
+                            if viewModel.aiConfig.chatGPTModel == nil {
+                                Text("请选择模型").tag("")
+                            }
+                            ForEach(viewModel.availableModels) { option in
+                                Text(option.displayName).tag(option.id)
+                            }
+                        }
+                        .labelsHidden()
+                        .disabled(isBusy)
+
+                        Button {
+                            viewModel.refreshAvailableModels()
+                        } label: {
+                            if viewModel.isLoadingModels {
+                                ProgressView().controlSize(.mini)
+                                    .frame(width: 14, height: 14)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        .disabled(isBusy || viewModel.isLoadingModels)
+                        .help("刷新可用模型列表")
+
+                        Button {
+                            viewModel.testChatGPTConnection()
+                        } label: {
+                            HStack(spacing: 5) {
+                                if viewModel.isTestingChatGPT {
+                                    ProgressView().controlSize(.mini)
+                                } else {
+                                    Image(systemName: "bolt.horizontal.fill")
+                                        .font(.caption)
+                                }
+                                Text(viewModel.isTestingChatGPT ? "验证中…" : "验证连接")
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.regular)
+                        .disabled(viewModel.aiConfig.chatGPTModel == nil || isBusy)
+                    }
+
+                    // Immediate, high-visibility connection test feedback directly below the action row
+                    switch viewModel.chatGPTTestState {
+                    case .idle:
+                        Text("点击「验证连接」会发送一条极短测试消息（不含邮件内容），确认当前模型可正常响应。")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    case .testing:
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("正在向 \(viewModel.aiConfig.chatGPTModel ?? "模型") 发送不含邮件内容的测试请求…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.accentColor.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    case .success(let detail):
+                        HStack(alignment: .top, spacing: 7) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                                .font(.callout)
+                            Text(detail)
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.primary)
+                                .textSelection(.enabled)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .strokeBorder(Color.green.opacity(0.28), lineWidth: 0.75)
+                        )
+                    case .failure(let detail):
+                        HStack(alignment: .top, spacing: 7) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.red)
+                                .font(.callout)
+                            Text(detail)
+                                .font(.caption)
+                                .foregroundStyle(.primary)
+                                .textSelection(.enabled)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.red.opacity(0.09), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .strokeBorder(Color.red.opacity(0.28), lineWidth: 0.75)
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -226,35 +400,45 @@ struct SettingsView: View {
         return Button {
             viewModel.aiConfig.authMode = mode
         } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Image(systemName: icon)
-                        .font(.system(size: 14))
-                        .foregroundStyle(isSelected ? Color.accentColor : .secondary)
-                    Spacer()
-                    if isSelected {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.caption)
-                            .foregroundStyle(Color.accentColor)
-                    }
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                    .frame(width: 28, height: 28)
+                    .background(
+                        isSelected ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.10),
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    )
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                Text(title)
-                    .font(.callout.weight(.semibold))
-                    .foregroundStyle(.primary)
-                Text(subtitle)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+
+                Spacer(minLength: 4)
+
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(Color.accentColor)
+                }
             }
-            .padding(11)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
-                isSelected ? Color.accentColor.opacity(0.09) : Color.secondary.opacity(0.06),
-                in: RoundedRectangle(cornerRadius: 10)
+                isSelected ? Color.accentColor.opacity(0.08) : Color.secondary.opacity(0.05),
+                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(isSelected ? Color.accentColor : Color.secondary.opacity(0.18), lineWidth: isSelected ? 1.5 : 0.8)
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(isSelected ? Color.accentColor : Color.secondary.opacity(0.16), lineWidth: isSelected ? 1.4 : 0.75)
             )
         }
         .buttonStyle(.plain)
@@ -447,30 +631,32 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("本地 Ollama") {
-                    viewModel.aiConfig.baseURL = "http://localhost:11434/v1"
-                    viewModel.aiConfig.model = "qwen2.5:14b"
-                    viewModel.aiConfig.apiKey = ""
+                    viewModel.applyAPIPreset(baseURL: "http://localhost:11434/v1", model: "qwen2.5:14b")
                 }
                 Button("DeepSeek") {
-                    viewModel.aiConfig.baseURL = "https://api.deepseek.com/v1"
-                    viewModel.aiConfig.model = "deepseek-chat"
+                    viewModel.applyAPIPreset(baseURL: "https://api.deepseek.com/v1", model: "deepseek-chat")
                 }
                 Button("OpenAI") {
-                    viewModel.aiConfig.baseURL = "https://api.openai.com/v1"
-                    viewModel.aiConfig.model = "gpt-4o-mini"
+                    viewModel.applyAPIPreset(baseURL: "https://api.openai.com/v1", model: "gpt-4o-mini")
                 }
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
 
-            labeledField("Base URL", text: $viewModel.aiConfig.baseURL)
+            labeledField("Base URL", text: Binding(
+                get: { viewModel.aiConfig.baseURL },
+                set: { viewModel.updateAPIBaseURL($0) }
+            ))
             labeledField("Model", text: $viewModel.aiConfig.model)
             VStack(alignment: .leading, spacing: 4) {
-                Text("API Key（本地 Ollama 可留空）")
+                Text("API Key（按服务域名隔离加密存入系统钥匙串，本地 Ollama 可留空）")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                SecureField("sk-...", text: $viewModel.aiConfig.apiKey)
-                    .textFieldStyle(.roundedBorder)
+                SecureField("sk-...", text: Binding(
+                    get: { viewModel.aiConfig.apiKey },
+                    set: { viewModel.updateAPIKey($0) }
+                ))
+                .textFieldStyle(.roundedBorder)
             }
         }
     }
@@ -775,6 +961,62 @@ struct SettingsView: View {
 
     private var permissionSettingsContent: some View {
         VStack(alignment: .leading, spacing: 16) {
+            Text("隐私与网络安全")
+                .font(.title3.weight(.semibold))
+
+            settingsCard {
+                VStack(alignment: .leading, spacing: 12) {
+                    Toggle(isOn: $viewModel.blockRemoteImages) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("默认拦截邮件远程图片与外部资源")
+                                .font(.callout.weight(.medium))
+                            Text("防止追踪像素泄露 IP 与阅读时间；内嵌截图（cid:）仍正常显示，单封邮件可按需临时放行")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Divider()
+
+                    Toggle(isOn: Binding(
+                        get: { viewModel.allowOnlineBrandAvatars },
+                        set: { viewModel.allowOnlineBrandAvatars = $0 }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("允许联网获取发件人品牌头像")
+                                .font(.callout.weight(.medium))
+                            Text("关闭时仅使用本地字母头像与内置品牌图标，不向第三方图标服务外发发件人域名")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Divider()
+
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("本地正文全文搜索缓存")
+                                .font(.callout.weight(.medium))
+                            Text("当前已索引 \(viewModel.indexedBodyCount) 封邮件正文（仅保存在本机缓存，绝不改动原邮件库）")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("重建索引") {
+                            viewModel.rebuildBodySearchIndex()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Button("清空缓存") {
+                            viewModel.clearBodySearchIndex()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+            }
+
             Text("macOS 系统权限")
                 .font(.title3.weight(.semibold))
 

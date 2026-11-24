@@ -117,6 +117,9 @@ public struct MailAttachment: Identifiable, Hashable, Sendable {
     public let sizeBytes: Int
     public let localFileURL: URL?
     public let inlineData: Data?
+    public let sourceEmlxPath: String?
+    public let sourceByteRange: Range<Int>?
+    public let sourceTransferEncoding: String?
 
     public init(
         id: String = UUID().uuidString,
@@ -124,7 +127,10 @@ public struct MailAttachment: Identifiable, Hashable, Sendable {
         mimeType: String,
         sizeBytes: Int,
         localFileURL: URL? = nil,
-        inlineData: Data? = nil
+        inlineData: Data? = nil,
+        sourceEmlxPath: String? = nil,
+        sourceByteRange: Range<Int>? = nil,
+        sourceTransferEncoding: String? = nil
     ) {
         self.id = id
         self.filename = filename
@@ -132,6 +138,9 @@ public struct MailAttachment: Identifiable, Hashable, Sendable {
         self.sizeBytes = sizeBytes
         self.localFileURL = localFileURL
         self.inlineData = inlineData
+        self.sourceEmlxPath = sourceEmlxPath
+        self.sourceByteRange = sourceByteRange
+        self.sourceTransferEncoding = sourceTransferEncoding
     }
 
     public var formattedSize: String {
@@ -143,25 +152,37 @@ public struct MailAttachment: Identifiable, Hashable, Sendable {
     }
 }
 
+public enum MailBodyLoadStatus: String, Sendable, Equatable {
+    case ready
+    case missing
+    case failed
+}
+
 public struct ParsedMailBody: Sendable {
     public let plainText: String
     public let rawHTML: String?
     public let verificationCode: String?
     public let sourcePath: String?
+    public let sourceModifiedAt: Date?
     public let attachments: [MailAttachment]
+    public let loadStatus: MailBodyLoadStatus
 
     public init(
         plainText: String,
         rawHTML: String? = nil,
         verificationCode: String? = nil,
         sourcePath: String? = nil,
-        attachments: [MailAttachment] = []
+        sourceModifiedAt: Date? = nil,
+        attachments: [MailAttachment] = [],
+        loadStatus: MailBodyLoadStatus = .ready
     ) {
         self.plainText = plainText
         self.rawHTML = rawHTML
         self.verificationCode = verificationCode
         self.sourcePath = sourcePath
+        self.sourceModifiedAt = sourceModifiedAt
         self.attachments = attachments
+        self.loadStatus = loadStatus
     }
 }
 
@@ -246,6 +267,10 @@ public struct AIConfig: Codable, Sendable, Equatable {
     // Shared Privacy Option
     public var maskSensitiveData: Bool
 
+    private enum CodingKeys: String, CodingKey {
+        case authMode, chatGPTModel, cliProvider, cliCustomPath, cliModelOverride, oauth, baseURL, apiKey, model, maskSensitiveData
+    }
+
     public init(
         authMode: AIAuthMode = .chatGPT,
         chatGPTModel: String? = nil,
@@ -268,5 +293,46 @@ public struct AIConfig: Codable, Sendable, Equatable {
         self.apiKey = apiKey
         self.model = model
         self.maskSensitiveData = maskSensitiveData
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.authMode = try c.decodeIfPresent(AIAuthMode.self, forKey: .authMode) ?? .chatGPT
+        self.chatGPTModel = try c.decodeIfPresent(String.self, forKey: .chatGPTModel)
+        self.cliProvider = try c.decodeIfPresent(SubscriptionCLIProvider.self, forKey: .cliProvider) ?? .antigravity
+        self.cliCustomPath = try c.decodeIfPresent(String.self, forKey: .cliCustomPath) ?? ""
+        self.cliModelOverride = try c.decodeIfPresent(String.self, forKey: .cliModelOverride) ?? ""
+        self.oauth = try c.decodeIfPresent(OAuthProviderConfig.self, forKey: .oauth) ?? OAuthProviderConfig()
+        self.baseURL = try c.decodeIfPresent(String.self, forKey: .baseURL) ?? "http://localhost:11434/v1"
+        // Legacy plaintext `apiKey` is decoded only to support one-time migration into Keychain.
+        self.apiKey = try c.decodeIfPresent(String.self, forKey: .apiKey) ?? ""
+        self.model = try c.decodeIfPresent(String.self, forKey: .model) ?? "qwen2.5:14b"
+        self.maskSensitiveData = try c.decodeIfPresent(Bool.self, forKey: .maskSensitiveData) ?? true
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(authMode, forKey: .authMode)
+        try c.encodeIfPresent(chatGPTModel, forKey: .chatGPTModel)
+        try c.encode(cliProvider, forKey: .cliProvider)
+        try c.encode(cliCustomPath, forKey: .cliCustomPath)
+        try c.encode(cliModelOverride, forKey: .cliModelOverride)
+        try c.encode(oauth, forKey: .oauth)
+        try c.encode(baseURL, forKey: .baseURL)
+        // Never persist plaintext API keys into UserDefaults / JSON preferences.
+        try c.encode(model, forKey: .model)
+        try c.encode(maskSensitiveData, forKey: .maskSensitiveData)
+    }
+
+    /// Keychain account identifier scoped to the API endpoint host so switching providers never leaks keys across hosts.
+    public static func apiKeyKeychainAccount(for baseURL: String) -> String {
+        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let url = URL(string: trimmed), let host = url.host, !host.isEmpty {
+            if let port = url.port {
+                return "api-key-\(host)-\(port)"
+            }
+            return "api-key-\(host)"
+        }
+        return "api-key-default"
     }
 }

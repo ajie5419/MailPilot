@@ -4,6 +4,7 @@ public enum AIServiceError: LocalizedError, Sendable {
     case invalidEndpoint(String)
     case httpError(statusCode: Int, body: String)
     case emptyResponse
+    case incompleteStream(reason: String)
 
     public var errorDescription: String? {
         switch self {
@@ -13,6 +14,8 @@ public enum AIServiceError: LocalizedError, Sendable {
             return "AI 请求失败（状态 \(code)）：\(body.prefix(240))"
         case .emptyResponse:
             return "AI 未返回有效内容。"
+        case .incompleteStream(let reason):
+            return "AI 回答不完整：\(reason)"
         }
     }
 }
@@ -160,22 +163,44 @@ public struct AIService: Sendable {
             struct Choice: Decodable {
                 struct Delta: Decodable { let content: String? }
                 let delta: Delta?
+                let finish_reason: String?
             }
-            let choices: [Choice]
+            struct APIError: Decodable { let message: String? }
+            let choices: [Choice]?
+            let error: APIError?
         }
 
         var accumulated = ""
+        var sawDone = false
+        var finishReason: String?
         for try await line in bytes.lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             guard trimmed.hasPrefix("data:") else { continue }
             let payload = trimmed.dropFirst(5).trimmingCharacters(in: .whitespaces)
-            if payload == "[DONE]" { break }
-            if let data = payload.data(using: .utf8),
-               let chunk = try? JSONDecoder().decode(StreamChunk.self, from: data),
-               let piece = chunk.choices.first?.delta?.content {
-                accumulated += piece
-                onPartial?(accumulated)
+            if payload == "[DONE]" {
+                sawDone = true
+                break
             }
+            if let data = payload.data(using: .utf8),
+               let chunk = try? JSONDecoder().decode(StreamChunk.self, from: data) {
+                if let errMsg = chunk.error?.message, !errMsg.isEmpty {
+                    throw AIServiceError.incompleteStream(reason: errMsg)
+                }
+                if let reason = chunk.choices?.first?.finish_reason, !reason.isEmpty {
+                    finishReason = reason
+                }
+                if let piece = chunk.choices?.first?.delta?.content {
+                    accumulated += piece
+                    onPartial?(accumulated)
+                }
+            }
+        }
+
+        if let reason = finishReason, reason == "length" || reason == "content_filter" {
+            throw AIServiceError.incompleteStream(reason: "回答被截断（finish_reason=\(reason)）")
+        }
+        guard sawDone || finishReason == "stop" else {
+            throw AIServiceError.incompleteStream(reason: "流式连接在收到结束标记前中断")
         }
 
         let finalText = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)

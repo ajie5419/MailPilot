@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 #if canImport(MailPilotCore)
 import MailPilotCore
 #endif
@@ -22,29 +23,69 @@ struct MailDetailView: View {
                     Divider()
                 }
 
-                if let code = viewModel.selectedBody?.verificationCode {
+                if let loadedBody = viewModel.currentLoadedBody,
+                   let code = loadedBody.verificationCode {
                     verificationBanner(code: code)
                     Divider()
                 }
 
-                if let attachments = viewModel.selectedBody?.attachments, !attachments.isEmpty {
-                    attachmentsBar(attachments)
+                if let loadedBody = viewModel.currentLoadedBody,
+                   !loadedBody.attachments.isEmpty {
+                    attachmentsBar(loadedBody.attachments)
                     Divider()
                 }
 
-                if viewModel.isLoadingBody {
-                    ProgressView("正在解析本地 .emlx 正文...")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if !viewModel.preferPlainText, let html = viewModel.selectedBody?.rawHTML, !html.isEmpty {
-                    HTMLMailWebView(html: html)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    ScrollView {
-                        Text(linkifiedAttributedText(viewModel.selectedBody?.plainText ?? ""))
-                            .font(.body)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(20)
+                let loadedBody = viewModel.currentLoadedBody
+                let activeHTML: String? = (!viewModel.isLoadingBody && !viewModel.preferPlainText)
+                    ? loadedBody?.rawHTML.flatMap { $0.isEmpty ? nil : $0 }
+                    : nil
+                let shouldBlockRemote = viewModel.blockRemoteImages && !viewModel.allowedRemoteContentMessageIDs.contains(message.id)
+
+                if activeHTML != nil && shouldBlockRemote && viewModel.selectedBodyHasRemoteResources {
+                    HStack(spacing: 8) {
+                        Image(systemName: "hand.raised.shield.fill")
+                            .foregroundStyle(.blue)
+                        Text("已拦截远程图片与外部资源，防止追踪像素泄露隐私")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("加载本封远程图片") {
+                            viewModel.allowRemoteContent(for: message.id)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 7)
+                    .background(Color.blue.opacity(0.07))
+                    Divider()
+                }
+
+                // Keep a single warm WKWebView mounted across email switches & plain-text toggles
+                // so WebKit's WebContent subprocess is never torn down and cold-booted per click.
+                ZStack {
+                    HTMLMailWebView(
+                        html: activeHTML,
+                        blockRemoteContent: shouldBlockRemote,
+                        releaseDOMWhenNil: !viewModel.isLoadingBody && loadedBody != nil
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .opacity(activeHTML != nil ? 1 : 0)
+                    .allowsHitTesting(activeHTML != nil)
+
+                    if viewModel.isLoadingBody || loadedBody == nil {
+                        ProgressView("正在解析本地 .emlx 正文...")
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .background(.background)
+                    } else if activeHTML == nil {
+                        ScrollView {
+                            Text(viewModel.selectedPlainAttributedText)
+                                .font(.body)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(20)
+                        }
+                        .background(.background)
                     }
                 }
             }
@@ -93,7 +134,7 @@ struct MailDetailView: View {
                     }
                     .help("删除（⌘⌫）")
 
-                    if viewModel.selectedBody?.rawHTML != nil {
+                    if viewModel.currentLoadedBody?.rawHTML != nil {
                         Button {
                             viewModel.preferPlainText.toggle()
                         } label: {
@@ -388,10 +429,18 @@ struct MailDetailView: View {
         .background(.background)
     }
 
-    /// Detects URLs inside plain-text emails and converts them into clickable links.
-    private func linkifiedAttributedText(_ plain: String) -> AttributedString {
+}
+
+enum MailBodyPresentationHelper {
+    private static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+    private static let remoteResourceRegex = try? NSRegularExpression(
+        pattern: #"(?i)(src|href|background)\s*=\s*["']?https?://|url\(\s*["']?https?://"#
+    )
+
+    /// Detects URLs inside plain-text emails off the main thread once per email load.
+    static func linkify(_ plain: String) -> AttributedString {
         var attributed = AttributedString(plain)
-        guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else {
+        guard let detector = linkDetector else {
             return attributed
         }
         let nsRange = NSRange(plain.startIndex..<plain.endIndex, in: plain)
@@ -407,11 +456,40 @@ struct MailDetailView: View {
         }
         return attributed
     }
+
+    static func containsRemoteResourceURL(_ rawHTML: String) -> Bool {
+        guard let regex = remoteResourceRegex else { return false }
+        let range = NSRange(rawHTML.startIndex..<rawHTML.endIndex, in: rawHTML)
+        return regex.firstMatch(in: rawHTML, range: range) != nil
+    }
 }
 
-/// Renders rich HTML email content via WKWebView and opens clicked links (including target="_blank") in the system browser.
+/// Renders rich HTML email content via a single persistent WKWebView with isolated non-persistent storage,
+/// default CSP remote-resource blocking (preserving inline `data:` / `cid:` images),
+/// and strict external-link-only navigation policy.
 private struct HTMLMailWebView: NSViewRepresentable {
-    let html: String
+    let html: String?
+    let blockRemoteContent: Bool
+    let releaseDOMWhenNil: Bool
+
+    private static let stripRemoteRegexes: [(regex: NSRegularExpression, replacement: String)] = [
+        (#"(?i)<iframe[\s\S]*?</iframe\s*>"#, ""),
+        (#"(?i)<iframe[^>]*>"#, ""),
+        (#"(?i)<link[^>]+href\s*=\s*["']?https?://[^>]*>"#, ""),
+        (#"(?i)(\s(?:src|srcset|background|poster)\s*=\s*)(?:"https?://[^"]*"|'https?://[^']*'|https?://[^\s>]+)"#, "$1\"\""),
+        (#"(?i)url\(\s*["']?https?://[^)]*\)"#, "url()")
+    ].compactMap { pattern, rep in
+        (try? NSRegularExpression(pattern: pattern)).map { ($0, rep) }
+    }
+    private static let metaStripRegexes: [NSRegularExpression] = [
+        #"(?i)<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]*>"#,
+        #"(?i)<meta[^>]+http-equiv\s*=\s*["']?content-security-policy["']?[^>]*>"#
+    ].compactMap { try? NSRegularExpression(pattern: $0) }
+    private static let shellStripRegexes: [NSRegularExpression] = [
+        #"(?i)<!doctype[^>]*>"#,
+        #"(?i)</?html[^>]*>"#,
+        #"(?i)</?head[^>]*>"#
+    ].compactMap { try? NSRegularExpression(pattern: $0) }
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -419,6 +497,7 @@ private struct HTMLMailWebView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
+        config.websiteDataStore = .nonPersistent()
         config.defaultWebpagePreferences.allowsContentJavaScript = false
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
@@ -430,20 +509,110 @@ private struct HTMLMailWebView: NSViewRepresentable {
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
-        guard context.coordinator.lastLoadedHTML != html else { return }
-        context.coordinator.lastLoadedHTML = html
-        webView.loadHTMLString(Self.prepareReadableHTML(from: html), baseURL: nil)
+        guard let html else {
+            if releaseDOMWhenNil && context.coordinator.lastRenderKey != "EMPTY" {
+                context.coordinator.lastRenderKey = "EMPTY"
+                webView.loadHTMLString("<!doctype html><html><body></body></html>", baseURL: nil)
+            }
+            return
+        }
+        let digest = SHA256.hash(data: Data(html.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
+        let renderKey = "\(blockRemoteContent ? "B" : "A"):\(html.utf8.count):\(digest)"
+        guard context.coordinator.lastRenderKey != renderKey else { return }
+        context.coordinator.lastRenderKey = renderKey
+
+        let preparedHTML = Self.prepareReadableHTML(from: html, blockRemoteContent: blockRemoteContent)
+        let shouldBlock = blockRemoteContent
+        let controller = webView.configuration.userContentController
+
+        // Enforce network-layer blocking via WebKit's native WKContentRuleList BEFORE loading HTML.
+        // Fail-closed: if rule compilation fails, strip all remote resource URLs from the HTML before loading
+        // so zero external requests can leak on error paths.
+        if shouldBlock {
+            Self.loadBlockRuleList { ruleList in
+                guard context.coordinator.lastRenderKey == renderKey else { return }
+                controller.removeAllContentRuleLists()
+                if let ruleList {
+                    controller.add(ruleList)
+                    webView.loadHTMLString(preparedHTML, baseURL: nil)
+                } else {
+                    let stripped = Self.stripRemoteResourceURLs(from: preparedHTML)
+                    webView.loadHTMLString(stripped, baseURL: nil)
+                }
+            }
+        } else {
+            controller.removeAllContentRuleLists()
+            webView.loadHTMLString(preparedHTML, baseURL: nil)
+        }
     }
 
-    /// Ensures HTML emails always have a readable light canvas (preventing black-on-black text in Dark Mode)
-    /// and injects PingFang SC system font defaults for simple HTML emails without custom CSS.
-    private static func prepareReadableHTML(from rawHTML: String) -> String {
-        let lower = rawHTML.lowercased()
+    /// Fail-closed HTML sanitizer used when `WKContentRuleList` is unavailable:
+    /// removes remote `http(s)://` subresource URLs (`src`, `srcset`, `background`, `poster`, `url(...)`, `<link>`, `<iframe>`)
+    /// while preserving inline `data:` images and clickable `<a href="...">` links.
+    private static func stripRemoteResourceURLs(from html: String) -> String {
+        var out = html
+        for (regex, replacement) in stripRemoteRegexes {
+            let range = NSRange(out.startIndex..<out.endIndex, in: out)
+            out = regex.stringByReplacingMatches(in: out, range: range, withTemplate: replacement)
+        }
+        return out
+    }
+
+    private static let remoteBlockRulesJSON = """
+    [
+      {
+        "trigger": {
+          "url-filter": "^https?://.*",
+          "resource-type": ["image", "style-sheet", "script", "font", "media", "raw", "svg-document", "popup"]
+        },
+        "action": { "type": "block" }
+      }
+    ]
+    """
+
+    @MainActor private static var cachedBlockRuleList: WKContentRuleList?
+
+    private static func loadBlockRuleList(completion: @escaping @MainActor (WKContentRuleList?) -> Void) {
+        if let cached = cachedBlockRuleList {
+            completion(cached)
+            return
+        }
+        WKContentRuleListStore.default()?.compileContentRuleList(
+            forIdentifier: "com.mailpilot.block-remote-resources.v1",
+            encodedContentRuleList: remoteBlockRulesJSON
+        ) { ruleList, _ in
+            Task { @MainActor in
+                if let ruleList {
+                    cachedBlockRuleList = ruleList
+                }
+                completion(ruleList)
+            }
+        }
+    }
+
+    /// Ensures HTML emails always have a readable light canvas, strips meta-refresh & sender CSP tags,
+    /// and safely prepends Content-Security-Policy (without relying on regex-matching commented `<head>` tags).
+    private static func prepareReadableHTML(from rawHTML: String, blockRemoteContent: Bool) -> String {
+        var sanitizedHTML = rawHTML
+        for regex in metaStripRegexes {
+            let range = NSRange(sanitizedHTML.startIndex..<sanitizedHTML.endIndex, in: sanitizedHTML)
+            sanitizedHTML = regex.stringByReplacingMatches(in: sanitizedHTML, range: range, withTemplate: "")
+        }
+
+        let cspMeta: String
+        if blockRemoteContent {
+            cspMeta = #"<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; media-src data:; frame-src 'none'; object-src 'none';">"#
+        } else {
+            cspMeta = #"<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline' https: http:; font-src data: https: http:; media-src data: https: http:; frame-src 'none'; object-src 'none';">"#
+        }
+
+        let lower = sanitizedHTML.lowercased()
         let hasCustomStyling = lower.contains("<style") || lower.contains("font-family")
 
         let baseCSS: String
         if hasCustomStyling {
             baseCSS = """
+            \(cspMeta)
             <style id="mailpilot-canvas-style">
             :root { color-scheme: light; }
             html, body { background-color: #ffffff; color: #1d1d1f; }
@@ -451,6 +620,7 @@ private struct HTMLMailWebView: NSViewRepresentable {
             """
         } else {
             baseCSS = """
+            \(cspMeta)
             <style id="mailpilot-default-style">
             :root { color-scheme: light; }
             html, body {
@@ -469,27 +639,24 @@ private struct HTMLMailWebView: NSViewRepresentable {
             """
         }
 
-        if let headRegex = try? NSRegularExpression(pattern: "(?i)<head[^>]*>"),
-           let match = headRegex.firstMatch(in: rawHTML, range: NSRange(rawHTML.startIndex..<rawHTML.endIndex, in: rawHTML)),
-           let range = Range(match.range, in: rawHTML) {
-            var copy = rawHTML
-            copy.insert(contentsOf: baseCSS, at: range.upperBound)
-            return copy
+        // Always wrap with our own leading `<!doctype html><html><head>` containing the CSP meta tag first
+        // (after stripping untrusted outer doctype/html/head shells) so malformed markup or comments can never
+        // cause `<meta http-equiv="Content-Security-Policy">` to be ignored or placed after resource tags.
+        var bodyOnly = sanitizedHTML
+        for regex in shellStripRegexes {
+            let range = NSRange(bodyOnly.startIndex..<bodyOnly.endIndex, in: bodyOnly)
+            bodyOnly = regex.stringByReplacingMatches(in: bodyOnly, range: range, withTemplate: "")
         }
-
-        if let htmlRegex = try? NSRegularExpression(pattern: "(?i)<html[^>]*>"),
-           let match = htmlRegex.firstMatch(in: rawHTML, range: NSRange(rawHTML.startIndex..<rawHTML.endIndex, in: rawHTML)),
-           let range = Range(match.range, in: rawHTML) {
-            var copy = rawHTML
-            copy.insert(contentsOf: "<head>\(baseCSS)</head>", at: range.upperBound)
-            return copy
-        }
-
-        return "<!doctype html><html><head><meta charset=\"utf-8\">\(baseCSS)</head><body>\(rawHTML)</body></html>"
+        return "<!doctype html><html><head><meta charset=\"utf-8\">\(baseCSS)</head><body>\(bodyOnly)</body></html>"
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
-        var lastLoadedHTML: String = ""
+        var lastRenderKey: String = ""
+
+        private static func isAllowedExternalURL(_ url: URL) -> Bool {
+            guard let scheme = url.scheme?.lowercased() else { return false }
+            return scheme == "http" || scheme == "https" || scheme == "mailto"
+        }
 
         func webView(
             _ webView: WKWebView,
@@ -498,11 +665,21 @@ private struct HTMLMailWebView: NSViewRepresentable {
         ) {
             if navigationAction.navigationType == .linkActivated,
                let url = navigationAction.request.url {
-                NSWorkspace.shared.open(url)
+                if Self.isAllowedExternalURL(url) {
+                    NSWorkspace.shared.open(url)
+                }
                 decisionHandler(.cancel)
                 return
             }
-            decisionHandler(.allow)
+
+            // Only allow the initial local `loadHTMLString` main-frame load (`about:blank`).
+            let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? false
+            let urlString = navigationAction.request.url?.absoluteString.lowercased() ?? ""
+            if isMainFrame && (urlString == "about:blank" || urlString.isEmpty) {
+                decisionHandler(.allow)
+                return
+            }
+            decisionHandler(.cancel)
         }
 
         func webView(
@@ -511,7 +688,7 @@ private struct HTMLMailWebView: NSViewRepresentable {
             for navigationAction: WKNavigationAction,
             windowFeatures: WKWindowFeatures
         ) -> WKWebView? {
-            if let url = navigationAction.request.url {
+            if let url = navigationAction.request.url, Self.isAllowedExternalURL(url) {
                 NSWorkspace.shared.open(url)
             }
             return nil

@@ -11,6 +11,8 @@ enum ComposeMode: String {
 }
 
 struct ComposeDraftState {
+    var id: UUID = UUID()
+    var revision: Int = 0
     var mode: ComposeMode = .new
     var fromEmail: String = ""
     var toText: String = ""
@@ -20,10 +22,19 @@ struct ComposeDraftState {
     var attachmentURLs: [URL] = []
     var isSending: Bool = false
     var isAIPolishing: Bool = false
+    var pendingAIPolish: String? = nil
+    var polishBaseRevision: Int? = nil
+    var missingOriginAccountWarning: String? = nil
 }
 
 struct ComposeMailSheet: View {
     @ObservedObject var viewModel: AppViewModel
+
+    private var requiresExplicitSenderSelection: Bool {
+        !viewModel.accountEmails.isEmpty &&
+        viewModel.composeDraft.fromEmail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+        viewModel.composeDraft.missingOriginAccountWarning != nil
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -31,13 +42,23 @@ struct ComposeMailSheet: View {
             HStack(spacing: 10) {
                 Label(viewModel.composeDraft.mode.rawValue, systemImage: "square.and.pencil")
                     .font(.headline)
+                if !viewModel.composeDraft.fromEmail.isEmpty {
+                    Text(viewModel.composeDraft.fromEmail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                        .background(.quaternary.opacity(0.6), in: Capsule())
+                        .lineLimit(1)
+                }
                 Spacer()
                 Button("取消") {
-                    viewModel.showComposeSheet = false
+                    viewModel.closeComposeSheet()
                 }
                 .keyboardShortcut(.cancelAction)
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .disabled(viewModel.composeDraft.isSending)
 
                 Button("存草稿") {
                     viewModel.saveComposedDraft()
@@ -63,6 +84,7 @@ struct ComposeMailSheet: View {
                 .controlSize(.small)
                 .disabled(
                     viewModel.composeDraft.isSending ||
+                    requiresExplicitSenderSelection ||
                     viewModel.composeDraft.toText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 )
             }
@@ -72,18 +94,35 @@ struct ComposeMailSheet: View {
 
             Divider()
 
+            if let warning = viewModel.composeDraft.missingOriginAccountWarning,
+               viewModel.composeDraft.fromEmail.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(warning)
+                        .font(.caption)
+                        .foregroundStyle(.primary)
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(Color.orange.opacity(0.12))
+                Divider()
+            }
+
             // Recipient & Subject Fields
             VStack(spacing: 0) {
                 if !viewModel.accountEmails.isEmpty {
                     composeRow(label: "发件人") {
                         Picker("", selection: $viewModel.composeDraft.fromEmail) {
-                            Text("默认账号").tag("")
+                            Text(viewModel.composeDraft.missingOriginAccountWarning == nil ? "默认账号" : "请选择发件账号...").tag("")
                             ForEach(viewModel.accountEmails, id: \.self) { email in
                                 Text(email).tag(email)
                             }
                         }
                         .labelsHidden()
                         .frame(maxWidth: 320, alignment: .leading)
+                        .disabled(viewModel.composeDraft.isSending)
                         Spacer()
                     }
                     Divider().padding(.leading, 72)
@@ -92,12 +131,14 @@ struct ComposeMailSheet: View {
                 composeRow(label: "收件人") {
                     TextField("多个邮箱请用逗号分隔", text: $viewModel.composeDraft.toText)
                         .textFieldStyle(.plain)
+                        .disabled(viewModel.composeDraft.isSending)
                 }
                 Divider().padding(.leading, 72)
 
                 composeRow(label: "抄送") {
                     TextField("可选，多个邮箱请用逗号分隔", text: $viewModel.composeDraft.ccText)
                         .textFieldStyle(.plain)
+                        .disabled(viewModel.composeDraft.isSending)
                 }
                 Divider().padding(.leading, 72)
 
@@ -105,6 +146,7 @@ struct ComposeMailSheet: View {
                     TextField("输入邮件主题", text: $viewModel.composeDraft.subject)
                         .textFieldStyle(.plain)
                         .font(.callout.weight(.medium))
+                        .disabled(viewModel.composeDraft.isSending)
                 }
             }
             .background(.background)
@@ -131,6 +173,7 @@ struct ComposeMailSheet: View {
                                         .foregroundStyle(.tertiary)
                                 }
                                 .buttonStyle(.plain)
+                                .disabled(viewModel.composeDraft.isSending)
                             }
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
@@ -144,11 +187,67 @@ struct ComposeMailSheet: View {
                 Divider()
             }
 
-            // Body Editor
-            TextEditor(text: $viewModel.composeDraft.body)
-                .font(.body)
-                .padding(12)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Body Editor (track revisions on user edit so AI polish never overwrites manual typing)
+            TextEditor(
+                text: Binding(
+                    get: { viewModel.composeDraft.body },
+                    set: { newValue in
+                        if viewModel.composeDraft.body != newValue {
+                            viewModel.composeDraft.body = newValue
+                            viewModel.composeDraft.revision += 1
+                        }
+                    }
+                )
+            )
+            .font(.body)
+            .padding(12)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .disabled(viewModel.composeDraft.isSending)
+
+            // AI Polish Preview Panel (explicit adopt/discard so AI never clobbers user's draft)
+            if let preview = viewModel.composeDraft.pendingAIPolish, !preview.isEmpty {
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Label(
+                            viewModel.composeDraft.isAIPolishing ? "AI 润色预览（生成中...）" : "AI 润色建议（原稿已保留）",
+                            systemImage: "sparkles"
+                        )
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.purple)
+                        Spacer()
+                        if viewModel.composeDraft.isAIPolishing {
+                            Button("停止") {
+                                viewModel.cancelComposeAIPolish()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                        } else {
+                            Button("放弃") {
+                                viewModel.discardPendingAIPolish()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+
+                            Button("采纳替换正文") {
+                                viewModel.applyPendingAIPolish()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.mini)
+                        }
+                    }
+                    ScrollView {
+                        Text(preview)
+                            .font(.callout)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 115)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(Color.purple.opacity(0.06))
+            }
 
             Divider()
 
@@ -161,6 +260,7 @@ struct ComposeMailSheet: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .disabled(viewModel.composeDraft.isSending)
 
                 Button {
                     viewModel.polishComposeBodyWithAI()
@@ -176,11 +276,11 @@ struct ComposeMailSheet: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(viewModel.composeDraft.isAIPolishing)
+                .disabled(viewModel.composeDraft.isAIPolishing || viewModel.composeDraft.isSending)
 
                 Spacer()
 
-                Text("⌘↩ 直接发送 · 由系统 Mail.app 后台安全投递")
+                Text("⌘↩ 提交给系统 Mail.app 发送")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -188,7 +288,7 @@ struct ComposeMailSheet: View {
             .padding(.vertical, 10)
             .background(.bar)
         }
-        .frame(width: 660, height: 540)
+        .frame(width: 680, height: 580)
     }
 
     private func composeRow<Content: View>(label: String, @ViewBuilder content: () -> Content) -> some View {

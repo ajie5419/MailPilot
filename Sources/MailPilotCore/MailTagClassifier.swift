@@ -78,6 +78,38 @@ public enum MailTagClassifier {
         )
     }
 
+    private static let verificationKeywords = [
+        "验证码", "校验码", "动态码", "登录码", "安全码", "通行密钥", "登录方式",
+        "verification code", "security code", "sign-in code", "one-time", "otp", "passcode", "2fa"
+    ]
+    private static let billingKeywords = [
+        "账单", "发票", "收据", "扣款", "付款", "支付成功", "续费", "对账单", "余额", "退款", "移除了一张卡", "银行卡",
+        "invoice", "receipt", "billing", "payment", "statement", "charged", "refund", "subscription", "order number", "renew"
+    ]
+    private static let orderLogisticsKeywords = [
+        "订单", "发货", "物流", "快递", "运单", "签收", "派送", "包裹", "揽收", "已出库", "16688", "apple store",
+        "your order", "processing your order", "shipped", "shipping", "delivery", "tracking", "package", "dispatched"
+    ]
+    private static let meetingKeywords = [
+        "会议", "纪要", "日程", "评审", "邀请", "例会", "议程",
+        "meeting", "calendar", "invite", "invitation", "recurrent", "teams", "zoom", "webinar"
+    ]
+    private static let promotionKeywords = [
+        "优惠", "促销", "折扣", "特惠", "限时", "双11", "双十一", "新观点", "订阅", "周刊",
+        "black friday", "sale", "discount", "off ", "promo", "deal", "newsletter", "digest"
+    ]
+    private static let automatedSenderKeywords = [
+        "noreply", "no-reply", "donotreply", "do-not-reply",
+        "notify", "notification", "notice", "service@", "support@",
+        "info@", "billing@", "admin@", "hello@", "team@", "mailer@", "alert", "system"
+    ]
+    private static let notificationKeywords = [
+        "通知", "提醒", "告警", "变配", "状态", "登录", "更新", "确认", "激活", "欢迎", "工单", "密码", "过期",
+        "notification", "alert", "reminder", "notice", "status", "account", "shared some",
+        "login", "sign in", "sign-in", "failed", "welcome", "portal", "activation", "activate",
+        "verify", "confirm", "password", "reset", "security", "ticket", "expir", "suspended"
+    ]
+
     public static func classify(
         subject: String,
         senderName: String,
@@ -87,88 +119,66 @@ public enum MailTagClassifier {
         guard settings.isEnabled else { return [] }
 
         let subj = subject.lowercased()
-        let sender = "\(senderName) \(senderAddress)".lowercased()
+        let addrLower = senderAddress.lowercased()
+        let sender = "\(senderName.lowercased()) \(addrLower)"
         let combined = "\(subj) \(sender)"
+        let hasCustom = !settings.customKeywords.isEmpty
 
         var tags: [MailSmartTag] = []
+        tags.reserveCapacity(2)
 
         // 1. Verification / Security Code
         if settings.isTagEnabled(.verification) {
-            let defaults = [
-                "验证码", "校验码", "动态码", "登录码", "安全码", "通行密钥", "登录方式",
-                "verification code", "security code", "sign-in code", "one-time", "otp", "passcode", "2fa"
-            ]
-            if matchesAny(subj, defaults) || matchesAny(combined, settings.customKeywordList(for: .verification)) {
+            if matchesAny(subj, verificationKeywords)
+                || (hasCustom && matchesAny(combined, settings.customKeywordList(for: .verification))) {
                 tags.append(.verification)
             }
         }
 
         // 2. Billing / Invoice / Payment
         if settings.isTagEnabled(.billing) {
-            let defaults = [
-                "账单", "发票", "收据", "扣款", "付款", "支付成功", "续费", "对账单", "余额", "退款", "移除了一张卡", "银行卡",
-                "invoice", "receipt", "billing", "payment", "statement", "charged", "refund", "subscription", "order number", "renew"
-            ]
-            if matchesAny(combined, defaults + settings.customKeywordList(for: .billing)) {
+            if matchesAny(combined, billingKeywords)
+                || (hasCustom && matchesAny(combined, settings.customKeywordList(for: .billing))) {
                 tags.append(.billing)
             }
         }
 
         // 3. Order & Logistics
-        if settings.isTagEnabled(.orderLogistics) {
-            let defaults = [
-                "订单", "发货", "物流", "快递", "运单", "签收", "派送", "包裹", "揽收", "已出库", "16688", "apple store",
-                "your order", "processing your order", "shipped", "shipping", "delivery", "tracking", "package", "dispatched"
-            ]
-            if matchesAny(combined, defaults + settings.customKeywordList(for: .orderLogistics)) {
+        if tags.count < 2 && settings.isTagEnabled(.orderLogistics) {
+            if matchesAny(combined, orderLogisticsKeywords)
+                || (hasCustom && matchesAny(combined, settings.customKeywordList(for: .orderLogistics))) {
                 tags.append(.orderLogistics)
             }
         }
 
         // 4. Meeting & Calendar
-        if settings.isTagEnabled(.meeting) {
-            let defaults = [
-                "会议", "纪要", "日程", "评审", "邀请", "例会", "议程",
-                "meeting", "calendar", "invite", "invitation", "recurrent", "teams", "zoom", "webinar"
-            ]
-            if matchesAny(subj, defaults) || matchesAny(combined, settings.customKeywordList(for: .meeting)) {
+        if tags.count < 2 && settings.isTagEnabled(.meeting) {
+            if matchesAny(subj, meetingKeywords)
+                || (hasCustom && matchesAny(combined, settings.customKeywordList(for: .meeting))) {
                 tags.append(.meeting)
             }
         }
 
         // 5. Promotion / Newsletter
-        if settings.isTagEnabled(.promotion) {
-            let defaults = [
-                "优惠", "促销", "折扣", "特惠", "限时", "双11", "双十一", "新观点", "订阅", "周刊",
-                "black friday", "sale", "discount", "off ", "promo", "deal", "newsletter", "digest"
-            ]
-            if matchesAny(subj, defaults) || matchesAny(combined, settings.customKeywordList(for: .promotion)) {
+        if tags.count < 2 && settings.isTagEnabled(.promotion) {
+            if matchesAny(subj, promotionKeywords)
+                || (hasCustom && matchesAny(combined, settings.customKeywordList(for: .promotion))) {
                 tags.append(.promotion)
             }
         }
 
         // 6. System Notification / Security / Welcome / Support
-        if settings.isTagEnabled(.notification) {
-            let isAutomatedSender = matchesAny(senderAddress.lowercased(), [
-                "noreply", "no-reply", "donotreply", "do-not-reply",
-                "notify", "notification", "notice", "service@", "support@",
-                "info@", "billing@", "admin@", "hello@", "team@", "mailer@", "alert", "system"
-            ])
-            let hasNotifyKeyword = matchesAny(subj, [
-                "通知", "提醒", "告警", "变配", "状态", "登录", "更新", "确认", "激活", "欢迎", "工单", "密码", "过期",
-                "notification", "alert", "reminder", "notice", "status", "account", "shared some",
-                "login", "sign in", "sign-in", "failed", "welcome", "portal", "activation", "activate",
-                "verify", "confirm", "password", "reset", "security", "ticket", "expir", "suspended"
-            ])
-            let matchedCustom = matchesAny(combined, settings.customKeywordList(for: .notification))
-            if matchedCustom || hasNotifyKeyword || (tags.isEmpty && isAutomatedSender) {
+        if tags.count < 2 && settings.isTagEnabled(.notification) {
+            let hasNotifyKeyword = matchesAny(subj, notificationKeywords)
+            let matchedCustom = hasCustom && matchesAny(combined, settings.customKeywordList(for: .notification))
+            if matchedCustom || hasNotifyKeyword || (tags.isEmpty && matchesAny(addrLower, automatedSenderKeywords)) {
                 if !tags.contains(.promotion) {
                     tags.append(.notification)
                 }
             }
         }
 
-        return Array(tags.prefix(2))
+        return tags
     }
 
     private static func matchesAny(_ text: String, _ keywords: [String]) -> Bool {

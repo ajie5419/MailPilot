@@ -297,16 +297,30 @@ struct StandaloneTestRunner {
         let walHandle = try FileHandle(forWritingTo: walURL)
         defer { try? walHandle.close() }
 
-        let semaphore = DispatchSemaphore(value: 0)
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
         let watcher = MailDirectoryWatcher(directoryURL: watchDir) {
-            semaphore.signal()
+            continuation.yield(())
         }
         defer { watcher.stop() }
         // Append to WAL while keeping file descriptor open (exactly like SQLite WAL mode)
         try walHandle.seekToEnd()
         try walHandle.write(contentsOf: Data("new-mail-wal-frame".utf8))
-        let waitResult = semaphore.wait(timeout: .now() + 2.0)
-        assertTrue(waitResult == .success, "MailDirectoryWatcher triggers on open-fd WAL write")
+        let triggered = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await _ in stream {
+                    return true
+                }
+                return false
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(2))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        assertTrue(triggered, "MailDirectoryWatcher triggers on open-fd WAL write")
 
         // 17. Gmail multi-label `labels` table support (message in All Mail with INBOX label)
         let dbTmpURL = FileManager.default.temporaryDirectory
@@ -342,7 +356,364 @@ struct StandaloneTestRunner {
         let byBoxMsgs = try labelReader.fetchMessages(mailboxID: 1, limit: 10)
         assertEqual(byBoxMsgs.map(\.id), [100], "mailboxID query includes Gmail message linked via labels")
 
-        print("ALL 17 CORE TEST SUITES PASSED")
+        // 18. AIConfig never persists plaintext apiKey in JSON / UserDefaults (F05)
+        let secretCfg = AIConfig(authMode: .apiKey, baseURL: "https://api.deepseek.com/v1", apiKey: "FAKE-AUDIT-KEY")
+        let encodedCfgData = try JSONEncoder().encode(secretCfg)
+        let encodedCfgText = String(data: encodedCfgData, encoding: .utf8) ?? ""
+        assertTrue(!encodedCfgText.contains("FAKE-AUDIT-KEY"), "encoded AIConfig omits plaintext apiKey")
+        let legacyJSON = Data(#"{"authMode":"api_key","baseURL":"https://api.openai.com/v1","apiKey":"LEGACY-KEY","model":"gpt-4o-mini","maskSensitiveData":true}"#.utf8)
+        let decodedLegacy = try JSONDecoder().decode(AIConfig.self, from: legacyJSON)
+        assertEqual(decodedLegacy.apiKey, "LEGACY-KEY", "legacy plaintext apiKey still decodes for one-time migration")
+        assertTrue(
+            AIConfig.apiKeyKeychainAccount(for: "https://api.deepseek.com/v1") != AIConfig.apiKeyKeychainAccount(for: "https://api.openai.com/v1"),
+            "API key keychain account isolated per provider host"
+        )
+
+        // 19. FTS5 update leaves zero stale old tokens & delete works (F09)
+        let ftsUpdateURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-fts-upd-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: ftsUpdateURL) }
+        let ftsUpd = BodySearchIndex(databaseURL: ftsUpdateURL)
+        await ftsUpd.upsertBatch([(rowID: 1, subject: "S", sender: "a@b.com", body: "olduniquetoken 旧合同内容")])
+        await ftsUpd.upsertBatch([(rowID: 1, subject: "S", sender: "a@b.com", body: "newuniquetoken 新审批内容")])
+        assertEqual(await ftsUpd.searchRowIDs(query: "olduniquetoken"), [], "FTS5 removes old token after update")
+        assertEqual(await ftsUpd.searchRowIDs(query: "newuniquetoken"), [1], "FTS5 indexes new token after update")
+        assertEqual(await ftsUpd.searchRowIDs(query: "新审批内容"), [1], "FTS5 trigram matches Chinese substring")
+        await ftsUpd.deleteRowIDs([1])
+        assertEqual(await ftsUpd.searchRowIDs(query: "newuniquetoken"), [], "FTS5 removes token after delete")
+
+        // 20. Gmail multi-label body search hydration via SQL (F08)
+        let gmailHydrated = try labelReader.fetchMessages(byRowIDs: [100], onlyInbox: true)
+        assertEqual(gmailHydrated.map(\.id), [100], "fetchMessages(byRowIDs:onlyInbox:) keeps Gmail label-linked inbox mail")
+        assertEqual(try labelReader.fetchMaxInboxRowID(), 100, "fetchMaxInboxRowID includes label-linked inbox mail")
+        assertEqual(try labelReader.fetchUnreadInboxMessages(afterRowID: 50).map(\.id), [100], "fetchUnreadInboxMessages(afterRowID:) finds new Gmail mail")
+
+        // 21. Raw 8bit GB18030 email decodes cleanly without mojibake (F15)
+        let gbEncoding = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
+        let gbHeader = Data("Content-Type: text/plain; charset=gb18030\r\nContent-Transfer-Encoding: 8bit\r\n\r\n".utf8)
+        let gbBody = "你好，测试编码".data(using: gbEncoding)!
+        let parsedGB = EmlxParser.parseEmlxData(gbHeader + gbBody)
+        assertEqual(parsedGB.plainText, "你好，测试编码", "8bit GB18030 decoded accurately")
+
+        // 22. OAuth form encoding strictly escapes reserved separators (F12)
+        assertEqual(OAuthSubscriptionManager.urlEncodeForm("a+b&c=d"), "a%2Bb%26c%3Dd", "OAuth form encoding escapes +, &, =")
+
+        // 23. Attachment regression: raw UTF-8 Chinese filename + byte-exact 8bit binary attachment
+        // including internal CRLF (`\r\n`), trailing spaces, and trailing tabs (`\t`)
+        let rawBinBytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0xFF, 0xFE, 0xC4, 0xE3, 0x20, 0x20, 0x09])
+        var attEmailData = Data()
+        attEmailData.append(Data("Content-Type: multipart/mixed; boundary=\"attbnd\"\r\n\r\n".utf8))
+        attEmailData.append(Data("--attbnd\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n正文内容\r\n".utf8))
+        attEmailData.append(Data("--attbnd\r\nContent-Type: application/octet-stream; name=\"合同报告.pdf\"\r\nContent-Disposition: attachment; filename=\"合同报告.pdf\"\r\nContent-Transfer-Encoding: 8bit\r\n\r\n".utf8))
+        attEmailData.append(rawBinBytes)
+        attEmailData.append(Data("\r\n--attbnd--\r\n".utf8))
+        let parsedAttReg = EmlxParser.parseEmlxData(attEmailData)
+        assertEqual(parsedAttReg.attachments.count, 1, "8bit attachment extracted")
+        assertEqual(parsedAttReg.attachments.first?.filename, "合同报告.pdf", "raw UTF-8 Chinese attachment filename preserved")
+        assertEqual(parsedAttReg.attachments.first?.inlineData, rawBinBytes, "8bit attachment preserves CRLF, trailing spaces, and tabs byte-for-byte")
+
+        // 24. Global unbounded FTS5 search + mailbox filter: 101 inbox hits behind 2,200 archive hits must all be returned
+        let bigFTSURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-fts-400-\(UUID().uuidString).sqlite")
+        let bigEnvURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-env-400-\(UUID().uuidString).sqlite")
+        defer {
+            try? FileManager.default.removeItem(at: bigFTSURL)
+            try? FileManager.default.removeItem(at: bigEnvURL)
+        }
+        let bigFTS = BodySearchIndex(databaseURL: bigFTSURL)
+        let padding = String(repeating: "a", count: 32_000)
+        var bulkEntries: [(rowID: Int64, subject: String, sender: String, body: String, fileMTime: Double)] = []
+        // ROWIDs 1..101 are INBOX; ROWIDs 102..2301 are Archive (higher ROWIDs would crowd out a naive global LIMIT 2000!)
+        for i in Int64(1)...Int64(2301) {
+            let body = (i == 101) ? "sharedneedle \(padding) TAILMARKER_99999" : "sharedneedle item \(i)"
+            bulkEntries.append((rowID: i, subject: "S\(i)", sender: "u@example.com", body: body, fileMTime: 100.0))
+        }
+        await bigFTS.upsertBatchWithMTime(bulkEntries)
+        let allNeedleHits = await bigFTS.searchRowIDs(query: "sharedneedle", limit: nil)
+        assertEqual(allNeedleHits.count, 2301, "unbounded FTS5 search returns all 2,301 hits")
+
+        var bigDB: OpaquePointer?
+        assertEqual(sqlite3_open(bigEnvURL.path, &bigDB), SQLITE_OK, "open big temp env db")
+        var bigSeedSQL = """
+        BEGIN;
+        CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url TEXT);
+        CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject TEXT);
+        CREATE TABLE addresses (ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT);
+        CREATE TABLE messages (ROWID INTEGER PRIMARY KEY, message_id INTEGER, subject INTEGER, sender INTEGER, date_received REAL, read INTEGER, flagged INTEGER, deleted INTEGER, mailbox INTEGER);
+        INSERT INTO mailboxes VALUES (1, 'imap://ACCT/INBOX');
+        INSERT INTO mailboxes VALUES (2, 'imap://ACCT/Archive');
+        INSERT INTO subjects VALUES (1, 'Test');
+        INSERT INTO addresses VALUES (1, 'u@example.com', 'User');
+        """
+        for i in 1...2301 {
+            let mb = i <= 101 ? 1 : 2
+            bigSeedSQL += "INSERT INTO messages VALUES (\(i), \(i), 1, 1, \(1700000000 + i), 0, 0, 0, \(mb));\n"
+        }
+        bigSeedSQL += "COMMIT;"
+        assertEqual(sqlite3_exec(bigDB, bigSeedSQL, nil, nil, nil), SQLITE_OK, "seed 2,301 messages")
+        sqlite3_close(bigDB)
+
+        let bigReader = EnvelopeIndexReader(mailVersionURL: bigEnvURL.deletingLastPathComponent(), databaseURL: bigEnvURL)
+        let inboxOnlyHits = try bigReader.fetchMessages(byRowIDs: allNeedleHits, onlyInbox: true)
+        assertEqual(inboxOnlyHits.count, 101, "all 101 inbox hits returned even behind 2,200 archive hits")
+        let tailHits = await bigFTS.searchRowIDs(query: "TAILMARKER_99999")
+        assertEqual(tailHits, [101], "long email tail beyond 32,000 chars is searchable")
+        let versions = await bigFTS.indexedVersions(in: [101])
+        assertEqual(versions[101], 100.0, "indexedVersions returns stored file_mtime")
+
+        // 25. Custom OAuth Keychain accounts are isolated across BOTH different hosts AND different tenants on the SAME host
+        let oauthTenantA = OAuthProviderConfig(
+            kind: .customPKCE,
+            authorizationURL: "https://login.microsoftonline.com/tenant-a/oauth2/v2.0/authorize",
+            tokenURL: "https://login.microsoftonline.com/tenant-a/oauth2/v2.0/token",
+            clientID: "shared-app-client",
+            apiBaseURL: "https://api.corp.io/v1"
+        )
+        let oauthTenantB = OAuthProviderConfig(
+            kind: .customPKCE,
+            authorizationURL: "https://login.microsoftonline.com/tenant-b/oauth2/v2.0/authorize",
+            tokenURL: "https://login.microsoftonline.com/tenant-b/oauth2/v2.0/token",
+            clientID: "shared-app-client",
+            apiBaseURL: "https://api.corp.io/v1"
+        )
+        assertTrue(
+            OAuthSubscriptionManager.keychainAccount(for: oauthTenantA) != OAuthSubscriptionManager.keychainAccount(for: oauthTenantB),
+            "custom OAuth keychain accounts isolated across different tenants on the same host"
+        )
+
+        // 26. Quoted-printable CRLF soft line break regression (`hello=\r\nworld` -> `helloworld`)
+        let qpCRLF = "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nhello=\r\nworld\r\nhttps://example.com/verify?token=3Dabc=\r\ndef&ok=3D1\r\n=E4=BD=\r\n=A0=E5=A5=BD\r\npadded= \t\r\njoined"
+        let parsedQPCRLF = EmlxParser.parseEmlxData(Data(qpCRLF.utf8))
+        assertTrue(parsedQPCRLF.plainText.contains("helloworld"), "QP CRLF soft line break unfolds hello=\\r\\nworld to helloworld")
+        assertTrue(!parsedQPCRLF.plainText.contains("hello="), "QP CRLF soft line break leaves no trailing '='")
+        assertTrue(parsedQPCRLF.plainText.contains("https://example.com/verify?token=abcdef&ok=1"), "QP CRLF soft line break preserves split URLs")
+        assertTrue(parsedQPCRLF.plainText.contains("你好"), "QP CRLF soft line break across multi-byte UTF-8 sequence decodes cleanly")
+        assertTrue(parsedQPCRLF.plainText.contains("paddedjoined"), "QP transport-padded soft line break unfolds cleanly")
+
+        let qpHTML = "Content-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n<a href=3D\"https://example.com/a=\r\nb\">hello=\r\nworld</a>"
+        let parsedQPHTML = EmlxParser.parseEmlxData(Data(qpHTML.utf8))
+        assertEqual(parsedQPHTML.plainText, "helloworld", "QP CRLF HTML plainText unfolds cleanly")
+        assertTrue(parsedQPHTML.rawHTML?.contains("href=\"https://example.com/ab\"") == true, "QP CRLF HTML link unfolds cleanly")
+
+        // 27. Search pagination without body index: 2,100 subject hits must paginate cleanly past first 200
+        let pagedEnvURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-env-search-page-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: pagedEnvURL) }
+        var pagedDB: OpaquePointer?
+        assertEqual(sqlite3_open(pagedEnvURL.path, &pagedDB), SQLITE_OK, "open paged search db")
+        var pagedSeedSQL = """
+        BEGIN;
+        CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url TEXT);
+        CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject TEXT);
+        CREATE TABLE addresses (ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT);
+        CREATE TABLE messages (ROWID INTEGER PRIMARY KEY, message_id INTEGER, subject INTEGER, sender INTEGER, date_received REAL, read INTEGER, flagged INTEGER, deleted INTEGER, mailbox INTEGER);
+        INSERT INTO mailboxes VALUES (1, 'imap://ACCT/INBOX');
+        INSERT INTO subjects VALUES (1, 'Quarterly Report Batch');
+        INSERT INTO subjects VALUES (2, 'Unrelated Notice');
+        INSERT INTO addresses VALUES (1, 'u@example.com', 'User');
+        """
+        for i in 1...2100 {
+            pagedSeedSQL += "INSERT INTO messages VALUES (\(i), \(i), 1, 1, \(1700000000 + i), 0, 0, 0, 1);\n"
+        }
+        // Add 1 body-only candidate with newer timestamp to test chronological merged pagination as well
+        pagedSeedSQL += "INSERT INTO messages VALUES (9001, 9001, 2, 1, \(1700000000 + 3000), 0, 0, 0, 1);\n"
+        pagedSeedSQL += "COMMIT;"
+        assertEqual(sqlite3_exec(pagedDB, pagedSeedSQL, nil, nil, nil), SQLITE_OK, "seed 2,100 subject hits")
+        sqlite3_close(pagedDB)
+
+        let pagedReader = EnvelopeIndexReader(mailVersionURL: pagedEnvURL.deletingLastPathComponent(), databaseURL: pagedEnvURL)
+        // Body index is empty (`bodyHitIDs: []`)
+        let searchPage1 = try pagedReader.fetchMessagePage(onlyInbox: true, searchQuery: "Quarterly Report", bodyHitIDs: [], limit: 200)
+        assertEqual(searchPage1.messages.count, 200, "search page 1 returns first 200 of 2,100 title hits")
+        assertTrue(searchPage1.hasMore, "search page 1 reports hasMore = true when 2,100 title hits exist without body index")
+        let searchPage2 = try pagedReader.fetchMessagePage(onlyInbox: true, searchQuery: "Quarterly Report", bodyHitIDs: [], limit: 400)
+        assertEqual(searchPage2.messages.count, 400, "search page 2 loads next page to 400 hits")
+        assertTrue(searchPage2.hasMore, "search page 2 still has more pages")
+        let searchPageFinal = try pagedReader.fetchMessagePage(onlyInbox: true, searchQuery: "Quarterly Report", bodyHitIDs: [], limit: 2200)
+        assertEqual(searchPageFinal.messages.count, 2100, "final search page loads all 2,100 title hits")
+        assertTrue(!searchPageFinal.hasMore, "final search page reports hasMore = false")
+        // Merged subject + body hit pagination preserves exact newest-first ordering and pagination
+        let mergedPage1 = try pagedReader.fetchMessagePage(onlyInbox: true, searchQuery: "Quarterly Report", bodyHitIDs: [9001], limit: 200)
+        assertEqual(mergedPage1.messages.count, 200, "merged search page 1 stays capped at 200")
+        assertEqual(mergedPage1.messages.first?.id, 9001, "newest body-only hit ranks first in merged search page 1")
+        assertTrue(mergedPage1.hasMore, "merged search page 1 reports hasMore = true")
+
+        // 28. OAuth Keychain isolation preserves case-sensitive paths (`/Tenant/` vs `/tenant/`), query params, and scheme/host normalization
+        let oauthUpperTenant = OAuthProviderConfig(
+            kind: .customPKCE,
+            authorizationURL: "https://idp.example.com/Tenant/oauth2/authorize",
+            tokenURL: "https://idp.example.com/Tenant/oauth2/token",
+            clientID: "shared-client",
+            apiBaseURL: "https://api.example.com/Tenant/v1"
+        )
+        let oauthLowerTenant = OAuthProviderConfig(
+            kind: .customPKCE,
+            authorizationURL: "https://idp.example.com/tenant/oauth2/authorize",
+            tokenURL: "https://idp.example.com/tenant/oauth2/token",
+            clientID: "shared-client",
+            apiBaseURL: "https://api.example.com/tenant/v1"
+        )
+        let oauthUpperHostSamePath = OAuthProviderConfig(
+            kind: .customPKCE,
+            authorizationURL: "HTTPS://IDP.EXAMPLE.COM:443/Tenant/oauth2/authorize",
+            tokenURL: "https://IDP.example.com/Tenant/oauth2/token",
+            clientID: "shared-client",
+            apiBaseURL: "https://API.example.com/Tenant/v1"
+        )
+        let oauthTrailingSlash = OAuthProviderConfig(
+            kind: .customPKCE,
+            authorizationURL: "https://idp.example.com/Tenant/oauth2/authorize",
+            tokenURL: "https://idp.example.com/Tenant/oauth2/token/",
+            clientID: "shared-client",
+            apiBaseURL: "https://api.example.com/Tenant/v1"
+        )
+        assertTrue(
+            OAuthSubscriptionManager.keychainAccount(for: oauthUpperTenant) != OAuthSubscriptionManager.keychainAccount(for: oauthLowerTenant),
+            "OAuth keychain account distinguishes /Tenant/ from /tenant/ paths"
+        )
+        assertTrue(
+            OAuthSubscriptionManager.keychainAccount(for: oauthUpperTenant) != OAuthSubscriptionManager.keychainAccount(for: oauthTrailingSlash),
+            "OAuth keychain account distinguishes /token from /token/ (trailing slash preserved per RFC 3986)"
+        )
+        assertEqual(
+            OAuthSubscriptionManager.keychainAccount(for: oauthUpperTenant),
+            OAuthSubscriptionManager.keychainAccount(for: oauthUpperHostSamePath),
+            "OAuth keychain account still normalizes case-insensitive scheme/host and default port"
+        )
+        let oauthQueryA = OAuthProviderConfig(
+            kind: .customPKCE,
+            authorizationURL: "https://idp.example.com/oauth2/authorize?tenant=TenantA",
+            tokenURL: "https://idp.example.com/oauth2/token?tenant=TenantA",
+            clientID: "shared-client",
+            apiBaseURL: "https://api.example.com/v1"
+        )
+        let oauthQueryB = OAuthProviderConfig(
+            kind: .customPKCE,
+            authorizationURL: "https://idp.example.com/oauth2/authorize?tenant=tenantA",
+            tokenURL: "https://idp.example.com/oauth2/token?tenant=tenantA",
+            clientID: "shared-client",
+            apiBaseURL: "https://api.example.com/v1"
+        )
+        assertTrue(
+            OAuthSubscriptionManager.keychainAccount(for: oauthQueryA) != OAuthSubscriptionManager.keychainAccount(for: oauthQueryB),
+            "OAuth keychain account preserves query parameters and case"
+        )
+        assertEqual(
+            OAuthSubscriptionManager.keychainAccount(for: OAuthProviderConfig(kind: .openRouter)),
+            "oauth-token-openrouter",
+            "Default OpenRouter config preserves legacy keychain account identifier"
+        )
+
+        // 29. Low-memory indexing path: checks mtime before reading and skips unchanged .emlx
+        let idxMailRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-idx-\(UUID().uuidString)", isDirectory: true)
+        let idxMsgDir = idxMailRoot.appendingPathComponent("INBOX.mbox/Data/Messages", isDirectory: true)
+        try FileManager.default.createDirectory(at: idxMsgDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: idxMailRoot) }
+        let idxEmlxURL = idxMsgDir.appendingPathComponent("42.emlx")
+        let idxRFC822 = "Content-Type: text/plain; charset=utf-8\r\n\r\nIndexed plain text body."
+        try Data("\(idxRFC822.utf8.count)\n\(idxRFC822)\n".utf8).write(to: idxEmlxURL)
+
+        let idxParser = EmlxParser(mailRootURL: idxMailRoot)
+        let firstIdx = await idxParser.loadPlainTextForIndexing(for: 42, cachedMTime: nil)
+        var capturedMTime: Double = 0
+        if case let .parsed(text, mtime) = firstIdx {
+            assertEqual(text, "Indexed plain text body.", "plainTextOnly extracts text accurately")
+            capturedMTime = mtime
+        } else {
+            assertTrue(false, "first loadPlainTextForIndexing should parse")
+        }
+        let secondIdx = await idxParser.loadPlainTextForIndexing(for: 42, cachedMTime: capturedMTime)
+        if case .unchanged = secondIdx {
+            assertTrue(true, "unchanged mtime skips reading .emlx")
+        } else {
+            assertTrue(false, "unchanged mtime should return .unchanged")
+        }
+
+        // 30. Large attachment lazy parsing & on-demand decoding (zero upfront attachment decode on file-backed .emlx)
+        let bigAttRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-bigatt-\(UUID().uuidString)", isDirectory: true)
+        let bigAttDir = bigAttRoot.appendingPathComponent("INBOX.mbox/Data/Messages", isDirectory: true)
+        try FileManager.default.createDirectory(at: bigAttDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: bigAttRoot) }
+        let bigPayload = Data((0..<(2 * 1024 * 1024)).map { UInt8($0 & 0xFF) })
+        let bigBase64 = bigPayload.base64EncodedString(options: [.lineLength76Characters, .endLineWithCarriageReturn, .endLineWithLineFeed])
+        var bigMime = Data()
+        bigMime.append(Data("Content-Type: multipart/mixed; boundary=\"bigbnd\"\r\n\r\n".utf8))
+        bigMime.append(Data("--bigbnd\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nShort 53-byte body for lazy large-attachment testing!\r\n".utf8))
+        bigMime.append(Data("--bigbnd\r\nContent-Type: application/pdf; name=\"report.pdf\"\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\n".utf8))
+        bigMime.append(Data(bigBase64.utf8))
+        bigMime.append(Data("\r\n--bigbnd--\r\n".utf8))
+        var bigEmlx = Data("\(bigMime.count)\n".utf8)
+        bigEmlx.append(bigMime)
+        let bigEmlxURL = bigAttDir.appendingPathComponent("77.emlx")
+        try bigEmlx.write(to: bigEmlxURL)
+
+        let bigAttParser = EmlxParser(mailRootURL: bigAttRoot)
+        let lazyBody = await bigAttParser.loadBody(for: 77)
+        assertEqual(lazyBody.plainText, "Short 53-byte body for lazy large-attachment testing!", "lazy parse extracts plain text accurately")
+        assertEqual(lazyBody.attachments.count, 1, "lazy parse discovers 1 attachment")
+        assertTrue(lazyBody.attachments[0].inlineData == nil, "file-backed attachment stays lazy (inlineData == nil)")
+        assertTrue(lazyBody.attachments[0].sourceByteRange != nil, "lazy attachment records exact byte range")
+        let decodedOnDemand = EmlxParser.decodeAttachmentData(lazyBody.attachments[0])
+        assertEqual(decodedOnDemand, bigPayload, "on-demand decodeAttachmentData reproduces exact 2 MiB attachment bytes")
+        if case let .parsed(indexedText, _) = await bigAttParser.loadPlainTextForIndexing(for: 77, cachedMTime: nil) {
+            assertEqual(indexedText, "Short 53-byte body for lazy large-attachment testing!", "plain-text indexing extracts body cleanly")
+        } else {
+            assertTrue(false, "loadPlainTextForIndexing should parse big attachment email")
+        }
+
+        // 31. Keyset cursor pagination (`fetchIndexableMessages(beforeRowID:limit:)`) scans all rows with zero gaps/duplicates
+        let keysetDBURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-keyset-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: keysetDBURL) }
+        var keysetDB: OpaquePointer?
+        assertEqual(sqlite3_open(keysetDBURL.path, &keysetDB), SQLITE_OK, "open keyset db")
+        var keysetSQL = """
+        BEGIN;
+        CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url TEXT);
+        CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject TEXT);
+        CREATE TABLE addresses (ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT);
+        CREATE TABLE messages (ROWID INTEGER PRIMARY KEY, message_id INTEGER, subject INTEGER, sender INTEGER, date_received REAL, read INTEGER, flagged INTEGER, deleted INTEGER, mailbox INTEGER);
+        INSERT INTO mailboxes VALUES (1, 'imap://ACCT/INBOX');
+        INSERT INTO mailboxes VALUES (2, 'imap://ACCT/Archive');
+        INSERT INTO subjects VALUES (1, 'History');
+        INSERT INTO addresses VALUES (1, 'u@example.com', 'User');
+        """
+        for i in 1...1050 {
+            let mb = (i % 5 == 0) ? 1 : 2
+            // Intentionally give an older ROWID (10) a very recent timestamp to test bounded top-K cutoff accuracy!
+            let ts = (i == 10) ? (1700000000 + 99999) : (1700000000 + i)
+            keysetSQL += "INSERT INTO messages VALUES (\(i), \(i), 1, 1, \(ts), 0, 0, 0, \(mb));\n"
+        }
+        keysetSQL += "COMMIT;"
+        assertEqual(sqlite3_exec(keysetDB, keysetSQL, nil, nil, nil), SQLITE_OK, "seed 1,050 rows")
+        sqlite3_close(keysetDB)
+
+        let keysetReader = EnvelopeIndexReader(mailVersionURL: keysetDBURL.deletingLastPathComponent(), databaseURL: keysetDBURL)
+        var collectedIDs: [Int64] = []
+        var cursor: Int64? = nil
+        while true {
+            let page = try keysetReader.fetchIndexableMessages(beforeRowID: cursor, limit: 200)
+            if page.isEmpty { break }
+            collectedIDs.append(contentsOf: page.map(\.id))
+            cursor = page.last?.id
+            if page.count < 200 { break }
+        }
+        assertEqual(collectedIDs.count, 1050, "keyset pagination visits all 1,050 rows")
+        assertEqual(Set(collectedIDs).count, 1050, "keyset pagination yields zero duplicates")
+        assertEqual(collectedIDs.first, 1050, "keyset starts at highest ROWID")
+        assertEqual(collectedIDs.last, 1, "keyset finishes at lowest ROWID")
+
+        // 32. Bounded top-K search hydration keeps newer inbox hit even at low ROWID without hydrating all hits
+        let allHitIDs = (1...1050).reversed().map { Int64($0) }
+        let boundedPage = try keysetReader.fetchMessagePage(onlyInbox: true, searchQuery: "NoTitleMatch", bodyHitIDs: allHitIDs, limit: 50)
+        assertEqual(boundedPage.messages.count, 50, "bounded top-K returns exact page size 50")
+        assertTrue(boundedPage.hasMore, "bounded top-K reports hasMore = true for 210 inbox hits")
+        assertEqual(boundedPage.messages.first?.id, 10, "bounded top-K still finds newest-dated inbox hit at low ROWID=10")
+
+        print("ALL 32 CORE TEST SUITES PASSED")
         try await ChatGPTTests.run()
     }
 }

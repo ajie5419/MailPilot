@@ -70,6 +70,53 @@ public enum OAuthSubscriptionManager {
         "oauth-token-\(kind.rawValue)"
     }
 
+    /// Scopes OAuth Keychain credentials per provider kind, full normalized auth/token/API URLs
+    /// (preserving case-sensitive paths and query parameters per RFC 3986 while normalizing scheme/host case
+    /// and default ports), client ID, and scopes so distinct tenants never share or overwrite credentials.
+    public static func keychainAccount(for config: OAuthProviderConfig) -> String {
+        func normalizedEndpoint(_ raw: String) -> String {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let comps = URLComponents(string: trimmed),
+                  let rawScheme = comps.scheme, !rawScheme.isEmpty,
+                  let rawHost = comps.host, !rawHost.isEmpty else {
+                return trimmed
+            }
+            let scheme = rawScheme.lowercased()
+            let host = rawHost.lowercased()
+            let user = comps.percentEncodedUser.map { "\($0)@" } ?? ""
+            let port: String
+            if let p = comps.port, !((scheme == "https" && p == 443) || (scheme == "http" && p == 80)) {
+                port = ":\(p)"
+            } else {
+                port = ""
+            }
+            var path = comps.percentEncodedPath
+            if path.isEmpty {
+                path = "/"
+            } else if !path.hasPrefix("/") {
+                path = "/" + path
+            }
+            let query = comps.percentEncodedQuery.map { "?\($0)" } ?? ""
+            return "\(scheme)://\(user)\(host)\(port)\(path)\(query)"
+        }
+        let authNorm = normalizedEndpoint(config.authorizationURL)
+        let tokenNorm = normalizedEndpoint(config.tokenURL)
+        let apiNorm = normalizedEndpoint(config.apiBaseURL)
+        if config.kind == .openRouter,
+           authNorm == "https://openrouter.ai/auth",
+           tokenNorm == "https://openrouter.ai/api/v1/auth/keys",
+           apiNorm == "https://openrouter.ai/api/v1" {
+            return "oauth-token-\(config.kind.rawValue)"
+        }
+        let client = config.clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let scope = config.scopes.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fields = [config.kind.rawValue, authNorm, tokenNorm, apiNorm, client, scope]
+        let fingerprintInput = fields.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+        let digest = SHA256.hash(data: Data(fingerprintInput.utf8))
+        let hex = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+        return "oauth-token-\(config.kind.rawValue)-\(hex)"
+    }
+
     public static func generatePKCE() -> (verifier: String, challenge: String) {
         var bytes = [UInt8](repeating: 0, count: 32)
         _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
@@ -178,12 +225,12 @@ public enum OAuthSubscriptionManager {
             codeVerifier: pkce.verifier,
             callbackURL: callbackURL
         )
-        try KeychainStore.saveToken(bundle, account: keychainAccount(for: config.kind))
+        try KeychainStore.saveToken(bundle, account: keychainAccount(for: config))
         return bundle
     }
 
     public static func refreshTokenIfNeeded(config: OAuthProviderConfig) async throws -> OAuthTokenBundle {
-        let account = keychainAccount(for: config.kind)
+        let account = keychainAccount(for: config)
         guard let current = KeychainStore.loadToken(account: account) else {
             throw OAuthError.tokenExchangeFailed("尚未登录，请先在设置中点击「浏览器登录」。")
         }
@@ -215,6 +262,10 @@ public enum OAuthSubscriptionManager {
         let refreshed = try decodeStandardTokenResponse(data, fallbackRefreshToken: refreshToken)
         try KeychainStore.saveToken(refreshed, account: account)
         return refreshed
+    }
+
+    public static func signOut(config: OAuthProviderConfig) {
+        KeychainStore.delete(account: keychainAccount(for: config))
     }
 
     public static func signOut(kind: OAuthProviderKind) {
@@ -307,8 +358,12 @@ public enum OAuthSubscriptionManager {
             .replacingOccurrences(of: "=", with: "")
     }
 
-    private static func urlEncodeForm(_ str: String) -> String {
-        str.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? str
+    private static let formUnreservedCharacters = CharacterSet(
+        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+    )
+
+    public static func urlEncodeForm(_ str: String) -> String {
+        str.addingPercentEncoding(withAllowedCharacters: formUnreservedCharacters) ?? str
     }
 }
 
@@ -317,6 +372,7 @@ private final class LoopbackCallbackServer: @unchecked Sendable {
     private let listener: NWListener
     private let queue = DispatchQueue(label: "com.mailpilot.oauth.loopback")
     private var continuation: CheckedContinuation<[String: String], Error>?
+    private var pendingParams: [String: String]?
     private var startResumed = false
     private var resolved = false
 
@@ -360,6 +416,16 @@ private final class LoopbackCallbackServer: @unchecked Sendable {
         try await withCheckedThrowingContinuation { cont in
             queue.async { [weak self] in
                 guard let self else { return }
+                if let buffered = self.pendingParams {
+                    self.pendingParams = nil
+                    self.resolved = true
+                    cont.resume(returning: buffered)
+                    return
+                }
+                if self.resolved {
+                    cont.resume(throwing: OAuthError.cancelledOrTimedOut)
+                    return
+                }
                 self.continuation = cont
                 self.queue.asyncAfter(deadline: .now() + .seconds(Int(timeoutSeconds))) { [weak self] in
                     guard let self, !self.resolved else { return }
@@ -372,7 +438,15 @@ private final class LoopbackCallbackServer: @unchecked Sendable {
     }
 
     func stop() {
-        listener.cancel()
+        queue.async { [weak self] in
+            guard let self else { return }
+            if !self.resolved {
+                self.resolved = true
+                self.continuation?.resume(throwing: OAuthError.cancelledOrTimedOut)
+                self.continuation = nil
+            }
+            self.listener.cancel()
+        }
     }
 
     private func handleConnection(_ connection: NWConnection) {
@@ -383,11 +457,20 @@ private final class LoopbackCallbackServer: @unchecked Sendable {
                 return
             }
             let firstLine = requestText.components(separatedBy: "\r\n").first ?? ""
-            let params = OAuthSubscriptionManager.parseCallbackQuery(from: firstLine)
+            let parts = firstLine.split(separator: " ")
+            let target = parts.count >= 2 ? String(parts[1]) : ""
+            guard target.hasPrefix("/callback") else {
+                let notFound = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"
+                connection.send(content: Data(notFound.utf8), completion: .contentProcessed { _ in
+                    connection.cancel()
+                })
+                return
+            }
 
+            let params = OAuthSubscriptionManager.parseCallbackQuery(from: firstLine)
             let html = """
             <!doctype html><html><meta charset="utf-8"><body style="font-family:-apple-system,sans-serif;text-align:center;padding:60px;">
-            <h2>✅ MailPilot 登录授权成功</h2><p>可以关闭此浏览器标签页并返回 MailPilot。</p></body></html>
+            <h2>已收到授权回调</h2><p>正在 MailPilot 中完成令牌验证，请返回应用查看最终状态。</p></body></html>
             """
             let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n\(html)"
             connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in
@@ -395,9 +478,13 @@ private final class LoopbackCallbackServer: @unchecked Sendable {
             })
 
             if !self.resolved {
-                self.resolved = true
-                self.continuation?.resume(returning: params)
-                self.continuation = nil
+                if let cont = self.continuation {
+                    self.resolved = true
+                    self.continuation = nil
+                    cont.resume(returning: params)
+                } else {
+                    self.pendingParams = params
+                }
             }
         }
     }

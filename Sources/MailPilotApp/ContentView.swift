@@ -1,3 +1,4 @@
+import AppKit
 #if canImport(MailPilotCore)
 import MailPilotCore
 #endif
@@ -5,6 +6,7 @@ import SwiftUI
 
 struct ContentView: View {
     @ObservedObject var viewModel: AppViewModel
+    @FocusState private var isMessageListFocused: Bool
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -315,60 +317,43 @@ struct ContentView: View {
                 Divider()
             }
 
-            List(viewModel.messages, selection: $viewModel.selectedMessageIDs) { msg in
-                MessageRowView(
-                    message: msg,
-                    tagSettings: viewModel.tagSettings,
-                    accountBadge: viewModel.isUnifiedView ? viewModel.accountShortUsername(for: msg.accountID) : nil,
-                    accountEmail: viewModel.accountEmail(for: msg.accountID),
-                    accountCustomIconPath: viewModel.accountCustomIconPath(for: msg.accountID),
-                    accountPresetLogoID: viewModel.accountPresetLogoID(for: msg.accountID),
-                    accountSFSymbolName: viewModel.accountSFSymbolName(for: msg.accountID),
-                    accountColor: viewModel.accountBadgeColor(for: msg.accountID)
-                )
-                    .tag(msg.id)
-                    .contextMenu {
-                        if viewModel.selectedMessageIDs.count > 1 && viewModel.selectedMessageIDs.contains(msg.id) {
-                            Button("全部标为已读（\(viewModel.selectedMessageIDs.count) 封）") {
-                                viewModel.batchMarkSelected(isRead: true)
+            ScrollViewReader { scrollProxy in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(viewModel.messages.enumerated()), id: \.element.id) { idx, msg in
+                            messageListCell(msg: msg, index: idx)
+                                .id(msg.id)
+                        }
+
+                        if viewModel.hasMoreMessages {
+                            let isSearching = !viewModel.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            HStack {
+                                Spacer()
+                                Button(isSearching ? "加载更多搜索结果" : "加载更多历史邮件") {
+                                    viewModel.loadMoreMessages()
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                Spacer()
                             }
-                            Button("全部标为未读（\(viewModel.selectedMessageIDs.count) 封）") {
-                                viewModel.batchMarkSelected(isRead: false)
-                            }
-                            Divider()
-                            Button("批量归档（\(viewModel.selectedMessageIDs.count) 封）") {
-                                viewModel.batchArchiveSelected()
-                            }
-                            Button("批量删除（\(viewModel.selectedMessageIDs.count) 封）", role: .destructive) {
-                                viewModel.batchDeleteSelected()
-                            }
-                        } else {
-                            Button("回复") {
-                                viewModel.openComposeReply(for: msg)
-                            }
-                            Button("转发") {
-                                viewModel.openComposeForward(for: msg)
-                            }
-                            Divider()
-                            Button(msg.isRead ? "标记为未读" : "标记为已读") {
-                                viewModel.toggleReadStatus(for: msg)
-                            }
-                            Button(msg.isFlagged ? "取消旗标" : "添加旗标") {
-                                viewModel.toggleFlaggedStatus(for: msg)
-                            }
-                            Button("归档") {
-                                viewModel.archiveMessage(msg)
-                            }
-                            Button("删除", role: .destructive) {
-                                viewModel.deleteMessage(msg)
-                            }
-                            Divider()
-                            Button("在系统 Mail.app 中打开") {
-                                viewModel.openInNativeMail(msg)
-                            }
+                            .padding(.vertical, 10)
                         }
                     }
+                    .padding(.vertical, 6)
+                }
+                .focusable()
+                .focusEffectDisabled()
+                .focused($isMessageListFocused)
+                .onKeyPress(.upArrow) {
+                    moveMessageSelection(by: -1, scrollProxy: scrollProxy)
+                    return .handled
+                }
+                .onKeyPress(.downArrow) {
+                    moveMessageSelection(by: 1, scrollProxy: scrollProxy)
+                    return .handled
+                }
             }
+            .background(Color(nsColor: .textBackgroundColor))
             .overlay {
                 if viewModel.messages.isEmpty {
                     ContentUnavailableView(
@@ -378,6 +363,129 @@ struct ContentView: View {
                     )
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func messageListCell(msg: MailMessageSummary, index: Int) -> some View {
+        let isSelected = viewModel.selectedMessageIDs.contains(msg.id)
+        let hasNext = index + 1 < viewModel.messages.count
+        let nextSelected = hasNext && viewModel.selectedMessageIDs.contains(viewModel.messages[index + 1].id)
+
+        MessageListRowContainer(
+            isSelected: isSelected,
+            showBottomDivider: hasNext && !isSelected && !nextSelected,
+            onTap: {
+                isMessageListFocused = true
+                handleMessageRowTap(msg.id)
+            }
+        ) {
+            MessageRowView(
+                message: msg,
+                tags: viewModel.tags(for: msg),
+                accountBadge: viewModel.isUnifiedView ? viewModel.accountShortUsername(for: msg.accountID) : nil,
+                accountEmail: viewModel.accountEmail(for: msg.accountID),
+                accountCustomIconPath: viewModel.accountCustomIconPath(for: msg.accountID),
+                accountPresetLogoID: viewModel.accountPresetLogoID(for: msg.accountID),
+                accountSFSymbolName: viewModel.accountSFSymbolName(for: msg.accountID),
+                accountColor: viewModel.accountBadgeColor(for: msg.accountID)
+            )
+            .equatable()
+        } contextMenu: {
+            messageContextMenu(for: msg)
+        }
+    }
+
+    @ViewBuilder
+    private func messageContextMenu(for msg: MailMessageSummary) -> some View {
+        if viewModel.selectedMessageIDs.count > 1 && viewModel.selectedMessageIDs.contains(msg.id) {
+            Button("全部标为已读（\(viewModel.selectedMessageIDs.count) 封）") {
+                viewModel.batchMarkSelected(isRead: true)
+            }
+            Button("全部标为未读（\(viewModel.selectedMessageIDs.count) 封）") {
+                viewModel.batchMarkSelected(isRead: false)
+            }
+            Divider()
+            Button("批量归档（\(viewModel.selectedMessageIDs.count) 封）") {
+                viewModel.batchArchiveSelected()
+            }
+            Button("批量删除（\(viewModel.selectedMessageIDs.count) 封）", role: .destructive) {
+                viewModel.batchDeleteSelected()
+            }
+        } else {
+            Button("回复") {
+                viewModel.openComposeReply(for: msg)
+            }
+            Button("转发") {
+                viewModel.openComposeForward(for: msg)
+            }
+            Divider()
+            Button(msg.isRead ? "标记为未读" : "标记为已读") {
+                viewModel.toggleReadStatus(for: msg)
+            }
+            Button(msg.isFlagged ? "取消旗标" : "添加旗标") {
+                viewModel.toggleFlaggedStatus(for: msg)
+            }
+            Button("归档") {
+                viewModel.archiveMessage(msg)
+            }
+            Button("删除", role: .destructive) {
+                viewModel.deleteMessage(msg)
+            }
+            Divider()
+            Button("在系统 Mail.app 中打开") {
+                viewModel.openInNativeMail(msg)
+            }
+        }
+    }
+
+    private func handleMessageRowTap(_ id: Int64) {
+        let flags = NSEvent.modifierFlags
+        if flags.contains(.command) {
+            if viewModel.selectedMessageIDs.contains(id) {
+                viewModel.selectedMessageIDs.remove(id)
+                if viewModel.selectedMessageID == id {
+                    viewModel.selectedMessageID = viewModel.selectedMessageIDs.first
+                }
+            } else {
+                viewModel.selectedMessageIDs.insert(id)
+                if viewModel.selectedMessageID == nil {
+                    viewModel.selectedMessageID = id
+                }
+            }
+        } else if flags.contains(.shift),
+                  let anchorID = viewModel.selectedMessageID,
+                  let anchorIdx = viewModel.messages.firstIndex(where: { $0.id == anchorID }),
+                  let targetIdx = viewModel.messages.firstIndex(where: { $0.id == id }) {
+            let lower = min(anchorIdx, targetIdx)
+            let upper = max(anchorIdx, targetIdx)
+            viewModel.selectedMessageIDs = Set(viewModel.messages[lower...upper].map(\.id))
+        } else {
+            viewModel.selectedMessageIDs = [id]
+            if viewModel.selectedMessageID != id {
+                viewModel.selectedMessageID = id
+            }
+        }
+    }
+
+    private func moveMessageSelection(by delta: Int, scrollProxy: ScrollViewProxy) {
+        guard !viewModel.messages.isEmpty else { return }
+        let currentIdx = viewModel.selectedMessageID.flatMap { id in
+            viewModel.messages.firstIndex(where: { $0.id == id })
+        }
+        let nextIdx: Int
+        if let currentIdx {
+            nextIdx = max(0, min(viewModel.messages.count - 1, currentIdx + delta))
+        } else {
+            nextIdx = delta >= 0 ? 0 : viewModel.messages.count - 1
+        }
+        let targetID = viewModel.messages[nextIdx].id
+        viewModel.selectedMessageIDs = [targetID]
+        if viewModel.selectedMessageID != targetID {
+            viewModel.selectedMessageID = targetID
+        }
+        withAnimation(.easeInOut(duration: 0.12)) {
+            scrollProxy.scrollTo(targetID)
         }
     }
 
@@ -441,9 +549,61 @@ struct ContentView: View {
     }
 }
 
-private struct MessageRowView: View {
+private final class RowHoverState: ObservableObject {
+    @Published var isHovered = false
+}
+
+private struct MessageListRowContainer<RowContent: View, MenuContent: View>: View {
+    let isSelected: Bool
+    let showBottomDivider: Bool
+    let onTap: () -> Void
+    @ViewBuilder let content: () -> RowContent
+    @ViewBuilder let contextMenu: () -> MenuContent
+
+    @StateObject private var hoverState = RowHoverState()
+
+    var body: some View {
+        let fillOpacity: Double = isSelected ? 0.075 : (hoverState.isHovered ? 0.032 : 0)
+        let borderOpacity: Double = isSelected ? 0.065 : 0
+
+        VStack(spacing: 0) {
+            content()
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(Color.primary.opacity(fillOpacity))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(borderOpacity), lineWidth: 0.75)
+                )
+                .padding(.horizontal, 8)
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onTap)
+                .onHover { hovering in
+                    if hoverState.isHovered != hovering {
+                        hoverState.isHovered = hovering
+                    }
+                }
+                .contextMenu {
+                    contextMenu()
+                }
+
+            if showBottomDivider {
+                Rectangle()
+                    .fill(Color.primary.opacity(hoverState.isHovered ? 0 : 0.08))
+                    .frame(height: 0.75)
+                    .padding(.leading, 60)
+                    .padding(.trailing, 18)
+            }
+        }
+    }
+}
+
+private struct MessageRowView: View, Equatable {
     let message: MailMessageSummary
-    let tagSettings: MailTagSettings
+    let tags: [MailSmartTag]
     let accountBadge: String?
     let accountEmail: String?
     let accountCustomIconPath: String?
@@ -473,9 +633,10 @@ private struct MessageRowView: View {
                             .font(.caption2)
                             .foregroundStyle(.orange)
                     }
-                    Text(message.dateReceived.formatted(date: .omitted, time: .shortened))
+                    Text(Self.formatListTimestamp(message.dateReceived))
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
+                        .help(Self.formatFullTimestamp(message.dateReceived))
                 }
 
                 Text(message.subject)
@@ -483,16 +644,30 @@ private struct MessageRowView: View {
                     .foregroundStyle(message.isRead ? .secondary : .primary)
                     .lineLimit(1)
 
-                let tags = MailTagClassifier.classify(message, settings: tagSettings)
                 HStack(spacing: 5) {
-                    if !tags.isEmpty {
-                        ForEach(tags) { tag in
-                            SmartTagPill(tag: tag)
+                    if let primaryTag = tags.first {
+                        SmartTagPill(tag: primaryTag)
+                        if tags.count > 1 {
+                            let extraTags = Array(tags.dropFirst())
+                            Text("+\(extraTags.count)")
+                                .font(.system(size: 10, weight: .medium).monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                        .strokeBorder(.separator.opacity(0.45), lineWidth: 0.7)
+                                )
+                                .fixedSize(horizontal: true, vertical: false)
+                                .help(extraTags.map(\.rawValue).joined(separator: "、"))
                         }
                     } else {
                         Text(message.mailboxName)
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
+                            .lineLimit(1)
                     }
 
                     Spacer(minLength: 4)
@@ -507,16 +682,69 @@ private struct MessageRowView: View {
                             sfSymbolName: accountSFSymbolName,
                             fallbackColor: accountColor
                         )
-                    } else if tags.isEmpty {
-                        Text(message.dateReceived.formatted(date: .abbreviated, time: .omitted))
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
                     }
                 }
                 .padding(.top, 2)
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 3)
+    }
+
+    private static let time24Formatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "HH:mm"
+        return f
+    }()
+
+    private static let sameYearFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "MM/dd"
+        return f
+    }()
+
+    private static let crossYearFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy/MM/dd"
+        return f
+    }()
+
+    private static let fullTimestampFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy/MM/dd HH:mm"
+        return f
+    }()
+
+    private static let chineseWeekdays = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+
+    private static func formatListTimestamp(_ date: Date, now: Date = Date()) -> String {
+        let cal = Calendar.autoupdatingCurrent
+        if cal.isDateInToday(date) {
+            return time24Formatter.string(from: date)
+        }
+        if cal.isDateInYesterday(date) {
+            return "昨天"
+        }
+        let startOfDate = cal.startOfDay(for: date)
+        let startOfNow = cal.startOfDay(for: now)
+        if let days = cal.dateComponents([.day], from: startOfDate, to: startOfNow).day,
+           days >= 2 && days < 7 {
+            let weekdayIndex = cal.component(.weekday, from: date) - 1
+            if chineseWeekdays.indices.contains(weekdayIndex) {
+                return chineseWeekdays[weekdayIndex]
+            }
+        }
+        if cal.isDate(date, equalTo: now, toGranularity: .year) {
+            return sameYearFormatter.string(from: date)
+        }
+        return crossYearFormatter.string(from: date)
+    }
+
+    private static func formatFullTimestamp(_ date: Date) -> String {
+        fullTimestampFormatter.string(from: date)
     }
 }
 
@@ -624,11 +852,19 @@ struct AccountBadgePill: View {
             RoundedRectangle(cornerRadius: 5, style: .continuous)
                 .strokeBorder(.separator.opacity(0.35), lineWidth: 0.5)
         )
+        .help(email ?? label)
     }
 }
 
 struct SmartTagPill: View {
     let tag: MailSmartTag
+
+    private var compactTitle: String {
+        switch tag {
+        case .orderLogistics: return "订单"
+        default: return tag.rawValue
+        }
+    }
 
     private var tint: Color {
         switch tag {
@@ -645,8 +881,9 @@ struct SmartTagPill: View {
         HStack(spacing: 3) {
             Image(systemName: tag.iconName)
                 .font(.system(size: 9.5, weight: .medium))
-            Text(tag.rawValue)
+            Text(compactTitle)
                 .font(.system(size: 10.5, weight: .medium))
+                .lineLimit(1)
         }
         .foregroundStyle(tint)
         .padding(.horizontal, 6)
@@ -656,6 +893,8 @@ struct SmartTagPill: View {
             RoundedRectangle(cornerRadius: 5, style: .continuous)
                 .strokeBorder(tint.opacity(0.35), lineWidth: 0.7)
         )
+        .fixedSize(horizontal: true, vertical: false)
+        .help(tag.rawValue)
     }
 }
 

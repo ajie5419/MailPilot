@@ -128,7 +128,7 @@ public enum ModelCatalogService {
 
         case .oauthPKCE:
             let token = KeychainStore.loadToken(
-                account: OAuthSubscriptionManager.keychainAccount(for: config.oauth.kind)
+                account: OAuthSubscriptionManager.keychainAccount(for: config.oauth)
             )?.accessToken ?? ""
             let fetched = await fetchRemoteModels(baseURL: config.oauth.apiBaseURL, apiKey: token)
             if !fetched.isEmpty { return fetched }
