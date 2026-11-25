@@ -56,6 +56,9 @@
 
 # 4. 生成可供分发的 release 压缩包与 SHA-256 校验文件
 ./scripts/release_app.sh
+
+# 5. 安全同步远端最新提交与标签（仅在 main 分支且工作区干净时 fast-forward，可配合 cron/launchd）
+./scripts/auto_sync.sh
 ```
 
 ### 首次使用权限配置
