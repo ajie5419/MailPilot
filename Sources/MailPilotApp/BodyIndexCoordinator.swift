@@ -164,13 +164,15 @@ final class BodyIndexCoordinator: ObservableObject {
         forceFullSweep: Bool = false
     ) {
         guard !isClearingOrRebuilding, let parser else { return }
-        deletedRowIDsInFlight.removeAll()
         let ftsIndex = index
         let shouldRunFullSweep = forceFullSweep || !hasCompletedFullSweep
         let shouldPruneStale = shouldRunFullSweep && !hasPrunedStale
         let initialCursor = forceFullSweep ? nil : resumeCursorRowID
+        let previousTask = indexingTask
         indexingTask?.cancel()
         indexingTask = Task.detached(priority: .background) { [weak self] in
+            await previousTask?.value
+            if Task.isCancelled { return }
             var processedIDs: Set<Int64> = []
             var anyChanges = false
 
