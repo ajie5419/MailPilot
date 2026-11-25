@@ -9,13 +9,97 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate {
     @MainActor private weak var mainWindow: NSWindow?
     @MainActor private var closeInterceptor: WindowCloseInterceptor?
     @MainActor private var isQuitting = false
+    @MainActor private var statusItem: NSStatusItem?
+    @MainActor private var lastMenuBarVisible = false
+    @MainActor private var lastMenuBarUnreadCount = 0
+    @MainActor var onMenuBarCompose: (() -> Void)?
+    @MainActor var onMenuBarCheckMail: (() -> Void)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated {
             Self.shared = self
+            applyMenuBarStatusItem()
         }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @MainActor
+    func updateMenuBarStatus(visible: Bool, unreadCount: Int) {
+        lastMenuBarVisible = visible
+        lastMenuBarUnreadCount = max(0, unreadCount)
+        applyMenuBarStatusItem()
+    }
+
+    @MainActor
+    private func applyMenuBarStatusItem() {
+        guard lastMenuBarVisible else {
+            if let existing = statusItem {
+                NSStatusBar.system.removeStatusItem(existing)
+                statusItem = nil
+            }
+            return
+        }
+        let item: NSStatusItem
+        if let existing = statusItem {
+            item = existing
+        } else {
+            item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            statusItem = item
+        }
+        if let button = item.button {
+            let symbolName = lastMenuBarUnreadCount > 0 ? "envelope.badge.fill" : "envelope"
+            let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "MailPilot")
+            img?.isTemplate = true
+            button.image = img
+            button.imagePosition = lastMenuBarUnreadCount > 0 ? .imageLeading : .imageOnly
+            button.title = lastMenuBarUnreadCount > 0 ? " \(lastMenuBarUnreadCount)" : ""
+        }
+
+        let menu = NSMenu()
+        let statusTitle = lastMenuBarUnreadCount > 0
+            ? "收件箱未读：\(lastMenuBarUnreadCount) 封"
+            : "收件箱暂无未读邮件"
+        let headerItem = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
+        headerItem.isEnabled = false
+        menu.addItem(headerItem)
+        menu.addItem(.separator())
+
+        let openItem = NSMenuItem(title: "打开 MailPilot", action: #selector(handleMenuBarOpen), keyEquivalent: "")
+        openItem.target = self
+        menu.addItem(openItem)
+
+        let composeItem = NSMenuItem(title: "写新邮件", action: #selector(handleMenuBarCompose), keyEquivalent: "")
+        composeItem.target = self
+        menu.addItem(composeItem)
+
+        let checkItem = NSMenuItem(title: "立即检查新邮件", action: #selector(handleMenuBarCheckMail), keyEquivalent: "")
+        checkItem.target = self
+        menu.addItem(checkItem)
+
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(title: "退出 MailPilot", action: #selector(handleMenuBarQuit), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        item.menu = menu
+    }
+
+    @MainActor @objc private func handleMenuBarOpen() {
+        showMainWindow()
+    }
+
+    @MainActor @objc private func handleMenuBarCompose() {
+        showMainWindow()
+        onMenuBarCompose?()
+    }
+
+    @MainActor @objc private func handleMenuBarCheckMail() {
+        onMenuBarCheckMail?()
+    }
+
+    @MainActor @objc private func handleMenuBarQuit() {
+        NSApp.terminate(nil)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

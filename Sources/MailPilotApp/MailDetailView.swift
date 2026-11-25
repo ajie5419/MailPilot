@@ -338,6 +338,14 @@ struct MailDetailView: View {
                     .buttonStyle(.plain)
                     .help("\(att.filename)（\(att.formattedSize)）· 点击打开，右键可另存为")
                     .contextMenu {
+                        if AttachmentTextExtractor.isSupportedForAI(att) {
+                            Button {
+                                ai.analyzeAttachment(att)
+                            } label: {
+                                Label("用 AI 解读此附件", systemImage: "sparkles")
+                            }
+                            Divider()
+                        }
                         Button("打开预览") {
                             viewModel.openAttachment(att)
                         }
@@ -471,7 +479,7 @@ struct MailDetailView: View {
 
             if hasBlockedRemote {
                 HStack(spacing: 6) {
-                    Image(systemName: "hand.raised.shield")
+                    Image(systemName: "eye.slash")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                     Text("已拦截远程图")
@@ -566,6 +574,18 @@ struct MailDetailView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("收起摘要")
+            }
+
+            if !ai.lastReadAttachmentNames.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "paperclip")
+                        .font(.caption2)
+                        .foregroundStyle(Color.accentColor)
+                    Text("已结合附件：\(ai.lastReadAttachmentNames.joined(separator: "、"))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
 
             if ai.inlineSummaryText.isEmpty && ai.isInlineSummarizing {

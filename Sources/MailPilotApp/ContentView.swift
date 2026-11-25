@@ -70,15 +70,24 @@ struct ContentView: View {
             }
 
             if let toast = viewModel.toastMessage {
-                Text(toast)
-                    .font(.callout)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
-                    .shadow(radius: 6)
-                    .padding(.bottom, 16)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                HStack(spacing: 10) {
+                    Text(toast)
+                        .font(.callout)
+                    if let actionTitle = viewModel.toastActionTitle {
+                        Button(actionTitle) {
+                            viewModel.performToastAction()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.mini)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay(Capsule().strokeBorder(.separator, lineWidth: 0.5))
+                .shadow(radius: 6)
+                .padding(.bottom, 16)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .animation(.easeInOut(duration: 0.2), value: viewModel.toastMessage)
@@ -272,9 +281,98 @@ struct ContentView: View {
             .padding(.vertical, 6)
             .background(.quaternary.opacity(0.65), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            .padding(.top, 8)
+            .padding(.bottom, 6)
             .onChange(of: viewModel.searchFocusTrigger) { _, _ in
                 isSearchFieldFocused = true
+            }
+
+            // Structured Quick Filters (Unread / Attachments / Date Range)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    Button {
+                        viewModel.filterUnreadOnly.toggle()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "envelope.badge")
+                                .font(.system(size: 10))
+                            Text("未读")
+                                .font(.caption2.weight(.medium))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            viewModel.filterUnreadOnly ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.05),
+                            in: Capsule()
+                        )
+                        .foregroundStyle(viewModel.filterUnreadOnly ? Color.accentColor : Color.secondary)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        viewModel.filterHasAttachments.toggle()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "paperclip")
+                                .font(.system(size: 10))
+                            Text("有附件")
+                                .font(.caption2.weight(.medium))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            viewModel.filterHasAttachments ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.05),
+                            in: Capsule()
+                        )
+                        .foregroundStyle(viewModel.filterHasAttachments ? Color.accentColor : Color.secondary)
+                    }
+                    .buttonStyle(.plain)
+
+                    Menu {
+                        ForEach(SearchDateRange.allCases) { range in
+                            Button {
+                                viewModel.filterDateRange = range
+                            } label: {
+                                if viewModel.filterDateRange == range {
+                                    Label(range.rawValue, systemImage: "checkmark")
+                                } else {
+                                    Text(range.rawValue)
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "calendar")
+                                .font(.system(size: 10))
+                            Text(viewModel.filterDateRange == .all ? "时间" : viewModel.filterDateRange.rawValue)
+                                .font(.caption2.weight(.medium))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            viewModel.filterDateRange != .all ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.05),
+                            in: Capsule()
+                        )
+                        .foregroundStyle(viewModel.filterDateRange != .all ? Color.accentColor : Color.secondary)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+
+                    if viewModel.hasActiveSearchFilters {
+                        Button {
+                            viewModel.resetSearchFilters()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("重置筛选条件")
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.bottom, 7)
             }
 
             Divider()

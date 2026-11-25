@@ -112,7 +112,8 @@ public actor BodySearchIndex {
                 subject TEXT NOT NULL,
                 sender TEXT NOT NULL,
                 body TEXT NOT NULL,
-                file_mtime REAL NOT NULL DEFAULT 0
+                file_mtime REAL NOT NULL DEFAULT 0,
+                has_attachments INTEGER NOT NULL DEFAULT 0
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS mail_fts USING fts5(
                 subject,
@@ -135,12 +136,31 @@ public actor BodySearchIndex {
             PRAGMA user_version = \(Self.currentSchemaVersion);
             """
             try exec(setupSQL, on: handle, operation: "初始化索引表")
+            // Non-destructive column upgrade for existing v3 databases so users keep their cached index.
+            if !hasColumn("has_attachments", on: handle) {
+                try exec("ALTER TABLE indexed_rows ADD COLUMN has_attachments INTEGER NOT NULL DEFAULT 0;", on: handle, operation: "升级附件标记列")
+            }
             self.db = handle
             return handle
         } catch {
             sqlite3_close(handle)
             throw error
         }
+    }
+
+    private func hasColumn(_ column: String, on handle: OpaquePointer) -> Bool {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, "PRAGMA table_info(indexed_rows);", -1, &stmt, nil) == SQLITE_OK else {
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let namePtr = sqlite3_column_text(stmt, 1),
+               String(cString: namePtr).caseInsensitiveCompare(column) == .orderedSame {
+                return true
+            }
+        }
+        return false
     }
 
     public func indexedRowIDs(in candidates: [Int64]) -> Set<Int64> {
@@ -186,24 +206,29 @@ public actor BodySearchIndex {
     }
 
     public func upsertBatch(_ entries: [(rowID: Int64, subject: String, sender: String, body: String)]) throws {
-        try upsertBatchWithMTime(entries.map { ($0.rowID, $0.subject, $0.sender, $0.body, 0.0) })
+        try upsertBatchWithMetadata(entries.map { ($0.rowID, $0.subject, $0.sender, $0.body, 0.0, false) })
     }
 
     public func upsertBatchWithMTime(_ entries: [(rowID: Int64, subject: String, sender: String, body: String, fileMTime: Double)]) throws {
+        try upsertBatchWithMetadata(entries.map { ($0.rowID, $0.subject, $0.sender, $0.body, $0.fileMTime, false) })
+    }
+
+    public func upsertBatchWithMetadata(_ entries: [(rowID: Int64, subject: String, sender: String, body: String, fileMTime: Double, hasAttachments: Bool)]) throws {
         guard !entries.isEmpty else { return }
         let db = try ensureOpen()
         try exec("BEGIN IMMEDIATE TRANSACTION;", on: db, operation: "开启写入事务")
         do {
             do {
-                // Store full plain-text body (no arbitrary char truncation) and use ON CONFLICT DO UPDATE so `mail_fts_au` purges old tokens.
+                // Store full plain-text body (plus indexed attachment names) and use ON CONFLICT DO UPDATE so `mail_fts_au` purges old tokens.
                 let sql = """
-                INSERT INTO indexed_rows(row_id, subject, sender, body, file_mtime)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO indexed_rows(row_id, subject, sender, body, file_mtime, has_attachments)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(row_id) DO UPDATE SET
                     subject = excluded.subject,
                     sender = excluded.sender,
                     body = excluded.body,
-                    file_mtime = excluded.file_mtime;
+                    file_mtime = excluded.file_mtime,
+                    has_attachments = excluded.has_attachments;
                 """
                 var stmt: OpaquePointer?
                 let prepareRC = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
@@ -224,7 +249,8 @@ public actor BodySearchIndex {
                           sqlite3_bind_text(stmt, 2, item.subject, -1, transient) == SQLITE_OK,
                           sqlite3_bind_text(stmt, 3, item.sender, -1, transient) == SQLITE_OK,
                           sqlite3_bind_text(stmt, 4, item.body, -1, transient) == SQLITE_OK,
-                          sqlite3_bind_double(stmt, 5, item.fileMTime) == SQLITE_OK else {
+                          sqlite3_bind_double(stmt, 5, item.fileMTime) == SQLITE_OK,
+                          sqlite3_bind_int(stmt, 6, item.hasAttachments ? 1 : 0) == SQLITE_OK else {
                         let bindRC = sqlite3_errcode(db)
                         throw BodySearchIndexError.sqliteError(
                             operation: "绑定写入参数",
@@ -247,6 +273,50 @@ public actor BodySearchIndex {
             rollbackIfNeeded(db)
             throw error
         }
+    }
+
+    public func fetchRowIDsWithAttachments() -> Set<Int64> {
+        guard let db = try? ensureOpen() else { return [] }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT row_id FROM indexed_rows WHERE has_attachments = 1;", -1, &stmt, nil) == SQLITE_OK else {
+            return []
+        }
+        defer { sqlite3_finalize(stmt) }
+        var ids: Set<Int64> = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            ids.insert(sqlite3_column_int64(stmt, 0))
+        }
+        return ids
+    }
+
+    /// Returns bounded plain-text body excerpts for a batch of message ROWIDs (for cross-mail AI QA).
+    public func fetchSnippets(for rowIDs: [Int64], maxChars: Int = 600) -> [Int64: String] {
+        guard !rowIDs.isEmpty, let db = try? ensureOpen() else { return [:] }
+        var snippets: [Int64: String] = [:]
+        let chunkSize = 200
+        var start = 0
+        while start < rowIDs.count {
+            let end = min(start + chunkSize, rowIDs.count)
+            let chunk = Array(rowIDs[start..<end])
+            let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+            let sql = "SELECT row_id, SUBSTR(body, 1, ?) FROM indexed_rows WHERE row_id IN (\(placeholders));"
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_int(stmt, 1, Int32(max(100, maxChars)))
+                for (idx, id) in chunk.enumerated() {
+                    sqlite3_bind_int64(stmt, Int32(idx + 2), id)
+                }
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    let id = sqlite3_column_int64(stmt, 0)
+                    if let cStr = sqlite3_column_text(stmt, 1) {
+                        snippets[id] = String(cString: cStr)
+                    }
+                }
+                sqlite3_finalize(stmt)
+            }
+            start = end
+        }
+        return snippets
     }
 
     public func deleteRowIDs(_ rowIDs: [Int64]) throws {

@@ -10,6 +10,8 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
     private var cachedMessageColumns: Set<String>?
     private var cachedLabelTableResolved = false
     private var cachedLabelTable: LabelTableInfo?
+    private var cachedAttachmentTableResolved = false
+    private var cachedAttachmentMessageCol: String?
 
     private struct LabelTableInfo {
         let tableName: String
@@ -142,6 +144,8 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
         onlyInbox: Bool = false,
         onlyUnread: Bool = false,
         onlyFlagged: Bool = false,
+        onlyWithAttachments: Bool = false,
+        sinceDate: Date? = nil,
         searchQuery: String = "",
         limit: Int = 150,
         offset: Int = 0
@@ -151,6 +155,7 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
 
         let messageColumns = inspectColumns(db: db, table: "messages")
         let labelTable = inspectLabelTable(db: db)
+        let attachmentMsgCol = onlyWithAttachments ? inspectAttachmentMessageColumn(db: db) : nil
         let hasDeleted = messageColumns.contains("deleted")
         let hasMessageIDHeader = messageColumns.contains("message_id")
         let hasDateReceived = messageColumns.contains("date_received")
@@ -192,6 +197,12 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
         }
         if onlyFlagged {
             conditions.append("COALESCE(m.flagged, 0) != 0")
+        }
+        if onlyWithAttachments, let attachmentMsgCol {
+            conditions.append("EXISTS (SELECT 1 FROM attachments att WHERE att.\(attachmentMsgCol) = m.ROWID)")
+        }
+        if sinceDate != nil {
+            conditions.append("COALESCE(\(dateCol), 0) >= ?")
         }
 
         let trimmedSearch = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -235,6 +246,10 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
                 sqlite3_bind_int64(stmt, bindIdx, mailboxID)
                 bindIdx += 1
             }
+        }
+        if let sinceDate {
+            sqlite3_bind_double(stmt, bindIdx, sinceDate.timeIntervalSince1970)
+            bindIdx += 1
         }
         if !trimmedSearch.isEmpty {
             let pattern = "%\(trimmedSearch)%"
@@ -290,6 +305,8 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
         onlyInbox: Bool = false,
         onlyUnread: Bool = false,
         onlyFlagged: Bool = false,
+        onlyWithAttachments: Bool = false,
+        sinceDate: Date? = nil,
         maxCount: Int? = nil
     ) throws -> [MailMessageSummary] {
         guard !rowIDs.isEmpty else { return [] }
@@ -298,6 +315,7 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
 
         let messageColumns = inspectColumns(db: db, table: "messages")
         let labelTable = inspectLabelTable(db: db)
+        let attachmentMsgCol = onlyWithAttachments ? inspectAttachmentMessageColumn(db: db) : nil
         let hasDeleted = messageColumns.contains("deleted")
         let hasMessageIDHeader = messageColumns.contains("message_id")
         let hasDateReceived = messageColumns.contains("date_received")
@@ -343,6 +361,12 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
             }
             if onlyFlagged {
                 conditions.append("COALESCE(m.flagged, 0) != 0")
+            }
+            if onlyWithAttachments, let attachmentMsgCol {
+                conditions.append("EXISTS (SELECT 1 FROM attachments att WHERE att.\(attachmentMsgCol) = m.ROWID)")
+            }
+            if sinceDate != nil {
+                conditions.append("COALESCE(\(dateCol), 0) >= ?")
             }
 
             var cutoffDate: Double?
@@ -392,6 +416,10 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
                     sqlite3_bind_int64(stmt, bindIdx, mailboxID)
                     bindIdx += 1
                 }
+            }
+            if let sinceDate {
+                sqlite3_bind_double(stmt, bindIdx, sinceDate.timeIntervalSince1970)
+                bindIdx += 1
             }
             if let cutoffDate, let cutoffID {
                 sqlite3_bind_double(stmt, bindIdx, cutoffDate)
@@ -477,20 +505,42 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
         onlyInbox: Bool = false,
         onlyUnread: Bool = false,
         onlyFlagged: Bool = false,
+        onlyWithAttachments: Bool = false,
+        sinceDate: Date? = nil,
         searchQuery: String = "",
         bodyHitIDs: [Int64] = [],
+        fallbackAttachmentRowIDs: Set<Int64>? = nil,
         limit: Int = 200,
         predicate: ((MailMessageSummary) -> Bool)? = nil
     ) throws -> MessagePage {
         let safeLimit = max(1, limit)
         let fetchLimit = safeLimit + 1
+        var hasNativeAttachmentTable = false
+        if onlyWithAttachments {
+            let probeDB = try openReadOnly()
+            hasNativeAttachmentTable = inspectAttachmentMessageColumn(db: probeDB) != nil
+            sqlite3_close(probeDB)
+        }
+        let useFallbackAttachmentFilter = onlyWithAttachments && !hasNativeAttachmentTable
+
+        let effectivePredicate: ((MailMessageSummary) -> Bool)?
+        if useFallbackAttachmentFilter, let fallbackAttachmentRowIDs {
+            effectivePredicate = { msg in
+                fallbackAttachmentRowIDs.contains(msg.id) && (predicate?(msg) ?? true)
+            }
+        } else {
+            effectivePredicate = predicate
+        }
+
         var rows = try fetchMessages(
             mailboxID: mailboxID,
             onlyInbox: onlyInbox,
             onlyUnread: onlyUnread,
             onlyFlagged: onlyFlagged,
+            onlyWithAttachments: onlyWithAttachments && hasNativeAttachmentTable,
+            sinceDate: sinceDate,
             searchQuery: searchQuery,
-            limit: fetchLimit
+            limit: useFallbackAttachmentFilter ? max(fetchLimit, 1500) : fetchLimit
         )
         let sqlHasMore = rows.count > safeLimit
 
@@ -506,7 +556,9 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
                     onlyInbox: onlyInbox,
                     onlyUnread: onlyUnread,
                     onlyFlagged: onlyFlagged,
-                    maxCount: predicate == nil ? fetchLimit : nil
+                    onlyWithAttachments: onlyWithAttachments && hasNativeAttachmentTable,
+                    sinceDate: sinceDate,
+                    maxCount: effectivePredicate == nil ? fetchLimit : nil
                 )
                 rows.append(contentsOf: extraRows)
                 rows.sort {
@@ -518,10 +570,10 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
             }
         }
 
-        if let predicate {
-            let candidates = (sqlHasMore && bodyHitIDs.isEmpty) ? Array(rows.prefix(safeLimit)) : rows
-            var filtered = candidates.filter(predicate)
-            let hasMore = sqlHasMore || filtered.count > safeLimit
+        if let effectivePredicate {
+            let candidates = (sqlHasMore && bodyHitIDs.isEmpty && !useFallbackAttachmentFilter) ? Array(rows.prefix(safeLimit)) : rows
+            var filtered = candidates.filter(effectivePredicate)
+            let hasMore = (useFallbackAttachmentFilter ? false : sqlHasMore) || filtered.count > safeLimit
             if filtered.count > safeLimit {
                 filtered = Array(filtered.prefix(safeLimit))
             }
@@ -971,6 +1023,32 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
         schemaLock.lock()
         cachedLabelTable = found
         cachedLabelTableResolved = true
+        schemaLock.unlock()
+        return found
+    }
+
+    private func inspectAttachmentMessageColumn(db: OpaquePointer) -> String? {
+        schemaLock.lock()
+        if cachedAttachmentTableResolved {
+            let result = cachedAttachmentMessageCol
+            schemaLock.unlock()
+            return result
+        }
+        schemaLock.unlock()
+
+        let cols = inspectColumns(db: db, table: "attachments")
+        let found: String?
+        if cols.contains("message") {
+            found = "message"
+        } else if cols.contains("message_id") {
+            found = "message_id"
+        } else {
+            found = nil
+        }
+
+        schemaLock.lock()
+        cachedAttachmentMessageCol = found
+        cachedAttachmentTableResolved = true
         schemaLock.unlock()
         return found
     }

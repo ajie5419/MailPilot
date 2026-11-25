@@ -29,6 +29,14 @@ final class BodyIndexCoordinator: ObservableObject {
         await index.searchRowIDs(query: query, limit: limit)
     }
 
+    func fetchRowIDsWithAttachments() async -> Set<Int64> {
+        await index.fetchRowIDsWithAttachments()
+    }
+
+    func fetchSnippets(for rowIDs: [Int64], maxChars: Int = 600) async -> [Int64: String] {
+        await index.fetchSnippets(for: rowIDs, maxChars: maxChars)
+    }
+
     @discardableResult
     func refreshIndexedCount() async -> Int {
         let count = await index.totalIndexedCount()
@@ -157,28 +165,35 @@ final class BodyIndexCoordinator: ObservableObject {
                     let unique = chunk.filter { processedIDs.insert($0.id).inserted }
                     guard !unique.isEmpty else { return }
                     let storedVersions = await ftsIndex.indexedVersions(in: unique.map(\.id))
-                    var batch: [(rowID: Int64, subject: String, sender: String, body: String, fileMTime: Double)] = []
+                    var batch: [(rowID: Int64, subject: String, sender: String, body: String, fileMTime: Double, hasAttachments: Bool)] = []
                     var chunkWrote = false
                     for msg in unique {
                         if Task.isCancelled { break }
                         let result = await parser.loadPlainTextForIndexing(for: msg.id, cachedMTime: storedVersions[msg.id])
-                        guard case let .parsed(plainText, mtime) = result else { continue }
+                        guard case let .parsed(plainText, attachmentNames, mtime) = result else { continue }
+                        let indexedBody: String
+                        if attachmentNames.isEmpty {
+                            indexedBody = plainText
+                        } else {
+                            indexedBody = "\(plainText)\n[附件] \(attachmentNames.joined(separator: " "))"
+                        }
                         batch.append((
                             rowID: msg.id,
                             subject: msg.subject,
                             sender: "\(msg.senderName) \(msg.senderAddress)",
-                            body: plainText,
-                            fileMTime: mtime
+                            body: indexedBody,
+                            fileMTime: mtime,
+                            hasAttachments: !attachmentNames.isEmpty
                         ))
                         if batch.count >= 25 {
-                            try await ftsIndex.upsertBatchWithMTime(batch)
+                            try await ftsIndex.upsertBatchWithMetadata(batch)
                             batch.removeAll(keepingCapacity: true)
                             chunkWrote = true
                             anyChanges = true
                         }
                     }
                     if !batch.isEmpty {
-                        try await ftsIndex.upsertBatchWithMTime(batch)
+                        try await ftsIndex.upsertBatchWithMetadata(batch)
                         chunkWrote = true
                         anyChanges = true
                     }

@@ -13,9 +13,12 @@ swiftc \
   -target arm64-apple-macosx14.0 \
   -module-cache-path "$MODULE_CACHE" \
   -lsqlite3 \
+  -framework AppKit \
   -framework CoreServices \
   -framework Security \
   -framework Network \
+  -framework PDFKit \
+  -framework Vision \
   -o "$TEST_BIN" \
   Sources/MailPilotCore/*.swift \
   Tests/StandaloneTestRunner.swift \

@@ -990,6 +990,39 @@ struct SettingsView: View {
             }
 
             settingsCard {
+                VStack(alignment: .leading, spacing: 14) {
+                    Toggle(isOn: $viewModel.showMenuBarExtra) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("在顶部菜单栏显示未读图标")
+                                .font(.callout.weight(.medium))
+                            Text("关闭主窗口后可随时在菜单栏查看未读数、快速打开或写信")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+
+                    Divider()
+
+                    Toggle(
+                        isOn: Binding(
+                            get: { viewModel.launchAtLoginEnabled },
+                            set: { viewModel.setLaunchAtLogin($0) }
+                        )
+                    ) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("登录 macOS 时自动启动 MailPilot")
+                                .font(.callout.weight(.medium))
+                            Text("使用系统原生 ServiceManagement 注册，随时可在系统设置 → 登录项中管理")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                }
+            }
+
+            settingsCard {
                 Label("开启 MailPilot 通知后，可以在「系统设置 → 通知 → 邮件」中关闭系统 Mail.app 的横幅，避免重复弹窗（只需保持 Mail.app 后台运行不按 ⌘Q 退出即可）。", systemImage: "info.circle")
                     .font(.caption)
                     .foregroundStyle(.secondary)

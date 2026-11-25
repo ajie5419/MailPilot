@@ -618,7 +618,7 @@ struct StandaloneTestRunner {
         let idxParser = EmlxParser(mailRootURL: idxMailRoot)
         let firstIdx = await idxParser.loadPlainTextForIndexing(for: 42, cachedMTime: nil)
         var capturedMTime: Double = 0
-        if case let .parsed(text, mtime) = firstIdx {
+        if case let .parsed(text, _, mtime) = firstIdx {
             assertEqual(text, "Indexed plain text body.", "plainTextOnly extracts text accurately")
             capturedMTime = mtime
         } else {
@@ -658,8 +658,9 @@ struct StandaloneTestRunner {
         assertTrue(lazyBody.attachments[0].sourceByteRange != nil, "lazy attachment records exact byte range")
         let decodedOnDemand = EmlxParser.decodeAttachmentData(lazyBody.attachments[0])
         assertEqual(decodedOnDemand, bigPayload, "on-demand decodeAttachmentData reproduces exact 2 MiB attachment bytes")
-        if case let .parsed(indexedText, _) = await bigAttParser.loadPlainTextForIndexing(for: 77, cachedMTime: nil) {
+        if case let .parsed(indexedText, indexedAttNames, _) = await bigAttParser.loadPlainTextForIndexing(for: 77, cachedMTime: nil) {
             assertEqual(indexedText, "Short 53-byte body for lazy large-attachment testing!", "plain-text indexing extracts body cleanly")
+            assertEqual(indexedAttNames, ["report.pdf"], "plain-text indexing collects large attachment filename without decoding payload")
         } else {
             assertTrue(false, "loadPlainTextForIndexing should parse big attachment email")
         }
@@ -966,7 +967,105 @@ struct StandaloneTestRunner {
         assertEqual(decodedLegacyCustom.senderDisplayName, "Jay", "legacy AccountCustomization keeps senderDisplayName")
         assertEqual(decodedLegacyCustom.signature, "", "legacy AccountCustomization defaults signature to empty string")
 
-        print("ALL 38 CORE TEST SUITES PASSED")
+        // 39. AttachmentTextExtractor extracts CSV/HTML/RTF text, enforces budgets, and skips unsupported formats
+        let csvData = Data("项目,金额,日期\n差旅报销,1280.50,2026-11-20\n".utf8)
+        let csvRes = AttachmentTextExtractor.extract(data: csvData, filename: "报销单.csv", mimeType: "text/csv")
+        if case .extracted(let extracted) = csvRes {
+            assertTrue(extracted.text.contains("1280.50"), "AttachmentTextExtractor decodes CSV text accurately")
+            assertEqual(extracted.method, "表格文本", "CSV uses 表格文本 method label")
+            assertTrue(!extracted.wasTruncated, "short CSV is not truncated")
+        } else {
+            assertTrue(false, "CSV extraction should succeed")
+        }
+
+        let longTextData = Data(String(repeating: "A", count: 900).utf8)
+        let clippedRes = AttachmentTextExtractor.extract(data: longTextData, filename: "notes.txt", maxChars: 200)
+        if case .extracted(let extracted) = clippedRes {
+            assertEqual(extracted.text.count, 200, "AttachmentTextExtractor enforces maxChars budget")
+            assertTrue(extracted.wasTruncated, "clipped text marks wasTruncated = true")
+        } else {
+            assertTrue(false, "TXT extraction should succeed")
+        }
+
+        let zipRes = AttachmentTextExtractor.extract(data: Data([0x50, 0x4B, 0x03, 0x04]), filename: "archive.zip")
+        if case .skipped(let name, _) = zipRes {
+            assertEqual(name, "archive.zip", "unsupported binary archive is skipped cleanly")
+        } else {
+            assertTrue(false, "ZIP archive should be skipped")
+        }
+
+        // 40. EmlxParser.parseForIndexing collects attachment names & BodySearchIndex indexes them + has_attachments + snippets
+        let attachIdxEmlx = """
+        999
+        From: billing@vendor.com
+        Subject: Monthly Statement
+        Content-Type: multipart/mixed; boundary="mix-idx"
+
+        --mix-idx
+        Content-Type: text/plain; charset="utf-8"
+
+        Please review the attached invoice summary.
+        --mix-idx
+        Content-Type: application/pdf; name="Q4_Invoice_2026.pdf"
+        Content-Disposition: attachment; filename="Q4_Invoice_2026.pdf"
+        Content-Transfer-Encoding: base64
+
+        JVBERi0xLjQK
+        --mix-idx--
+        """
+        let indexedParsed = EmlxParser.parseForIndexing(Data(attachIdxEmlx.utf8))
+        assertTrue(indexedParsed.plainText.contains("attached invoice summary"), "parseForIndexing keeps plain text")
+        assertEqual(indexedParsed.attachmentNames, ["Q4_Invoice_2026.pdf"], "parseForIndexing collects MIME attachment filename")
+
+        let attachFTSURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-fts-attach-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: attachFTSURL) }
+        let attachFTS = BodySearchIndex(databaseURL: attachFTSURL)
+        try await attachFTS.upsertBatchWithMetadata([
+            (rowID: 701, subject: "Monthly Statement", sender: "billing@vendor.com", body: "\(indexedParsed.plainText)\n[附件] Q4_Invoice_2026.pdf", fileMTime: 100.0, hasAttachments: true),
+            (rowID: 702, subject: "Plain Greeting", sender: "friend@example.com", body: "Just saying hello", fileMTime: 100.0, hasAttachments: false)
+        ])
+        let attSearchHits = await attachFTS.searchRowIDs(query: "Q4_Invoice_2026")
+        assertEqual(attSearchHits, [701], "BodySearchIndex finds message by indexed attachment filename")
+        let withAttIDs = await attachFTS.fetchRowIDsWithAttachments()
+        assertEqual(withAttIDs, Set([701]), "fetchRowIDsWithAttachments returns only rows flagged with attachments")
+        let snippets = await attachFTS.fetchSnippets(for: [701, 702], maxChars: 120)
+        assertTrue(snippets[701]?.contains("Q4_Invoice_2026.pdf") == true, "fetchSnippets returns bounded body excerpt")
+
+        // 41. EnvelopeIndexReader date-range and native attachment-table filters
+        let filterDBURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-filter-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: filterDBURL) }
+        var filterDB: OpaquePointer?
+        assertEqual(sqlite3_open(filterDBURL.path, &filterDB), SQLITE_OK, "create synthetic filter db")
+        let nowTS = Date().timeIntervalSince1970
+        let oldTS = nowTS - 40 * 86400
+        let filterSQL = """
+        CREATE TABLE mailboxes (ROWID INTEGER PRIMARY KEY, url TEXT);
+        CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject TEXT);
+        CREATE TABLE addresses (ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT);
+        CREATE TABLE messages (ROWID INTEGER PRIMARY KEY, subject INTEGER, sender INTEGER, date_received REAL, read INTEGER, flagged INTEGER, deleted INTEGER, mailbox INTEGER);
+        CREATE TABLE attachments (ROWID INTEGER PRIMARY KEY, message INTEGER, name TEXT);
+        INSERT INTO mailboxes VALUES (1, 'imap://ACCT1/INBOX');
+        INSERT INTO subjects VALUES (1, 'Recent With PDF'), (2, 'Recent Plain'), (3, 'Old With PDF');
+        INSERT INTO addresses VALUES (1, 'ops@company.com', 'Ops');
+        INSERT INTO messages VALUES
+            (1, 1, 1, \(nowTS - 3600), 0, 0, 0, 1),
+            (2, 2, 1, \(nowTS - 1800), 1, 0, 0, 1),
+            (3, 3, 1, \(oldTS), 0, 0, 0, 1);
+        INSERT INTO attachments VALUES (1, 1, 'recent.pdf'), (2, 3, 'old.pdf');
+        """
+        assertEqual(sqlite3_exec(filterDB, filterSQL, nil, nil, nil), SQLITE_OK, "seed filter db")
+        sqlite3_close(filterDB)
+
+        let filterReader = EnvelopeIndexReader(mailVersionURL: filterDBURL.deletingLastPathComponent(), databaseURL: filterDBURL)
+        let recentCutoff = Date().addingTimeInterval(-7 * 86400)
+        let recentPage = try filterReader.fetchMessagePage(onlyInbox: true, sinceDate: recentCutoff, limit: 50)
+        assertEqual(Set(recentPage.messages.map(\.id)), Set([1, 2]), "sinceDate filters out 40-day-old email")
+        let recentAttPage = try filterReader.fetchMessagePage(onlyInbox: true, onlyWithAttachments: true, sinceDate: recentCutoff, limit: 50)
+        assertEqual(recentAttPage.messages.map(\.id), [1], "combined sinceDate + onlyWithAttachments matches only row 1")
+
+        print("ALL 41 CORE TEST SUITES PASSED")
         try await ChatGPTTests.run()
     }
 }

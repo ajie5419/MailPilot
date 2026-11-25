@@ -6,7 +6,7 @@ import Foundation
 public enum IndexingBodyResult: Sendable {
     case unchanged
     case unavailable
-    case parsed(plainText: String, fileMTime: Double)
+    case parsed(plainText: String, attachmentNames: [String], fileMTime: Double)
 }
 
 /// Parses Apple Mail `.emlx` files into readable plain text and extracts verification codes.
@@ -82,11 +82,18 @@ public actor EmlxParser {
             return .unchanged
         }
         return autoreleasepool {
-            guard let data = try? Data(contentsOf: URL(fileURLWithPath: filePath), options: .mappedIfSafe) else {
+            let fileURL = URL(fileURLWithPath: filePath)
+            guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
                 return .unavailable
             }
-            let plainText = Self.parsePlainTextOnly(data)
-            return .parsed(plainText: plainText, fileMTime: mtime)
+            let (plainText, inlineNames) = Self.parseForIndexing(data)
+            let externalNames = Self.scanExternalAttachments(for: rowID, nearEmlxURL: fileURL).map(\.filename)
+            var mergedNames = inlineNames
+            var seenLower = Set(inlineNames.map { $0.lowercased() })
+            for name in externalNames where seenLower.insert(name.lowercased()).inserted {
+                mergedNames.append(name)
+            }
+            return .parsed(plainText: plainText, attachmentNames: mergedNames, fileMTime: mtime)
         }
     }
 
@@ -321,6 +328,12 @@ public actor EmlxParser {
     /// Plain-text-only extraction for FTS5 indexing: scans raw byte ranges directly without converting
     /// multi-MB `.emlx` payloads into `String` and returns as soon as the plain-text part is found.
     public static func parsePlainTextOnly(_ data: Data) -> String {
+        parseForIndexing(data).plainText
+    }
+
+    /// Low-memory indexing extraction: extracts plain text plus MIME attachment filenames
+    /// without decoding multi-MB attachment payloads.
+    public static func parseForIndexing(_ data: Data) -> (plainText: String, attachmentNames: [String]) {
         let messageRange = stripEmlxHeaderRange(in: data)
         let (headers, bodyRange) = splitHeadersAndBodyBytes(in: data, range: messageRange)
         let contentType = headers["content-type"] ?? "text/plain"
@@ -329,6 +342,7 @@ public actor EmlxParser {
 
         var unusedAttachments: [MailAttachment] = []
         var unusedCIDs: [String: String] = [:]
+        var attachmentNames: [String] = []
         let extracted = extractReadableBodyBytes(
             in: data,
             bodyRange: bodyRange,
@@ -339,10 +353,11 @@ public actor EmlxParser {
             sourcePath: nil,
             attachments: &unusedAttachments,
             cidImages: &unusedCIDs,
-            plainTextOnly: true
+            plainTextOnly: true,
+            collectedAttachmentNames: &attachmentNames
         )
         let plainText = extracted.plain.trimmingCharacters(in: .whitespacesAndNewlines)
-        return plainText.isEmpty ? "（无纯文本正文）" : plainText
+        return (plainText.isEmpty ? "（无纯文本正文）" : plainText, attachmentNames)
     }
 
     public static func parseEmlxData(_ data: Data, sourcePath: String? = nil, sourceModifiedAt: Date? = nil) -> ParsedMailBody {
@@ -354,6 +369,7 @@ public actor EmlxParser {
 
         var attachments: [MailAttachment] = []
         var cidImages: [String: String] = [:]
+        var unusedNames: [String] = []
         let extracted = extractReadableBodyBytes(
             in: data,
             bodyRange: bodyRange,
@@ -364,7 +380,8 @@ public actor EmlxParser {
             sourcePath: sourcePath,
             attachments: &attachments,
             cidImages: &cidImages,
-            plainTextOnly: false
+            plainTextOnly: false,
+            collectedAttachmentNames: &unusedNames
         )
 
         let resolvedHTML = extracted.html.map { Self.inlineCIDImages(in: $0, cidMap: cidImages) }
@@ -521,7 +538,8 @@ public actor EmlxParser {
         sourcePath: String?,
         attachments: inout [MailAttachment],
         cidImages: inout [String: String],
-        plainTextOnly: Bool = false
+        plainTextOnly: Bool = false,
+        collectedAttachmentNames: inout [String]
     ) -> (plain: String, html: String?) {
         let lowerCT = contentType.lowercased()
         let lowerDisp = contentDisposition.lowercased()
@@ -529,6 +547,7 @@ public actor EmlxParser {
         if lowerCT.contains("multipart/"), let boundary = extractParameter(named: "boundary", from: contentType) {
             let delimiterBytes = Data(("--" + boundary).utf8)
             guard !delimiterBytes.isEmpty else { return ("", nil) }
+            let isAlternative = lowerCT.contains("multipart/alternative")
 
             var foundPlain: String?
             var foundHTML: String?
@@ -564,13 +583,15 @@ public actor EmlxParser {
                     sourcePath: sourcePath,
                     attachments: &attachments,
                     cidImages: &cidImages,
-                    plainTextOnly: plainTextOnly
+                    plainTextOnly: plainTextOnly,
+                    collectedAttachmentNames: &collectedAttachmentNames
                 )
 
                 if foundPlain == nil, !sub.plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                    !partCT.lowercased().contains("text/html") {
                     foundPlain = sub.plain
-                    if plainTextOnly {
+                    // Inside multipart/alternative there are no attachments; stop immediately.
+                    if plainTextOnly && isAlternative {
                         return (sub.plain, nil)
                     }
                 }
@@ -593,6 +614,10 @@ public actor EmlxParser {
            let rawCID = contentID?.trimmingCharacters(in: CharacterSet(charactersIn: "<> \t\r\n")),
            !rawCID.isEmpty {
             if plainTextOnly {
+                if lowerDisp.contains("attachment"),
+                   let rawName = extractFilename(fromDisposition: contentDisposition, contentType: contentType) {
+                    collectedAttachmentNames.append(decodeMIMEFilename(rawName))
+                }
                 return ("", nil)
             }
             let mime = contentType.split(separator: ";").first.map { String($0).trimmingCharacters(in: .whitespaces) } ?? "image/png"
@@ -612,6 +637,9 @@ public actor EmlxParser {
         let isNonBodyPart = !lowerCT.contains("text/plain") && !lowerCT.contains("text/html") && !lowerCT.isEmpty
         if isExplicitAttachment || (rawFilename != nil && isNonBodyPart) {
             if plainTextOnly {
+                if let rawFilename {
+                    collectedAttachmentNames.append(decodeMIMEFilename(rawFilename))
+                }
                 return ("", nil)
             }
             guard !bodyRange.isEmpty else { return ("", nil) }

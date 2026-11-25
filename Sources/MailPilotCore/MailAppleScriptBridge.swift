@@ -376,6 +376,56 @@ public enum MailAppleScriptBridge {
         }
     }
 
+    /// Moves a recently archived or deleted message back into its account's Inbox (used for Undo).
+    public static func moveMessageToInbox(rowID: Int64) async throws {
+        let script = """
+        tell application "Mail"
+            set targetMsg to missing value
+            set targetAcct to missing value
+            repeat with acct in accounts
+                repeat with mb in mailboxes of acct
+                    try
+                        set foundMsgs to (every message of mb whose id is \(rowID))
+                        if (count of foundMsgs) > 0 then
+                            set targetMsg to item 1 of foundMsgs
+                            set targetAcct to acct
+                            exit repeat
+                        end if
+                    end try
+                end repeat
+                if targetMsg is not missing value then exit repeat
+            end repeat
+
+            if targetMsg is missing value then
+                return "NOT_FOUND"
+            end if
+
+            set inboxBox to missing value
+            repeat with mb in mailboxes of targetAcct
+                set mbName to name of mb
+                if mbName is "INBOX" or mbName is "Inbox" or mbName is "收件箱" then
+                    set inboxBox to mb
+                    exit repeat
+                end if
+            end repeat
+
+            if inboxBox is missing value then
+                return "NO_INBOX"
+            end if
+
+            move targetMsg to inboxBox
+            return "OK"
+        end tell
+        """
+        let result = try await runAppleScript(script)
+        if result == "NO_INBOX" {
+            throw MailAccessError.appleScriptFailed(message: "未找到该账号的收件箱，无法撤销")
+        }
+        if result == "NOT_FOUND" {
+            throw MailAccessError.appleScriptFailed(message: "未在 Mail.app 中找到该邮件，无法撤销")
+        }
+    }
+
     private static func composeAndDispatch(
         from senderEmail: String?,
         to recipients: [String],

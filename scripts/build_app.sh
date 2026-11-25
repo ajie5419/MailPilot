@@ -60,6 +60,9 @@ swiftc \
   -framework Network \
   -framework WebKit \
   -framework UserNotifications \
+  -framework PDFKit \
+  -framework Vision \
+  -framework ServiceManagement \
   -o "$MACOS_DIR/${APP_NAME}" \
   Sources/MailPilotCore/*.swift \
   Sources/MailPilotApp/*.swift

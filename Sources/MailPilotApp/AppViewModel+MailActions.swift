@@ -209,7 +209,9 @@ extension AppViewModel {
                 self.pendingRemovedIDs.remove(id)
             }
             if failed == 0 {
-                self.showToast("已批量归档 \(ids.count) 封邮件")
+                self.showToast("已批量归档 \(ids.count) 封邮件", actionTitle: "撤销", duration: 5.0) { [weak self] in
+                    self?.undoMoveToInbox(rowIDs: ids)
+                }
             } else {
                 self.showToast("批量归档完成（\(failed) 封失败）")
             }
@@ -245,7 +247,9 @@ extension AppViewModel {
                 await self.bodyIndex.deleteRowIDs(deletedIDs)
             }
             if failed == 0 {
-                self.showToast("已批量删除 \(ids.count) 封邮件")
+                self.showToast("已批量删除 \(ids.count) 封邮件", actionTitle: "撤销", duration: 5.0) { [weak self] in
+                    self?.undoMoveToInbox(rowIDs: deletedIDs)
+                }
             } else {
                 self.showToast("批量删除完成（\(failed) 封失败）")
             }
@@ -263,7 +267,9 @@ extension AppViewModel {
                 try await MailAppleScriptBridge.deleteMessage(rowID: message.id)
                 self.pendingRemovedIDs.remove(message.id)
                 await self.bodyIndex.deleteRowIDs([message.id])
-                self.showToast("已移入废纸篓")
+                self.showToast("已移入废纸篓", actionTitle: "撤销", duration: 5.0) { [weak self] in
+                    self?.undoMoveToInbox(rowIDs: [message.id])
+                }
                 try? await Task.sleep(for: .milliseconds(450))
                 self.refreshNow()
             } catch {
@@ -282,7 +288,9 @@ extension AppViewModel {
             do {
                 try await MailAppleScriptBridge.archiveMessage(rowID: message.id)
                 self.pendingRemovedIDs.remove(message.id)
-                self.showToast("已归档")
+                self.showToast("已归档", actionTitle: "撤销", duration: 5.0) { [weak self] in
+                    self?.undoMoveToInbox(rowIDs: [message.id])
+                }
                 try? await Task.sleep(for: .milliseconds(450))
                 self.refreshNow()
             } catch {
@@ -290,6 +298,29 @@ extension AppViewModel {
                 self.refreshNow()
                 self.showToast("归档失败：\(error.localizedDescription)")
             }
+        }
+    }
+
+    func undoMoveToInbox(rowIDs: [Int64]) {
+        guard !rowIDs.isEmpty else { return }
+        showToast("正在撤销并移回收件箱…")
+        Task { [weak self] in
+            guard let self else { return }
+            var failed = 0
+            for id in rowIDs {
+                do {
+                    try await MailAppleScriptBridge.moveMessageToInbox(rowID: id)
+                } catch {
+                    failed += 1
+                }
+            }
+            if failed == 0 {
+                self.showToast("已撤销，邮件已移回收件箱")
+            } else {
+                self.showToast("部分撤销失败（\(failed) 封）")
+            }
+            try? await Task.sleep(for: .milliseconds(450))
+            self.refreshNow()
         }
     }
 

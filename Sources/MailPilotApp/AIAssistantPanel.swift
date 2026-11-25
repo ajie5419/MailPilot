@@ -184,6 +184,74 @@ struct AIAssistantPanel: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                 }
+
+                HStack(spacing: 6) {
+                    Button {
+                        ai.includeAttachmentsInAI.toggle()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "paperclip")
+                                .font(.system(size: 10))
+                            Text(ai.includeAttachmentsInAI ? "含附件解读" : "仅读正文")
+                                .font(.caption2.weight(.medium))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3.5)
+                        .background(
+                            ai.includeAttachmentsInAI ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.05),
+                            in: Capsule()
+                        )
+                        .foregroundStyle(ai.includeAttachmentsInAI ? Color.accentColor : Color.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("开启后自动本地提取 PDF / CSV / DOCX / 图片 OCR 文本参与分析")
+
+                    Button {
+                        ai.crossMailQAMode.toggle()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "magnifyingglass")
+                                .font(.system(size: 10))
+                            Text(ai.crossMailQAMode ? "全箱检索问答" : "当前邮件")
+                                .font(.caption2.weight(.medium))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3.5)
+                        .background(
+                            ai.crossMailQAMode ? Color.purple.opacity(0.16) : Color.primary.opacity(0.05),
+                            in: Capsule()
+                        )
+                        .foregroundStyle(ai.crossMailQAMode ? Color.purple : Color.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("切换为全箱跨邮件检索聚合问答（如汇总发票、机票或项目进展）")
+
+                    Spacer()
+                }
+
+                if !ai.lastReadAttachmentNames.isEmpty {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.caption2)
+                            .foregroundStyle(Color.accentColor)
+                        Text("已结合附件：\(ai.lastReadAttachmentNames.joined(separator: "、"))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                } else if ai.crossMailQAMode && ai.lastCrossMailHitCount > 0 {
+                    HStack(spacing: 4) {
+                        Image(systemName: "tray.full")
+                            .font(.caption2)
+                            .foregroundStyle(.purple)
+                        Text("全箱问答模式 · 最近命中 \(ai.lastCrossMailHitCount) 封相关邮件")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                }
             }
             .padding(.horizontal, 10)
             .padding(.bottom, 10)
@@ -288,7 +356,10 @@ struct AIAssistantPanel: View {
 
             // Prompt Input
             HStack(spacing: 8) {
-                TextField("问这封邮件任何问题...", text: $ai.aiInput)
+                TextField(
+                    ai.crossMailQAMode ? "跨所有邮件提问（如：汇总最近发票金额）..." : "问这封邮件或附件任何问题...",
+                    text: $ai.aiInput
+                )
                     .textFieldStyle(.roundedBorder)
                     .onSubmit {
                         ai.sendCustomAIQuestion()

@@ -3,7 +3,27 @@ import Foundation
 #if canImport(MailPilotCore)
 import MailPilotCore
 #endif
+import ServiceManagement
 import SwiftUI
+
+enum SearchDateRange: String, CaseIterable, Identifiable {
+    case all = "全部时间"
+    case last7Days = "近 7 天"
+    case last30Days = "近 30 天"
+    case last90Days = "近 90 天"
+
+    var id: String { rawValue }
+
+    var cutoffDate: Date? {
+        let now = Date()
+        switch self {
+        case .all: return nil
+        case .last7Days: return Calendar.current.date(byAdding: .day, value: -7, to: now)
+        case .last30Days: return Calendar.current.date(byAdding: .day, value: -30, to: now)
+        case .last90Days: return Calendar.current.date(byAdding: .day, value: -90, to: now)
+        }
+    }
+}
 
 enum SidebarSelection: Hashable {
     case allInbox
@@ -70,7 +90,41 @@ final class AppViewModel: ObservableObject {
             }
         }
     }
+    @Published var filterUnreadOnly: Bool = false {
+        didSet {
+            if filterUnreadOnly != oldValue {
+                currentPageLimit = 200
+                reloadMessages()
+            }
+        }
+    }
+    @Published var filterHasAttachments: Bool = false {
+        didSet {
+            if filterHasAttachments != oldValue {
+                currentPageLimit = 200
+                reloadMessages()
+            }
+        }
+    }
+    @Published var filterDateRange: SearchDateRange = .all {
+        didSet {
+            if filterDateRange != oldValue {
+                currentPageLimit = 200
+                reloadMessages()
+            }
+        }
+    }
     @Published var searchFocusTrigger: Int = 0
+
+    var hasActiveSearchFilters: Bool {
+        filterUnreadOnly || filterHasAttachments || filterDateRange != .all
+    }
+
+    func resetSearchFilters() {
+        filterUnreadOnly = false
+        filterHasAttachments = false
+        filterDateRange = .all
+    }
 
     func focusSearchField() {
         searchFocusTrigger += 1
@@ -167,6 +221,17 @@ final class AppViewModel: ObservableObject {
     @Published var showSettings = false
     @Published var settingsTab: SettingsTab = .ai
     @Published var toastMessage: String?
+    @Published var toastActionTitle: String?
+    private var toastActionHandler: (() -> Void)?
+    private var toastDismissTask: Task<Void, Never>?
+
+    @Published var showMenuBarExtra: Bool {
+        didSet {
+            UserDefaults.standard.set(showMenuBarExtra, forKey: Self.showMenuBarExtraKey)
+            updateDockUnreadBadge()
+        }
+    }
+    @Published var launchAtLoginEnabled: Bool = false
 
     @Published var accounts: [MailAccountInfo] = [] {
         didSet { rebuildAccountGroupingCache() }
@@ -249,6 +314,7 @@ final class AppViewModel: ObservableObject {
     private static let maxRecentBodyCacheEntries = 8
     private static let maxCacheableBodyBytes = 2 * 1024 * 1024
     private static let notificationsEnabledKey = "MailPilot.NotificationsEnabled.v1"
+    private static let showMenuBarExtraKey = "MailPilot.ShowMenuBarExtra.v1"
     private static let blockRemoteImagesKey = "MailPilot.BlockRemoteImages.v1"
     private static let tagSettingsStorageKey = "MailPilot.TagSettings.v1"
     private static let collapsedSectionsStorageKey = "MailPilot.CollapsedSidebarSections.v1"
@@ -266,6 +332,12 @@ final class AppViewModel: ObservableObject {
         } else {
             self.notificationsEnabled = true
         }
+        if UserDefaults.standard.object(forKey: Self.showMenuBarExtraKey) != nil {
+            self.showMenuBarExtra = UserDefaults.standard.bool(forKey: Self.showMenuBarExtraKey)
+        } else {
+            self.showMenuBarExtra = true
+        }
+        self.launchAtLoginEnabled = (SMAppService.mainApp.status == .enabled)
         if let customData = UserDefaults.standard.data(forKey: Self.accountCustomizationsKey),
            let decodedCustom = try? JSONDecoder().decode([String: AccountCustomization].self, from: customData) {
             self.accountCustomizations = decodedCustom
@@ -329,6 +401,32 @@ final class AppViewModel: ObservableObject {
         }
         ai.currentMessages = { [weak self] in
             self?.messages ?? []
+        }
+        ai.onSearchEmailsForQA = { [weak self] keywords, limit in
+            guard let self, let reader = self.reader else { return [] }
+            let fts = self.bodyIndex
+            var hitIDs: [Int64] = []
+            var seen: Set<Int64> = []
+            for kw in keywords {
+                let ids = await fts.searchRowIDs(query: kw, limit: 80)
+                for id in ids where seen.insert(id).inserted {
+                    hitIDs.append(id)
+                }
+            }
+            let primaryKeyword = keywords.first ?? ""
+            let fetched: [MailMessageSummary] = await Task.detached(priority: .userInitiated) {
+                let page = (try? reader.fetchMessagePage(
+                    onlyInbox: false,
+                    searchQuery: primaryKeyword,
+                    bodyHitIDs: hitIDs,
+                    limit: limit
+                ))
+                return page?.messages ?? []
+            }.value
+            let snippets = await fts.fetchSnippets(for: fetched.map(\.id), maxChars: 650)
+            return fetched.map { msg in
+                (message: msg, snippet: snippets[msg.id] ?? "")
+            }
         }
 
         compose.currentAIConfig = { [weak self] in
@@ -482,7 +580,15 @@ final class AppViewModel: ObservableObject {
     }
 
     func updateDockUnreadBadge() {
-        notificationManager.syncBadgeCount(totalInboxUnreadCount)
+        let count = totalInboxUnreadCount
+        notificationManager.syncBadgeCount(count)
+        MailPilotAppDelegate.shared?.onMenuBarCompose = { [weak self] in
+            self?.openComposeNew()
+        }
+        MailPilotAppDelegate.shared?.onMenuBarCheckMail = { [weak self] in
+            self?.triggerNativeMailFetch()
+        }
+        MailPilotAppDelegate.shared?.updateMenuBarStatus(visible: showMenuBarExtra, unreadCount: count)
     }
 
     private func observeAppLifecycle() {
@@ -687,6 +793,9 @@ final class AppViewModel: ObservableObject {
 
         let query = searchQuery
         let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveOnlyUnread = onlyUnread || filterUnreadOnly
+        let effectiveOnlyAttachments = filterHasAttachments
+        let effectiveSinceDate = filterDateRange.cutoffDate
         let currentTagSettings = tagSettings
         let baseLimit = filterTag != nil ? max(400, currentPageLimit) : currentPageLimit
         let indexCoordinator = bodyIndex
@@ -699,6 +808,9 @@ final class AppViewModel: ObservableObject {
                 let bodyHitIDs: [Int64] = trimmedQuery.isEmpty
                     ? []
                     : await indexCoordinator.searchRowIDs(query: trimmedQuery, limit: nil)
+                let fallbackAttachmentRowIDs: Set<Int64>? = effectiveOnlyAttachments
+                    ? await indexCoordinator.fetchRowIDsWithAttachments()
+                    : nil
 
                 let (page, precomputedTags) = try await Self.runCancellableDetached(priority: .userInitiated) {
                     try Task.checkCancellation()
@@ -708,10 +820,13 @@ final class AppViewModel: ObservableObject {
                     let result = try reader.fetchMessagePage(
                         mailboxID: mailboxID,
                         onlyInbox: onlyInbox,
-                        onlyUnread: onlyUnread,
+                        onlyUnread: effectiveOnlyUnread,
                         onlyFlagged: onlyFlagged,
+                        onlyWithAttachments: effectiveOnlyAttachments,
+                        sinceDate: effectiveSinceDate,
                         searchQuery: query,
                         bodyHitIDs: bodyHitIDs,
+                        fallbackAttachmentRowIDs: fallbackAttachmentRowIDs,
                         limit: baseLimit,
                         predicate: tagPredicate
                     )
@@ -1009,13 +1124,48 @@ final class AppViewModel: ObservableObject {
         showToast(label)
     }
 
-    func showToast(_ message: String) {
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            launchAtLoginEnabled = (SMAppService.mainApp.status == .enabled)
+            showToast(launchAtLoginEnabled ? "已开启登录时自动启动" : "已关闭登录时自动启动")
+        } catch {
+            launchAtLoginEnabled = (SMAppService.mainApp.status == .enabled)
+            showToast("设置开机自启失败：\(error.localizedDescription)")
+        }
+    }
+
+    func showToast(
+        _ message: String,
+        actionTitle: String? = nil,
+        duration: Double = 2.5,
+        action: (() -> Void)? = nil
+    ) {
+        toastDismissTask?.cancel()
         toastMessage = message
-        Task {
-            try? await Task.sleep(for: .seconds(2.5))
+        toastActionTitle = actionTitle
+        toastActionHandler = action
+        toastDismissTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(duration))
+            guard !Task.isCancelled, let self else { return }
             if self.toastMessage == message {
                 self.toastMessage = nil
+                self.toastActionTitle = nil
+                self.toastActionHandler = nil
             }
         }
+    }
+
+    func performToastAction() {
+        let handler = toastActionHandler
+        toastDismissTask?.cancel()
+        toastMessage = nil
+        toastActionTitle = nil
+        toastActionHandler = nil
+        handler?()
     }
 }
