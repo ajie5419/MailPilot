@@ -221,13 +221,14 @@ final class BodyIndexCoordinator: ObservableObject {
                             let racedSet = Set(racedDeleted)
                             committedIDs.removeAll { racedSet.contains($0) }
                         }
+                        let finalCommittedIDs = committedIDs
                         anyChanges = true
                         let total = await ftsIndex.totalIndexedCount()
                         await MainActor.run { [weak self] in
                             self?.indexedBodyCount = total
                             self?.errorMessage = nil
-                            if !committedIDs.isEmpty {
-                                self?.onIndexedRowIDsUpdated?(committedIDs)
+                            if !finalCommittedIDs.isEmpty {
+                                self?.onIndexedRowIDsUpdated?(finalCommittedIDs)
                             }
                         }
                     }
