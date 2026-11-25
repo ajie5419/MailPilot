@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-build:
+    name: Core Tests & macOS App Build
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify Swift toolchain
+        run: swiftc --version
+
+      - name: Run standalone core & ChatGPT test suites
+        run: ./scripts/run_tests.sh
+
+      - name: Build macOS app bundle
+        run: ./scripts/build_app.sh
+
+      - name: Verify built app bundle metadata
+        run: |
+          test -x dist/MailPilot.app/Contents/MacOS/MailPilot
+          defaults read "$PWD/dist/MailPilot.app/Contents/Info.plist" CFBundleShortVersionString
