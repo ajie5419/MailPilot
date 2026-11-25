@@ -324,7 +324,7 @@ final class AppViewModel: ObservableObject {
     private var recentBodyCache: [Int64: CachedRenderedBody] = [:]
     private var recentBodyOrder: [Int64] = []
     /// Keeps messages auto-marked as read during the current `.unread` session visible so reading never jumps away.
-    private var sessionKeptUnreadMessages: [Int64: MailMessageSummary] = [:]
+    var sessionKeptUnreadMessages: [Int64: MailMessageSummary] = [:]
 
     private static let maxRecentBodyCacheEntries = 8
     private static let maxCacheableBodyBytes = 2 * 1024 * 1024

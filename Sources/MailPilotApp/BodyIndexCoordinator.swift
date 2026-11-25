@@ -17,6 +17,8 @@ final class BodyIndexCoordinator: ObservableObject {
 
     private let index: BodySearchIndex
     private var indexingTask: Task<Void, Never>?
+    private var isClearingOrRebuilding = false
+    private var deletedRowIDsInFlight: Set<Int64> = []
     private var hasCompletedFullSweep = false
     private var hasPrunedStale = false
     private var resumeCursorRowID: Int64?
@@ -52,6 +54,9 @@ final class BodyIndexCoordinator: ObservableObject {
 
     func deleteRowIDs(_ rowIDs: [Int64]) async {
         guard !rowIDs.isEmpty else { return }
+        for id in rowIDs {
+            deletedRowIDsInFlight.insert(id)
+        }
         do {
             try await index.deleteRowIDs(rowIDs)
             indexedBodyCount = await index.totalIndexedCount()
@@ -67,6 +72,7 @@ final class BodyIndexCoordinator: ObservableObject {
         parser: EmlxParser?,
         onToast: @escaping (String) -> Void
     ) {
+        isClearingOrRebuilding = true
         let previousTask = indexingTask
         indexingTask?.cancel()
         indexingTask = nil
@@ -77,20 +83,24 @@ final class BodyIndexCoordinator: ObservableObject {
         let ftsIndex = index
         Task { [weak self] in
             await previousTask?.value
+            guard let self else { return }
             do {
                 try await ftsIndex.clearAll()
-                self?.indexedBodyCount = 0
-                self?.errorMessage = nil
-                self?.onIndexCleared?()
+                self.deletedRowIDsInFlight.removeAll()
+                self.indexedBodyCount = 0
+                self.errorMessage = nil
+                self.onIndexCleared?()
                 onToast("已清空正文索引，正在后台重建...")
-                self?.scheduleIndexing(
+                self.isClearingOrRebuilding = false
+                self.scheduleIndexing(
                     visiblePriority: visiblePriority,
                     reader: reader,
                     parser: parser,
                     forceFullSweep: true
                 )
             } catch {
-                self?.errorMessage = error.localizedDescription
+                self.isClearingOrRebuilding = false
+                self.errorMessage = error.localizedDescription
                 onToast("清空正文索引失败：\(error.localizedDescription)")
             }
         }
@@ -102,6 +112,7 @@ final class BodyIndexCoordinator: ObservableObject {
         parser: EmlxParser?,
         onToast: @escaping (String) -> Void
     ) {
+        guard !isClearingOrRebuilding else { return }
         errorMessage = nil
         onToast("正在重试本地正文索引...")
         scheduleIndexing(
@@ -113,6 +124,7 @@ final class BodyIndexCoordinator: ObservableObject {
     }
 
     func clear(onToast: @escaping (String) -> Void) {
+        isClearingOrRebuilding = true
         let previousTask = indexingTask
         indexingTask?.cancel()
         indexingTask = nil
@@ -123,14 +135,17 @@ final class BodyIndexCoordinator: ObservableObject {
         let ftsIndex = index
         Task { [weak self] in
             await previousTask?.value
+            guard let self else { return }
+            defer { self.isClearingOrRebuilding = false }
             do {
                 try await ftsIndex.clearAll()
-                self?.indexedBodyCount = 0
-                self?.errorMessage = nil
-                self?.onIndexCleared?()
+                self.deletedRowIDsInFlight.removeAll()
+                self.indexedBodyCount = 0
+                self.errorMessage = nil
+                self.onIndexCleared?()
                 onToast("已清空本地正文全文搜索缓存")
             } catch {
-                self?.errorMessage = error.localizedDescription
+                self.errorMessage = error.localizedDescription
                 onToast("清空本地正文缓存失败：\(error.localizedDescription)")
             }
         }
@@ -146,7 +161,8 @@ final class BodyIndexCoordinator: ObservableObject {
         parser: EmlxParser?,
         forceFullSweep: Bool = false
     ) {
-        guard let parser else { return }
+        guard !isClearingOrRebuilding, let parser else { return }
+        deletedRowIDsInFlight.removeAll()
         let ftsIndex = index
         let shouldRunFullSweep = forceFullSweep || !hasCompletedFullSweep
         let shouldPruneStale = shouldRunFullSweep && !hasPrunedStale
@@ -182,8 +198,27 @@ final class BodyIndexCoordinator: ObservableObject {
                     guard !unique.isEmpty else { return }
                     let storedVersions = await ftsIndex.indexedVersions(in: unique.map(\.id))
                     var batch: [(rowID: Int64, subject: String, sender: String, body: String, fileMTime: Double, hasAttachments: Bool)] = []
-                    var writtenIDs: [Int64] = []
-                    var chunkWrote = false
+                    func flushBatch() async throws {
+                        guard !batch.isEmpty else { return }
+                        let deletedSnapshot = await MainActor.run { [weak self] () -> Set<Int64> in
+                            self?.deletedRowIDsInFlight ?? []
+                        }
+                        let liveBatch = deletedSnapshot.isEmpty
+                            ? batch
+                            : batch.filter { !deletedSnapshot.contains($0.rowID) }
+                        batch.removeAll(keepingCapacity: true)
+                        guard !Task.isCancelled, !liveBatch.isEmpty else { return }
+                        try await ftsIndex.upsertBatchWithMetadata(liveBatch)
+                        let committedIDs = liveBatch.map(\.rowID)
+                        anyChanges = true
+                        let total = await ftsIndex.totalIndexedCount()
+                        await MainActor.run { [weak self] in
+                            self?.indexedBodyCount = total
+                            self?.errorMessage = nil
+                            self?.onIndexedRowIDsUpdated?(committedIDs)
+                        }
+                    }
+
                     for msg in unique {
                         if Task.isCancelled { break }
                         let result = await parser.loadPlainTextForIndexing(for: msg.id, cachedMTime: storedVersions[msg.id])
@@ -204,28 +239,11 @@ final class BodyIndexCoordinator: ObservableObject {
                             hasAttachments: !attachmentNames.isEmpty
                         ))
                         if batch.count >= 25 {
-                            if Task.isCancelled { break }
-                            try await ftsIndex.upsertBatchWithMetadata(batch)
-                            writtenIDs.append(contentsOf: batch.map(\.rowID))
-                            batch.removeAll(keepingCapacity: true)
-                            chunkWrote = true
-                            anyChanges = true
+                            try await flushBatch()
                         }
                     }
                     if !Task.isCancelled && !batch.isEmpty {
-                        try await ftsIndex.upsertBatchWithMetadata(batch)
-                        writtenIDs.append(contentsOf: batch.map(\.rowID))
-                        chunkWrote = true
-                        anyChanges = true
-                    }
-                    if !Task.isCancelled && chunkWrote {
-                        let total = await ftsIndex.totalIndexedCount()
-                        let notifiedIDs = writtenIDs
-                        await MainActor.run { [weak self] in
-                            self?.indexedBodyCount = total
-                            self?.errorMessage = nil
-                            self?.onIndexedRowIDsUpdated?(notifiedIDs)
-                        }
+                        try await flushBatch()
                     }
                 }
 

@@ -531,8 +531,7 @@ final class AIAssistantController: ObservableObject {
     ) -> String {
         let fp = Self.contentFingerprint(
             subject: message.subject,
-            plainText: body.plainText,
-            attachments: body.attachments,
+            body: body,
             includeAttachments: includeAttachments
         )
         return "\(message.id)|att:\(includeAttachments ? 1 : 0)|mask:\(maskSensitiveData ? 1 : 0)|v:\(fp)"
@@ -546,8 +545,7 @@ final class AIAssistantController: ObservableObject {
     ) -> String {
         let fp = Self.contentFingerprint(
             subject: message.subject,
-            plainText: body.plainText,
-            attachments: [],
+            body: body,
             includeAttachments: false
         )
         return "\(message.id)|lang:\(target.rawValue)|mask:\(maskSensitiveData ? 1 : 0)|v:\(fp)"
@@ -555,17 +553,23 @@ final class AIAssistantController: ObservableObject {
 
     private static func contentFingerprint(
         subject: String,
-        plainText: String,
-        attachments: [MailAttachment],
+        body: ParsedMailBody,
         includeAttachments: Bool
     ) -> String {
         var hasher = SHA256()
         hasher.update(data: Data(subject.utf8))
         hasher.update(data: Data([0]))
-        hasher.update(data: Data(plainText.utf8))
+        hasher.update(data: Data(body.plainText.utf8))
+        hasher.update(data: Data([0]))
+        if let srcPath = body.sourcePath {
+            hasher.update(data: Data(srcPath.utf8))
+        }
+        if let srcMTime = body.sourceModifiedAt {
+            hasher.update(data: Data(":\(srcMTime.timeIntervalSince1970)".utf8))
+        }
         hasher.update(data: Data([0]))
         if includeAttachments {
-            for att in attachments {
+            for att in body.attachments {
                 hasher.update(data: Data(att.filename.utf8))
                 hasher.update(data: Data(":\(att.sizeBytes):\(att.mimeType):".utf8))
                 if let inlineData = att.inlineData {
@@ -573,9 +577,29 @@ final class AIAssistantController: ObservableObject {
                     hasher.update(data: Data(":\(inlineData.count)".utf8))
                 } else if let path = att.localFileURL?.path {
                     hasher.update(data: Data(path.utf8))
-                    if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-                       let mtime = attrs[.modificationDate] as? Date {
-                        hasher.update(data: Data(":\(mtime.timeIntervalSince1970)".utf8))
+                    if let attrs = try? FileManager.default.attributesOfItem(atPath: path) {
+                        if let mtime = attrs[.modificationDate] as? Date {
+                            hasher.update(data: Data(":\(mtime.timeIntervalSince1970)".utf8))
+                        }
+                        if let size = attrs[.size] as? NSNumber {
+                            hasher.update(data: Data(":\(size.int64Value)".utf8))
+                        }
+                    }
+                } else if let emlxPath = att.sourceEmlxPath {
+                    hasher.update(data: Data(emlxPath.utf8))
+                    if let range = att.sourceByteRange {
+                        hasher.update(data: Data(":\(range.lowerBound)-\(range.upperBound)".utf8))
+                    }
+                    if let encoding = att.sourceTransferEncoding {
+                        hasher.update(data: Data(":\(encoding)".utf8))
+                    }
+                    if let attrs = try? FileManager.default.attributesOfItem(atPath: emlxPath) {
+                        if let mtime = attrs[.modificationDate] as? Date {
+                            hasher.update(data: Data(":\(mtime.timeIntervalSince1970)".utf8))
+                        }
+                        if let size = attrs[.size] as? NSNumber {
+                            hasher.update(data: Data(":\(size.int64Value)".utf8))
+                        }
                     }
                 }
                 hasher.update(data: Data([0]))
@@ -585,18 +609,30 @@ final class AIAssistantController: ObservableObject {
     }
 
     /// Resolves `.auto` target language once per email so multi-chunk translations never mix languages.
+    /// Japanese/Korean scripts (containing Kana or Hangul) are always treated as foreign -> Simplified Chinese.
     private static func resolveAutoTranslationTarget(subject: String, body: String) -> TranslationTargetLanguage {
         let sample = subject + "\n" + String(body.prefix(1500))
         var cjkCount = 0
+        var kanaOrHangulCount = 0
         var letterCount = 0
         for scalar in sample.unicodeScalars {
             let v = scalar.value
-            if (0x4E00...0x9FFF).contains(v) || (0x3400...0x4DBF).contains(v) {
+            if (0x3040...0x309F).contains(v)
+                || (0x30A0...0x30FF).contains(v)
+                || (0x31F0...0x31FF).contains(v)
+                || (0xAC00...0xD7AF).contains(v)
+                || (0x1100...0x11FF).contains(v) {
+                kanaOrHangulCount += 1
+                letterCount += 1
+            } else if (0x4E00...0x9FFF).contains(v) || (0x3400...0x4DBF).contains(v) {
                 cjkCount += 1
                 letterCount += 1
             } else if CharacterSet.letters.contains(scalar) {
                 letterCount += 1
             }
+        }
+        if kanaOrHangulCount >= 2 {
+            return .chinese
         }
         guard letterCount > 0 else { return .chinese }
         return (Double(cjkCount) / Double(letterCount)) >= 0.18 ? .english : .chinese
@@ -810,10 +846,10 @@ final class AIAssistantController: ObservableObject {
 
         // Run PrivacyMasker ONCE on the FULL unclipped text before capping/chunking so no sensitive token
         // is ever split across a 3,800-char chunk boundary or the 24,000-char cap.
+        let originalCharCount = body.plainText.count
         let preparedSubject = configSnapshot.maskSensitiveData ? PrivacyMasker.mask(message.subject) : message.subject
         let preparedFullText = configSnapshot.maskSensitiveData ? PrivacyMasker.mask(body.plainText) : body.plainText
-        let totalCharCount = preparedFullText.count
-        let wasCapped = totalCharCount > Self.maxTotalTranslationChars
+        let wasCapped = preparedFullText.count > Self.maxTotalTranslationChars
         let textToTranslate = wasCapped
             ? Self.safePrefixPreservingMaskTokens(preparedFullText, maxChars: Self.maxTotalTranslationChars)
             : preparedFullText
@@ -821,9 +857,9 @@ final class AIAssistantController: ObservableObject {
 
         inlineNoticeText = chunks.count > 1
             ? (wasCapped
-                ? "原邮件较长（共 \(totalCharCount) 字），正在分段翻译前 \(textToTranslate.count) 字（第 1/\(chunks.count) 段）…"
+                ? "原邮件较长（共 \(originalCharCount) 字），正在分段翻译前 \(Self.maxTotalTranslationChars) 字（第 1/\(chunks.count) 段）…"
                 : "长邮件分段翻译中（第 1/\(chunks.count) 段）…")
-            : (wasCapped ? "原邮件较长（共 \(totalCharCount) 字），仅翻译前 \(textToTranslate.count) 字。" : nil)
+            : (wasCapped ? "原邮件较长（共 \(originalCharCount) 字），仅翻译前 \(Self.maxTotalTranslationChars) 字。" : nil)
 
         inlineSummaryTask = Task { [weak self] in
             guard let self else { return }
@@ -834,7 +870,7 @@ final class AIAssistantController: ObservableObject {
                     let streamGen = self.advanceInlineStreamGeneration()
                     if chunks.count > 1, self.currentSelectedMessageID?() == targetID {
                         self.inlineNoticeText = wasCapped
-                            ? "原邮件较长（共 \(totalCharCount) 字），正在分段翻译前 \(textToTranslate.count) 字（第 \(index + 1)/\(chunks.count) 段）…"
+                            ? "原邮件较长（共 \(originalCharCount) 字），正在分段翻译前 \(Self.maxTotalTranslationChars) 字（第 \(index + 1)/\(chunks.count) 段）…"
                             : "长邮件分段翻译中（第 \(index + 1)/\(chunks.count) 段）…"
                     }
 
@@ -895,7 +931,7 @@ final class AIAssistantController: ObservableObject {
                 let finalText = completedParts.joined(separator: "\n\n")
                 if !finalText.isEmpty {
                     let finalNotice: String? = wasCapped
-                        ? "原邮件较长（共 \(totalCharCount) 字），已完整翻译前 \(textToTranslate.count) 字。"
+                        ? "原邮件较长（共 \(originalCharCount) 字），已完整翻译前 \(Self.maxTotalTranslationChars) 字。"
                         : nil
                     self.storeTranslation(CachedTranslationEntry(text: finalText, notice: finalNotice), for: cacheKey)
                     if self.currentSelectedMessageID?() == targetID {
@@ -1351,9 +1387,10 @@ final class AIAssistantController: ObservableObject {
         message: MailMessageSummary,
         body: ParsedMailBody,
         attachmentSection: String = "",
-        maskBeforeClipping: Bool = false
+        maskBeforeClipping: Bool? = nil
     ) -> String {
-        let sourceBody = maskBeforeClipping ? PrivacyMasker.mask(body.plainText) : body.plainText
+        let shouldMask = maskBeforeClipping ?? aiConfig.maskSensitiveData
+        let sourceBody = shouldMask ? PrivacyMasker.mask(body.plainText) : body.plainText
         let clippedBody = Self.safePrefixPreservingMaskTokens(sourceBody, maxChars: 4000)
         let truncationNote = sourceBody.count > 4000 ? "\n（注：原邮件正文较长，已截取前 4,000 字）" : ""
         let attachmentListNote = body.attachments.isEmpty

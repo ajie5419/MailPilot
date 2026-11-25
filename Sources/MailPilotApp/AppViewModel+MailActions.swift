@@ -84,6 +84,7 @@ extension AppViewModel {
     }
 
     func removeMessageLocally(rowID: Int64) {
+        sessionKeptUnreadMessages.removeValue(forKey: rowID)
         guard let idx = messages.firstIndex(where: { $0.id == rowID }) else { return }
         localListMutationVersion &+= 1
         let removed = messages.remove(at: idx)
@@ -197,6 +198,7 @@ extension AppViewModel {
             guard let self else { return }
             var failed = 0
             for item in opTokens {
+                guard self.pendingReadOverrides[item.id]?.token == item.token else { continue }
                 do {
                     try await MailAppleScriptBridge.setReadStatus(rowID: item.id, isRead: isRead)
                     self.finishReadOverride(rowID: item.id, token: item.token, succeeded: true, fallbackIsRead: item.previousRead)
