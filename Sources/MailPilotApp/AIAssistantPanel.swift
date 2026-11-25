@@ -154,11 +154,11 @@ struct AIAssistantPanel: View {
 
             // Quick Actions
             VStack(spacing: 8) {
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     Button {
                         ai.summarizeSelectedEmail()
                     } label: {
-                        Label("总结邮件", systemImage: "text.alignleft")
+                        Label("总结", systemImage: "text.alignleft")
                             .frame(maxWidth: .infinity)
                     }
                     .disabled(viewModel.selectedMessage == nil || ai.isAIThinking)
@@ -166,10 +166,19 @@ struct AIAssistantPanel: View {
                     Button {
                         ai.generateReplyDraft(tone: "专业简洁")
                     } label: {
-                        Label("起草回复", systemImage: "square.and.pencil")
+                        Label("回复", systemImage: "square.and.pencil")
                             .frame(maxWidth: .infinity)
                     }
                     .disabled(viewModel.selectedMessage == nil || ai.isAIThinking)
+
+                    Button {
+                        viewModel.generateUnreadBriefing()
+                    } label: {
+                        Label("简报", systemImage: "sparkles.rectangle.stack")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .disabled(ai.isAIThinking)
+                    .help("用 AI 汇总当前列表里的未读邮件")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)

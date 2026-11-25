@@ -26,25 +26,24 @@ struct MailDetailView: View {
             let hasBlockedRemote = activeHTML != nil && shouldBlockRemote && viewModel.selectedBodyHasRemoteResources
 
             VStack(spacing: 0) {
-                headerBar(for: message)
+                headerBar(for: message, hasBlockedRemote: hasBlockedRemote)
                 Divider()
-
-                compactActionStrip(for: message, hasBlockedRemote: hasBlockedRemote)
-                Divider()
+                    .opacity(0.75)
 
                 if ai.showInlineSummary {
                     inlineSummaryCard
-                    Divider()
                 }
 
                 if let loadedBody, let code = loadedBody.verificationCode {
                     verificationBanner(code: code)
                     Divider()
+                        .opacity(0.6)
                 }
 
                 if let loadedBody, !loadedBody.attachments.isEmpty {
                     attachmentsBar(loadedBody.attachments)
                     Divider()
+                        .opacity(0.6)
                 }
 
                 // Keep a single warm WKWebView mounted across email switches & plain-text toggles
@@ -84,8 +83,8 @@ struct MailDetailView: View {
         }
     }
 
-    private func headerBar(for message: MailMessageSummary) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
+    private func headerBar(for message: MailMessageSummary, hasBlockedRemote: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 8) {
                 HStack(spacing: 6) {
                     if message.isFlagged {
@@ -188,20 +187,27 @@ struct MailDetailView: View {
                         .textSelection(.enabled)
                 }
                 Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
+                VStack(alignment: .trailing, spacing: 3) {
                     Text(message.dateReceived.formatted(date: .abbreviated, time: .shortened))
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                     if let acctName = viewModel.accountDisplayName(for: message.accountID) {
-                        AccountBadgePill(
-                            accountID: message.accountID,
-                            label: "\(acctName) · \(message.mailboxName)",
-                            email: viewModel.accountEmail(for: message.accountID),
-                            customIconPath: viewModel.accountCustomIconPath(for: message.accountID),
-                            presetLogoID: viewModel.accountPresetLogoID(for: message.accountID),
-                            sfSymbolName: viewModel.accountSFSymbolName(for: message.accountID),
-                            fallbackColor: viewModel.accountBadgeColor(for: message.accountID)
-                        )
+                        HStack(spacing: 5) {
+                            AccountLogoView(
+                                accountID: message.accountID,
+                                email: viewModel.accountEmail(for: message.accountID),
+                                customIconPath: viewModel.accountCustomIconPath(for: message.accountID),
+                                presetLogoID: viewModel.accountPresetLogoID(for: message.accountID),
+                                sfSymbolName: viewModel.accountSFSymbolName(for: message.accountID),
+                                fallbackColor: viewModel.accountBadgeColor(for: message.accountID),
+                                size: 13
+                            )
+                            Text("\(acctName) · \(message.mailboxName)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        .help(viewModel.accountEmail(for: message.accountID) ?? acctName)
                     }
                 }
             }
@@ -209,9 +215,12 @@ struct MailDetailView: View {
             if !viewModel.selectedMessageRecipients.isEmpty {
                 recipientsSummaryBar(viewModel.selectedMessageRecipients)
             }
+
+            compactActionStrip(for: message, hasBlockedRemote: hasBlockedRemote)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 18)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
         .background(.background)
         .onChange(of: message.id) { _, _ in
             recipientExpandState.isExpanded = false
@@ -328,10 +337,10 @@ struct MailDetailView: View {
                         }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 5)
-                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                         .overlay(
                             RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .strokeBorder(.separator.opacity(0.55), lineWidth: 0.7)
+                                .strokeBorder(.separator.opacity(0.4), lineWidth: 0.6)
                         )
                         .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
                     }
@@ -389,8 +398,12 @@ struct MailDetailView: View {
     }
 
     private func compactActionStrip(for message: MailMessageSummary, hasBlockedRemote: Bool) -> some View {
-        HStack(spacing: 7) {
-            if ai.isInlineSummarizing {
+        let isSummarizing = ai.isInlineSummarizing && ai.inlineCardMode == .summary
+        let isTranslating = ai.isInlineSummarizing && ai.inlineCardMode == .translation
+        let isShowingTranslation = ai.showInlineSummary && ai.inlineCardMode == .translation
+
+        return HStack(spacing: 6) {
+            if isSummarizing {
                 Button {
                     ai.stopInlineSummary()
                 } label: {
@@ -402,12 +415,8 @@ struct MailDetailView: View {
                     }
                     .foregroundStyle(Color.accentColor)
                     .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(Color.accentColor.opacity(0.12), in: Capsule())
-                    .overlay(
-                        Capsule()
-                            .strokeBorder(Color.accentColor.opacity(0.28), lineWidth: 0.8)
-                    )
+                    .padding(.vertical, 4.5)
+                    .background(Color.accentColor.opacity(0.14), in: RoundedRectangle(cornerRadius: 6.5, style: .continuous))
                 }
                 .buttonStyle(.plain)
                 .help("停止正在生成的摘要")
@@ -417,18 +426,14 @@ struct MailDetailView: View {
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "sparkles")
-                            .font(.system(size: 11, weight: .medium))
+                            .font(.system(size: 10.5, weight: .semibold))
                         Text("总结邮件")
                             .font(.caption.weight(.medium))
                     }
-                    .foregroundStyle(Color.accentColor)
+                    .foregroundStyle(.white)
                     .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(Color.accentColor.opacity(0.12), in: Capsule())
-                    .overlay(
-                        Capsule()
-                            .strokeBorder(Color.accentColor.opacity(0.24), lineWidth: 0.8)
-                    )
+                    .padding(.vertical, 4.5)
+                    .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 6.5, style: .continuous))
                 }
                 .buttonStyle(.plain)
                 .disabled(viewModel.isLoadingBody)
@@ -436,66 +441,68 @@ struct MailDetailView: View {
                 .help("使用 AI 生成当前邮件摘要")
             }
 
-            Button {
-                ai.generateReplyDraft(tone: "专业简洁")
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "square.and.pencil")
-                        .font(.system(size: 11))
-                    Text("起草回复")
-                        .font(.caption)
+            if isTranslating {
+                Button {
+                    ai.stopInlineSummary()
+                } label: {
+                    HStack(spacing: 5) {
+                        ProgressView()
+                            .controlSize(.mini)
+                        Text("停止翻译")
+                            .font(.caption.weight(.medium))
+                    }
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4.5)
+                    .background(Color.accentColor.opacity(0.14), in: RoundedRectangle(cornerRadius: 6.5, style: .continuous))
                 }
-                .foregroundStyle(.primary.opacity(0.85))
-                .padding(.horizontal, 9)
-                .padding(.vertical, 4)
-                .background(.quaternary.opacity(0.5), in: Capsule())
-            }
-            .buttonStyle(.plain)
-            .disabled(viewModel.isLoadingBody || ai.isAIThinking)
-            .opacity((viewModel.isLoadingBody || ai.isAIThinking) ? 0.5 : 1)
-            .help("基于当前邮件起草回复")
-
-            Button {
-                viewModel.showAIPanel.toggle()
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "bubble.left.and.text.bubble.right")
-                        .font(.system(size: 11))
-                    Text(viewModel.showAIPanel ? "收起对话" : "追问 AI")
-                        .font(.caption)
+                .buttonStyle(.plain)
+                .help("停止正在进行的翻译")
+            } else {
+                Button {
+                    ai.translateSelectedEmailInline()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "globe")
+                            .font(.system(size: 10.5, weight: .medium))
+                        Text("翻译邮件")
+                            .font(.caption.weight(.medium))
+                    }
+                    .foregroundStyle(isShowingTranslation ? Color.accentColor : .primary.opacity(0.84))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4.5)
+                    .background(
+                        isShowingTranslation ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.055),
+                        in: RoundedRectangle(cornerRadius: 6.5, style: .continuous)
+                    )
                 }
-                .foregroundStyle(viewModel.showAIPanel ? Color.accentColor : .primary.opacity(0.85))
-                .padding(.horizontal, 9)
-                .padding(.vertical, 4)
-                .background(
-                    viewModel.showAIPanel ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.05),
-                    in: Capsule()
-                )
+                .buttonStyle(.plain)
+                .disabled(viewModel.isLoadingBody)
+                .opacity(viewModel.isLoadingBody ? 0.5 : 1)
+                .help("将当前邮件智能翻译（外文译为中文，中文译为英文）")
             }
-            .buttonStyle(.plain)
-            .help(viewModel.showAIPanel ? "收起右侧 AI 对话栏" : "打开右侧 AI 对话栏继续追问")
 
             Spacer(minLength: 8)
 
             if hasBlockedRemote {
-                HStack(spacing: 6) {
+                HStack(spacing: 5) {
                     Image(systemName: "eye.slash")
-                        .font(.system(size: 11))
+                        .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                     Text("已拦截远程图")
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                     Button("显示") {
                         viewModel.allowedRemoteContentMessageIDs.insert(message.id)
                     }
                     .buttonStyle(.plain)
-                    .font(.caption.weight(.medium))
+                    .font(.caption2.weight(.semibold))
                     .foregroundStyle(Color.accentColor)
                     .help("仅对当前邮件加载远程图片")
                 }
-                .padding(.horizontal, 9)
-                .padding(.vertical, 4)
-                .background(.quaternary.opacity(0.45), in: Capsule())
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3.5)
+                .background(Color.primary.opacity(0.045), in: Capsule())
             } else {
                 Button {
                     viewModel.settingsTab = .ai
@@ -505,32 +512,77 @@ struct MailDetailView: View {
                         Image(systemName: "cpu")
                             .font(.system(size: 10))
                         Text("\(ai.activeAIBadge) · \(ai.activeModelDisplayName)")
-                            .font(.caption)
+                            .font(.caption2)
                             .lineLimit(1)
                     }
                     .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(.quaternary.opacity(0.45), in: Capsule())
                 }
                 .buttonStyle(.plain)
                 .help("点击配置模型或订阅账号")
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 7)
-        .background(.bar.opacity(0.55))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color.primary.opacity(0.032), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(.separator.opacity(0.35), lineWidth: 0.5)
+        )
     }
 
     private var inlineSummaryCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let isTranslation = ai.inlineCardMode == .translation
+
+        return VStack(alignment: .leading, spacing: 0) {
+            // Card Header Strip
             HStack(spacing: 8) {
-                Label("AI 摘要", systemImage: "sparkles")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Color.accentColor)
+                ZStack {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.12))
+                    Image(systemName: isTranslation ? "globe" : "sparkles")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                }
+                .frame(width: 21, height: 21)
+
+                Text(isTranslation ? "AI 翻译" : "AI 摘要")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.primary)
+
+                if isTranslation {
+                    Menu {
+                        ForEach(TranslationTargetLanguage.allCases) { lang in
+                            Button {
+                                ai.translateSelectedEmailInline(target: lang)
+                            } label: {
+                                if ai.translationTarget == lang {
+                                    Label(lang.rawValue, systemImage: "checkmark")
+                                } else {
+                                    Text(lang.rawValue)
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Text(ai.translationTarget.rawValue)
+                                .font(.system(size: 11, weight: .medium))
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 8.5, weight: .semibold))
+                        }
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2.5)
+                        .background(Color.primary.opacity(0.05), in: Capsule())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("切换目标翻译语言")
+                }
 
                 if ai.isInlineSummarizing {
-                    ProgressView().controlSize(.mini)
+                    ProgressView()
+                        .controlSize(.mini)
                     Button {
                         ai.stopInlineSummary()
                     } label: {
@@ -539,29 +591,38 @@ struct MailDetailView: View {
                     }
                     .buttonStyle(.borderless)
                     .foregroundStyle(.secondary)
-                    .help("停止生成摘要")
+                    .help(isTranslation ? "停止翻译" : "停止生成摘要")
                 }
 
                 Spacer()
 
-                if !ai.inlineSummaryText.isEmpty {
+                if !ai.inlineSummaryText.isEmpty && !ai.isInlineSummarizing {
                     Button {
-                        viewModel.copyToClipboard(ai.inlineSummaryText, label: "已复制摘要")
+                        if isTranslation {
+                            ai.translateSelectedEmailInline(forceRefresh: true)
+                        } else {
+                            ai.summarizeSelectedEmailInline(forceRefresh: true)
+                        }
                     } label: {
-                        Image(systemName: "doc.on.doc")
-                            .font(.caption)
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.borderless)
-                    .help("复制摘要")
+                    .help(isTranslation ? "重新翻译" : "重新生成摘要")
 
                     Button {
-                        ai.continueInlineSummaryInDrawer()
+                        viewModel.copyToClipboard(
+                            ai.inlineSummaryText,
+                            label: isTranslation ? "已复制译文" : "已复制摘要"
+                        )
                     } label: {
-                        Text("继续追问")
-                            .font(.caption)
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.borderless)
-                    .foregroundStyle(Color.accentColor)
+                    .help(isTranslation ? "复制译文" : "复制摘要")
                 }
 
                 Button {
@@ -569,14 +630,82 @@ struct MailDetailView: View {
                     ai.showInlineSummary = false
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 20, height: 20)
+                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.borderless)
-                .help("收起摘要")
+                .buttonStyle(.plain)
+                .help(isTranslation ? "收起译文" : "收起摘要")
             }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                LinearGradient(
+                    colors: [Color.accentColor.opacity(0.045), Color.clear],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            )
 
-            if !ai.lastReadAttachmentNames.isEmpty {
+            Rectangle()
+                .fill(Color.primary.opacity(0.06))
+                .frame(height: 0.5)
+
+            // Card Body
+            Group {
+                if isTranslation && ai.inlineSummaryText.count > 360 {
+                    ScrollView {
+                        inlineCardBodyContent(isTranslation: isTranslation)
+                    }
+                    .frame(height: 240)
+                } else {
+                    inlineCardBodyContent(isTranslation: isTranslation)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color(nsColor: .textBackgroundColor))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [Color.primary.opacity(0.015), Color.clear],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                )
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(
+                    LinearGradient(
+                        colors: [Color.primary.opacity(0.11), Color.primary.opacity(0.07)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ),
+                    lineWidth: 0.75
+                )
+        )
+        .shadow(color: Color.black.opacity(0.055), radius: 10, x: 0, y: 3)
+        .shadow(color: Color.black.opacity(0.025), radius: 2, x: 0, y: 1)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+        .background(Color.primary.opacity(0.02))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.07))
+                .frame(height: 0.5)
+        }
+    }
+
+    private func inlineCardBodyContent(isTranslation: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !isTranslation && !ai.lastReadAttachmentNames.isEmpty {
                 HStack(spacing: 4) {
                     Image(systemName: "paperclip")
                         .font(.caption2)
@@ -589,23 +718,16 @@ struct MailDetailView: View {
             }
 
             if ai.inlineSummaryText.isEmpty && ai.isInlineSummarizing {
-                Text("正在生成邮件摘要...")
+                Text(isTranslation ? "正在翻译邮件…" : "正在生成邮件摘要…")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             } else {
                 MarkdownBlockView(text: ai.inlineSummaryText)
             }
         }
-        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.accentColor.opacity(0.22), lineWidth: 1)
-        )
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.background)
+        .padding(.horizontal, 15)
+        .padding(.vertical, 12)
     }
 
 }

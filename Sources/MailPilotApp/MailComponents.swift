@@ -18,22 +18,19 @@ struct MessageListRowContainer<RowContent: View, MenuContent: View>: View {
     @StateObject private var hoverState = RowHoverState()
 
     var body: some View {
-        let fillOpacity: Double = isSelected ? 0.075 : (hoverState.isHovered ? 0.032 : 0)
-        let borderOpacity: Double = isSelected ? 0.065 : 0
+        let bgColor: Color = isSelected
+            ? Color.accentColor.opacity(0.13)
+            : (hoverState.isHovered ? Color.primary.opacity(0.035) : Color.clear)
 
         VStack(spacing: 0) {
             content()
                 .padding(.horizontal, 10)
-                .padding(.vertical, 4)
+                .padding(.vertical, 6)
                 .background(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(Color.primary.opacity(fillOpacity))
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(bgColor)
                 )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(borderOpacity), lineWidth: 0.75)
-                )
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 7)
                 .contentShape(Rectangle())
                 .onTapGesture(perform: onTap)
                 .onHover { hovering in
@@ -47,10 +44,10 @@ struct MessageListRowContainer<RowContent: View, MenuContent: View>: View {
 
             if showBottomDivider {
                 Rectangle()
-                    .fill(Color.primary.opacity(hoverState.isHovered ? 0 : 0.08))
-                    .frame(height: 0.75)
-                    .padding(.leading, 60)
-                    .padding(.trailing, 18)
+                    .fill(Color.primary.opacity(hoverState.isHovered ? 0 : 0.065))
+                    .frame(height: 0.5)
+                    .padding(.leading, 28)
+                    .padding(.trailing, 14)
             }
         }
     }
@@ -58,6 +55,7 @@ struct MessageListRowContainer<RowContent: View, MenuContent: View>: View {
 
 struct MessageRowView: View, Equatable {
     let message: MailMessageSummary
+    let snippet: String?
     let tags: [MailSmartTag]
     let accountBadge: String?
     let accountEmail: String?
@@ -67,82 +65,111 @@ struct MessageRowView: View, Equatable {
     let accountColor: Color
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            SenderAvatarView(name: message.displaySender, email: message.senderAddress, size: 32)
-                .padding(.top, 2)
+        HStack(alignment: .top, spacing: 7) {
+            Circle()
+                .fill(message.isRead ? Color.clear : Color.accentColor)
+                .frame(width: 7, height: 7)
+                .padding(.top, 5.5)
 
             VStack(alignment: .leading, spacing: 3) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    if !message.isRead {
-                        Circle()
-                            .fill(Color.accentColor)
-                            .frame(width: 7, height: 7)
-                    }
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Text(message.displaySender)
-                        .font(.subheadline.weight(message.isRead ? .medium : .semibold))
-                        .foregroundStyle(message.isRead ? Color.primary.opacity(0.82) : Color.primary)
+                        .font(.system(size: 13.5, weight: message.isRead ? .semibold : .bold))
+                        .foregroundStyle(message.isRead ? Color.primary.opacity(0.9) : Color.primary)
                         .lineLimit(1)
+
                     Spacer(minLength: 4)
+
                     if message.isFlagged {
                         Image(systemName: "flag.fill")
-                            .font(.caption2)
+                            .font(.system(size: 9.5))
                             .foregroundStyle(.orange)
                     }
+
                     Text(Self.formatListTimestamp(message.dateReceived))
-                        .font(.caption2.monospacedDigit())
+                        .font(.system(size: 11).monospacedDigit())
                         .foregroundStyle(.secondary)
                         .help(Self.formatFullTimestamp(message.dateReceived))
                 }
 
                 Text(message.subject)
-                    .font(.callout.weight(message.isRead ? .regular : .medium))
-                    .foregroundStyle(message.isRead ? .secondary : .primary)
+                    .font(.system(size: 12.5, weight: message.isRead ? .regular : .medium))
+                    .foregroundStyle(message.isRead ? Color.secondary : Color.primary.opacity(0.88))
                     .lineLimit(1)
 
-                HStack(spacing: 5) {
-                    if let primaryTag = tags.first {
-                        SmartTagPill(tag: primaryTag)
-                        if tags.count > 1 {
-                            let extraTags = Array(tags.dropFirst())
-                            Text("+\(extraTags.count)")
-                                .font(.system(size: 10, weight: .medium).monospacedDigit())
+                if let snippet, !snippet.isEmpty {
+                    Text(snippet)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary.opacity(0.82))
+                        .lineLimit(1)
+                }
+
+                if accountBadge != nil || !tags.isEmpty || snippet == nil {
+                    HStack(spacing: 5) {
+                        if let accountBadge {
+                            AccountLogoView(
+                                accountID: message.accountID,
+                                email: accountEmail,
+                                customIconPath: accountCustomIconPath,
+                                presetLogoID: accountPresetLogoID,
+                                sfSymbolName: accountSFSymbolName,
+                                fallbackColor: accountColor,
+                                size: 13
+                            )
+                            Text(accountBadge)
+                                .font(.system(size: 10.5, weight: .medium))
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                        .strokeBorder(.separator.opacity(0.45), lineWidth: 0.7)
-                                )
-                                .fixedSize(horizontal: true, vertical: false)
-                                .help(extraTags.map(\.rawValue).joined(separator: "、"))
                         }
-                    } else {
-                        Text(message.mailboxName)
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1)
-                    }
 
-                    Spacer(minLength: 4)
+                        if let primaryTag = tags.first {
+                            if accountBadge != nil {
+                                Text("·")
+                                    .font(.caption2)
+                                    .foregroundStyle(.quaternary)
+                            }
+                            Text(Self.compactTagTitle(primaryTag))
+                                .font(.system(size: 10.5, weight: .medium))
+                                .foregroundStyle(Self.subtleTagColor(primaryTag))
+                                .lineLimit(1)
+                            if tags.count > 1 {
+                                Text("+\(tags.count - 1)")
+                                    .font(.system(size: 10).monospacedDigit())
+                                    .foregroundStyle(.tertiary)
+                                    .help(tags.dropFirst().map(\.rawValue).joined(separator: "、"))
+                            }
+                        } else if accountBadge == nil && snippet == nil {
+                            Text(message.mailboxName)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
 
-                    if let accountBadge {
-                        AccountBadgePill(
-                            accountID: message.accountID,
-                            label: accountBadge,
-                            email: accountEmail,
-                            customIconPath: accountCustomIconPath,
-                            presetLogoID: accountPresetLogoID,
-                            sfSymbolName: accountSFSymbolName,
-                            fallbackColor: accountColor
-                        )
+                        Spacer(minLength: 0)
                     }
+                    .padding(.top, 1.5)
                 }
-                .padding(.top, 2)
             }
         }
-        .padding(.vertical, 3)
+        .padding(.vertical, 2)
+    }
+
+    private static func compactTagTitle(_ tag: MailSmartTag) -> String {
+        switch tag {
+        case .orderLogistics: return "订单"
+        default: return tag.rawValue
+        }
+    }
+
+    private static func subtleTagColor(_ tag: MailSmartTag) -> Color {
+        switch tag {
+        case .verification: return Color(red: 0.44, green: 0.42, blue: 0.80)
+        case .billing: return Color(red: 0.72, green: 0.54, blue: 0.18)
+        case .orderLogistics: return Color(red: 0.76, green: 0.44, blue: 0.24)
+        case .meeting: return Color(red: 0.24, green: 0.50, blue: 0.82)
+        case .promotion: return Color(red: 0.64, green: 0.36, blue: 0.54)
+        case .notification: return .secondary
+        }
     }
 
     private static let time24Formatter: DateFormatter = {
@@ -368,12 +395,12 @@ struct SenderAvatarView: View {
 
     private var tint: Color {
         let palette: [Color] = [
-            Color(red: 0.28, green: 0.52, blue: 0.88),
-            Color(red: 0.48, green: 0.38, blue: 0.84),
-            Color(red: 0.16, green: 0.62, blue: 0.58),
-            Color(red: 0.82, green: 0.45, blue: 0.26),
-            Color(red: 0.74, green: 0.34, blue: 0.54),
-            Color(red: 0.32, green: 0.58, blue: 0.36)
+            Color(red: 0.24, green: 0.48, blue: 0.84),
+            Color(red: 0.42, green: 0.44, blue: 0.76),
+            Color(red: 0.20, green: 0.56, blue: 0.55),
+            Color(red: 0.72, green: 0.48, blue: 0.30),
+            Color(red: 0.62, green: 0.40, blue: 0.54),
+            Color(red: 0.34, green: 0.54, blue: 0.40)
         ]
         let hash = abs(name.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) })
         return palette[hash % palette.count]
@@ -382,7 +409,7 @@ struct SenderAvatarView: View {
     var body: some View {
         if let brandImage = avatarLoader.image(for: email) {
             ZStack {
-                RoundedRectangle(cornerRadius: size * 0.26, style: .continuous)
+                RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
                     .fill(Color.white)
                 Image(nsImage: brandImage)
                     .resizable()
@@ -392,16 +419,15 @@ struct SenderAvatarView: View {
             }
             .frame(width: size, height: size)
             .overlay(
-                RoundedRectangle(cornerRadius: size * 0.26, style: .continuous)
-                    .strokeBorder(.separator.opacity(0.45), lineWidth: 0.6)
+                RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
+                    .strokeBorder(.separator.opacity(0.35), lineWidth: 0.5)
             )
-            .shadow(color: .black.opacity(0.05), radius: 2, y: 1)
         } else {
             ZStack {
                 Circle()
-                    .fill(tint.opacity(0.16))
+                    .fill(tint.opacity(0.13))
                 Text(initial)
-                    .font(.system(size: size * 0.44, weight: .semibold, design: .rounded))
+                    .font(.system(size: size * 0.42, weight: .semibold, design: .rounded))
                     .foregroundStyle(tint)
             }
             .frame(width: size, height: size)
@@ -415,23 +441,34 @@ struct PermissionGuideView: View {
 
     var body: some View {
         VStack(spacing: 22) {
-            // Brand Mark + Headline
+            // Brand Mark + Headline (Sunset Coral Origami Crane)
             VStack(spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [Color.accentColor, Color.indigo],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
+                if let appIcon = NSApp.applicationIconImage {
+                    Image(nsImage: appIcon)
+                        .resizable()
+                        .interpolation(.high)
+                        .frame(width: 68, height: 68)
+                } else {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 15, style: .continuous)
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        Color(red: 1.0, green: 0.573, blue: 0.2),
+                                        Color(red: 0.957, green: 0.337, blue: 0.271),
+                                        Color(red: 0.82, green: 0.141, blue: 0.353)
+                                    ],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
                             )
-                        )
-                        .frame(width: 56, height: 56)
-                        .shadow(color: Color.accentColor.opacity(0.28), radius: 10, y: 5)
+                            .frame(width: 58, height: 58)
+                            .shadow(color: Color.black.opacity(0.16), radius: 10, y: 4)
 
-                    Image(systemName: "paperplane.fill")
-                        .font(.system(size: 25, weight: .medium))
-                        .foregroundStyle(.white)
+                        Image(systemName: "paperplane.fill")
+                            .font(.system(size: 25, weight: .medium))
+                            .foregroundStyle(.white)
+                    }
                 }
 
                 VStack(spacing: 6) {

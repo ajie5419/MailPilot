@@ -77,7 +77,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <key>CFBundleExecutable</key>
     <string>MailPilot</string>
     <key>CFBundleIconFile</key>
-    <string>AppIcon.icns</string>
+    <string>MailPilotCrane.icns</string>
     <key>CFBundleIdentifier</key>
     <string>com.mailpilot.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -100,10 +100,10 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Generate official AppIcon.icns using Apple's iconutil when available (with direct writer fallback)
-ICON_CACHE="$DIST_DIR/AppIcon.icns"
+# Generate official MailPilotCrane.icns using Apple's iconutil when available (with direct writer fallback)
+ICON_CACHE="$DIST_DIR/MailPilotCrane.icns"
 if [[ ! -f "$ICON_CACHE" || "$ROOT_DIR/scripts/generate_icon.swift" -nt "$ICON_CACHE" ]]; then
-  echo "Generating MailPilot AppIcon.icns..."
+  echo "Generating MailPilotCrane.icns..."
   ICON_GEN_BIN="${TMPDIR:-/tmp}/mailpilot-generate-icon"
   ICONSET_DIR="${TMPDIR:-/tmp}/MailPilot.iconset"
   rm -rf "$ICONSET_DIR"
@@ -119,7 +119,7 @@ if [[ ! -f "$ICON_CACHE" || "$ROOT_DIR/scripts/generate_icon.swift" -nt "$ICON_C
   fi
   rm -rf "$ICONSET_DIR" "$ICON_GEN_BIN"
 fi
-cp "$ICON_CACHE" "$RESOURCES_DIR/AppIcon.icns"
+cp "$ICON_CACHE" "$RESOURCES_DIR/MailPilotCrane.icns"
 
 # Prefer a stable local code-signing identity so macOS TCC permissions persist across rebuilds.
 SIGN_IDENTITY="${CODESIGN_IDENTITY:-}"

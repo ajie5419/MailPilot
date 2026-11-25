@@ -154,7 +154,12 @@ final class AppViewModel: ObservableObject {
     }
     @Published var groupedMailboxes: [AccountMailboxGroup] = []
     @Published var messages: [MailMessageSummary] = []
+    @Published var messageSnippets: [Int64: String] = [:]
     @Published var currentPageLimit: Int = 200
+
+    func snippet(for messageID: Int64) -> String? {
+        messageSnippets[messageID]
+    }
     @Published var hasMoreMessages: Bool = false
     @Published var selectedMessageIDs: Set<Int64> = [] {
         didSet {
@@ -864,6 +869,21 @@ final class AppViewModel: ObservableObject {
                 } else {
                     self.cachedMessageTags = precomputedTags
                 }
+                let rawSnippets = await indexCoordinator.fetchSnippets(
+                    for: filtered.map(\.id),
+                    maxChars: 180
+                )
+                guard !Task.isCancelled else { return }
+                var cleanedSnippets: [Int64: String] = [:]
+                cleanedSnippets.reserveCapacity(rawSnippets.count)
+                for (id, raw) in rawSnippets {
+                    if let cleaned = Self.cleanListSnippet(raw) {
+                        cleanedSnippets[id] = cleaned
+                    }
+                }
+                if self.messageSnippets != cleanedSnippets {
+                    self.messageSnippets = cleanedSnippets
+                }
                 let messagesChanged = self.messages != filtered
                 if messagesChanged {
                     self.messages = filtered
@@ -902,6 +922,25 @@ final class AppViewModel: ObservableObject {
                 self?.statusText = "查询失败：\(error.localizedDescription)"
             }
         }
+    }
+
+    private static func cleanListSnippet(_ raw: String) -> String? {
+        var text = raw
+        if let range = text.range(of: "\n[附件]") {
+            text = String(text[..<range.lowerBound])
+        } else if let range = text.range(of: "[附件]") {
+            text = String(text[..<range.lowerBound])
+        }
+        let collapsed = text
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !collapsed.isEmpty else { return nil }
+        if collapsed.count <= 120 {
+            return collapsed
+        }
+        return String(collapsed.prefix(120)) + "…"
     }
 
     func loadMoreMessages() {

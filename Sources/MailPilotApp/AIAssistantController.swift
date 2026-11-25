@@ -12,6 +12,33 @@ enum ChatGPTConnectionTestState: Equatable {
     case failure(String)
 }
 
+enum InlineAIResultMode: Equatable {
+    case summary
+    case translation
+}
+
+enum TranslationTargetLanguage: String, CaseIterable, Identifiable {
+    case auto = "自动"
+    case chinese = "简体中文"
+    case english = "English"
+    case japanese = "日本語"
+
+    var id: String { rawValue }
+
+    var promptInstruction: String {
+        switch self {
+        case .auto:
+            return "若邮件原文主要为外语，请翻译成自然流畅的简体中文；若原文主要为中文，请翻译成自然地道的英文。"
+        case .chinese:
+            return "请将邮件完整翻译成自然流畅的简体中文。"
+        case .english:
+            return "请将邮件完整翻译成自然地道的英文。"
+        case .japanese:
+            return "请将邮件完整翻译成自然礼貌的日文。"
+        }
+    }
+}
+
 /// Manages AI configuration, subscription/OAuth/CLI/API-key authentication, model catalog,
 /// inline email summaries, and the AI assistant conversation drawer.
 @MainActor
@@ -55,6 +82,8 @@ final class AIAssistantController: ObservableObject {
     @Published var inlineSummaryText: String = ""
     @Published var isInlineSummarizing = false
     @Published var showInlineSummary = false
+    @Published var inlineCardMode: InlineAIResultMode = .summary
+    @Published var translationTarget: TranslationTargetLanguage = .auto
 
     @Published var includeAttachmentsInAI: Bool {
         didSet {
@@ -76,6 +105,8 @@ final class AIAssistantController: ObservableObject {
     private let aiService = AIService()
     private var summaryCache: [Int64: String] = [:]
     private var summaryCacheOrder: [Int64] = []
+    private var translationCache: [String: String] = [:]
+    private var translationCacheOrder: [String] = []
     private var chatGPTLoginTask: Task<Void, Never>?
     private var modelLoadTask: Task<Void, Never>?
     private var aiQueryTask: Task<Void, Never>?
@@ -150,18 +181,9 @@ final class AIAssistantController: ObservableObject {
         lastReadAttachmentNames = []
         lastCrossMailHitCount = 0
 
-        guard let id else {
-            inlineSummaryText = ""
-            showInlineSummary = false
-            return
-        }
-        if let cached = summaryCache[id] {
-            inlineSummaryText = cached
-            showInlineSummary = true
-        } else {
-            inlineSummaryText = ""
-            showInlineSummary = false
-        }
+        inlineSummaryText = ""
+        showInlineSummary = false
+        inlineCardMode = .summary
     }
 
     // MARK: - Display Helpers & Model Catalog
@@ -460,11 +482,22 @@ final class AIAssistantController: ObservableObject {
         onOpenReplyDraft?(message, body)
     }
 
-    /// Streams a concise summary directly into the inline card above the email body (Scheme A).
-    func summarizeSelectedEmailInline() {
+    private static let conciseSummaryPrompt = """
+    请直接用 1 到 3 句自然流畅的简体中文概括这封邮件的核心内容（总字数控制在 100 字以内）：
+    - 直接陈述重点，保留关键人名、金额、日期或截止时间；如有附件正文一并简要概括。
+    - 如需收件人回复或处理，在结尾自然顺带一句即可。
+    - 不要输出「结论」「要点」「行动」等小标题或项目符号模板，也不要写「这封邮件主要讲了…」之类的套话。
+    """
+
+    /// Streams a concise summary directly into the inline card above the email body.
+    func summarizeSelectedEmailInline(forceRefresh: Bool = false) {
         let ctx = currentMessageContext?()
         guard let message = ctx?.message, let body = ctx?.body else { return }
-        if let cached = summaryCache[message.id], !cached.isEmpty {
+        inlineCardMode = .summary
+        if !forceRefresh, let cached = summaryCache[message.id], !cached.isEmpty {
+            inlineSummaryTask?.cancel()
+            inlineSummaryTask = nil
+            isInlineSummarizing = false
             inlineSummaryText = cached
             showInlineSummary = true
             return
@@ -476,15 +509,7 @@ final class AIAssistantController: ObservableObject {
         isInlineSummarizing = true
         inlineSummaryText = ""
 
-        let prompt = """
-        请用中文极简总结这封邮件（总字数控制在 120 字以内，直奔重点，不要客套；如有附件正文一并概括关键内容或金额/时间）：
-        ## 结论
-        （1 句话概括）
-        ## 要点
-        - （最多 3 条短句）
-        ## 行动
-        （如需操作写明动作，否则写「无需操作」）
-        """
+        let prompt = Self.conciseSummaryPrompt
         let configSnapshot = aiConfig
         let includeAttachments = includeAttachmentsInAI
 
@@ -527,6 +552,89 @@ final class AIAssistantController: ObservableObject {
         }
     }
 
+    /// Streams an inline translation of the selected email above the email body.
+    func translateSelectedEmailInline(target: TranslationTargetLanguage? = nil, forceRefresh: Bool = false) {
+        let ctx = currentMessageContext?()
+        guard let message = ctx?.message, let body = ctx?.body else { return }
+        if let target {
+            translationTarget = target
+        }
+        let effectiveTarget = translationTarget
+        let cacheKey = "\(message.id)-\(effectiveTarget.rawValue)"
+        inlineCardMode = .translation
+        lastReadAttachmentNames = []
+
+        if !forceRefresh, let cached = translationCache[cacheKey], !cached.isEmpty {
+            inlineSummaryTask?.cancel()
+            inlineSummaryTask = nil
+            isInlineSummarizing = false
+            inlineSummaryText = cached
+            showInlineSummary = true
+            return
+        }
+
+        inlineSummaryTask?.cancel()
+        let targetID = message.id
+        showInlineSummary = true
+        isInlineSummarizing = true
+        inlineSummaryText = ""
+
+        let prompt = """
+        \(effectiveTarget.promptInstruction)
+        要求：
+        - 准确自然地传达原意，保留原有段落结构、数字、时间、专有名词和链接；
+        - 先在首行给出「主题：…」译文，空一行再输出正文译文；
+        - 只输出译文本身，不要添加解释、说明或额外前后缀。
+        """
+        let configSnapshot = aiConfig
+        let context = buildSingleEmailContext(message: message, body: body, attachmentSection: "")
+
+        inlineSummaryTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let reply = try await self.aiService.chat(
+                    config: configSnapshot,
+                    systemPrompt: context,
+                    history: [],
+                    userMessage: prompt,
+                    onPartial: { [weak self] partialText in
+                        Task { @MainActor [weak self] in
+                            guard let self, self.currentSelectedMessageID?() == targetID else { return }
+                            self.inlineSummaryText = partialText
+                        }
+                    }
+                )
+                guard !Task.isCancelled else { return }
+                let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    self.storeTranslation(trimmed, for: cacheKey)
+                }
+                if self.currentSelectedMessageID?() == targetID {
+                    self.inlineSummaryText = reply
+                }
+            } catch {
+                if !Task.isCancelled, self.currentSelectedMessageID?() == targetID {
+                    self.inlineSummaryText = "翻译失败：\(error.localizedDescription)"
+                }
+            }
+            if self.currentSelectedMessageID?() == targetID {
+                self.isInlineSummarizing = false
+            }
+        }
+    }
+
+    private func storeTranslation(_ text: String, for key: String) {
+        translationCache[key] = text
+        if let idx = translationCacheOrder.firstIndex(of: key) {
+            translationCacheOrder.remove(at: idx)
+        }
+        translationCacheOrder.append(key)
+        while translationCacheOrder.count > 80 {
+            let oldest = translationCacheOrder.removeFirst()
+            translationCache.removeValue(forKey: oldest)
+        }
+    }
+
     func stopInlineSummary() {
         inlineSummaryTask?.cancel()
         inlineSummaryTask = nil
@@ -555,15 +663,7 @@ final class AIAssistantController: ObservableObject {
             aiMessages.append(AIChatMessage(role: .assistant, content: cached))
             return
         }
-        let prompt = """
-        请用中文极简总结这封邮件（总字数控制在 120 字以内，直奔重点，不要客套；如有附件正文一并概括关键内容或金额/时间）：
-        ## 结论
-        （1 句话概括）
-        ## 要点
-        - （最多 3 条短句）
-        ## 行动
-        （如需操作写明动作，否则写「无需操作」）
-        """
+        let prompt = Self.conciseSummaryPrompt
         let includeAttachments = includeAttachmentsInAI
         Task { [weak self] in
             guard let self else { return }
@@ -966,7 +1066,7 @@ final class AIAssistantController: ObservableObject {
             ?? FileManager.default.temporaryDirectory
         let dir = appSupport.appendingPathComponent("MailPilot", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("summary-cache.json")
+        return dir.appendingPathComponent("summary-cache-v2.json")
     }
 
     private func loadPersistedSummaryCache() {
