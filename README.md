@@ -56,7 +56,15 @@
 
 # 4. 生成可供分发的 release 压缩包与 SHA-256 校验文件
 ./scripts/release_app.sh
+
+# 5. 安全同步远端最新提交与标签（默认远端 origin、默认分支 main，仅在工作区干净时 fast-forward）
+./scripts/auto_sync.sh
 ```
+
+> 定时同步说明：`./scripts/auto_sync.sh` 支持通过 `MAILPILOT_REPO_DIR`（默认脚本所在仓库根目录）、`MAILPILOT_SYNC_REMOTE`（默认 `origin`）、`MAILPILOT_SYNC_BRANCH`（默认 `main`）和 `MAILPILOT_SYNC_LOG`（日志路径，**必须放在仓库外部**或被 `.gitignore` 忽略的路径，避免日志变成未跟踪文件阻塞后续同步）配置。配合 `cron` 示例（建议使用脚本绝对路径与仓库外日志）：
+> ```cron
+> */5 * * * * MAILPILOT_SYNC_LOG=/var/log/mailpilot-autosync.log /path/to/MailPilot/scripts/auto_sync.sh
+> ```
 
 ### 首次使用权限配置
 1. **完全磁盘访问权限（必需）**：打开「系统设置 → 隐私与安全性 → 完全磁盘访问权限」，勾选 `/Applications/MailPilot.app` 后重启应用。
