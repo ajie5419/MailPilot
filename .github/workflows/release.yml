@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+*'
+      - 'v[0-9]*'
   workflow_dispatch:
     inputs:
       tag:
@@ -25,12 +25,15 @@ jobs:
           fetch-depth: 0
 
       - name: Import Developer ID certificate (optional)
-        if: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12 != '' && secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD != '' }}
         env:
           CERT_P12: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12 }}
           CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
         run: |
+          if [[ -z "$CERT_P12" || -z "$CERT_PASSWORD" ]]; then
+            echo "Developer ID certificate secrets not configured; skipping certificate import."
+            exit 0
+          fi
           KEYCHAIN_PATH="$RUNNER_TEMP/mailpilot-signing.keychain-db"
           KC_PASS="${KEYCHAIN_PASSWORD:-mailpilot-ci-keychain}"
           security create-keychain -p "$KC_PASS" "$KEYCHAIN_PATH"
