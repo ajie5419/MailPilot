@@ -72,6 +72,7 @@ final class BodyIndexCoordinator: ObservableObject {
         parser: EmlxParser?,
         onToast: @escaping (String) -> Void
     ) {
+        guard !isClearingOrRebuilding else { return }
         isClearingOrRebuilding = true
         let previousTask = indexingTask
         indexingTask?.cancel()
@@ -124,6 +125,7 @@ final class BodyIndexCoordinator: ObservableObject {
     }
 
     func clear(onToast: @escaping (String) -> Void) {
+        guard !isClearingOrRebuilding else { return }
         isClearingOrRebuilding = true
         let previousTask = indexingTask
         indexingTask?.cancel()
@@ -209,13 +211,24 @@ final class BodyIndexCoordinator: ObservableObject {
                         batch.removeAll(keepingCapacity: true)
                         guard !Task.isCancelled, !liveBatch.isEmpty else { return }
                         try await ftsIndex.upsertBatchWithMetadata(liveBatch)
-                        let committedIDs = liveBatch.map(\.rowID)
+                        var committedIDs = liveBatch.map(\.rowID)
+                        let postUpsertDeleted = await MainActor.run { [weak self] () -> Set<Int64> in
+                            self?.deletedRowIDsInFlight ?? []
+                        }
+                        let racedDeleted = committedIDs.filter { postUpsertDeleted.contains($0) }
+                        if !racedDeleted.isEmpty {
+                            try? await ftsIndex.deleteRowIDs(racedDeleted)
+                            let racedSet = Set(racedDeleted)
+                            committedIDs.removeAll { racedSet.contains($0) }
+                        }
                         anyChanges = true
                         let total = await ftsIndex.totalIndexedCount()
                         await MainActor.run { [weak self] in
                             self?.indexedBodyCount = total
                             self?.errorMessage = nil
-                            self?.onIndexedRowIDsUpdated?(committedIDs)
+                            if !committedIDs.isEmpty {
+                                self?.onIndexedRowIDsUpdated?(committedIDs)
+                            }
                         }
                     }
 

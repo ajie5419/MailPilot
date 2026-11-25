@@ -620,6 +620,7 @@ final class AIAssistantController: ObservableObject {
             if (0x3040...0x309F).contains(v)
                 || (0x30A0...0x30FF).contains(v)
                 || (0x31F0...0x31FF).contains(v)
+                || (0xFF66...0xFF9F).contains(v)
                 || (0xAC00...0xD7AF).contains(v)
                 || (0x1100...0x11FF).contains(v) {
                 kanaOrHangulCount += 1
@@ -1006,12 +1007,13 @@ final class AIAssistantController: ObservableObject {
     func summarizeSelectedEmail() {
         let ctx = currentMessageContext?()
         guard let message = ctx?.message, let body = ctx?.body else { return }
+        let configSnapshot = aiConfig
         let includeAttachments = includeAttachmentsInAI
         let cacheKey = summaryCacheKey(
             message: message,
             body: body,
             includeAttachments: includeAttachments,
-            maskSensitiveData: aiConfig.maskSensitiveData
+            maskSensitiveData: configSnapshot.maskSensitiveData
         )
         if let cached = summaryCache[cacheKey] {
             lastReadAttachmentNames = cached.attachmentNames
@@ -1019,17 +1021,25 @@ final class AIAssistantController: ObservableObject {
             return
         }
         let prompt = Self.conciseSummaryPrompt
+        let targetID = message.id
         Task { [weak self] in
             guard let self else { return }
             let (attachmentSection, readNames) = includeAttachments
                 ? await self.extractAttachmentsContext(for: body)
                 : ("", [])
+            guard self.currentSelectedMessageID?() == targetID else { return }
             self.lastReadAttachmentNames = readNames
             self.runAIQuery(
                 userPrompt: prompt,
-                contextOverride: self.buildSingleEmailContext(message: message, body: body, attachmentSection: attachmentSection),
+                contextOverride: self.buildSingleEmailContext(
+                    message: message,
+                    body: body,
+                    attachmentSection: attachmentSection,
+                    maskBeforeClipping: configSnapshot.maskSensitiveData
+                ),
                 captureAsDraft: false,
                 showUserBubble: false,
+                configOverride: configSnapshot,
                 cacheSummaryKey: cacheKey,
                 cacheAttachmentNames: readNames
             )
@@ -1300,6 +1310,7 @@ final class AIAssistantController: ObservableObject {
         contextOverride: String,
         captureAsDraft: Bool,
         showUserBubble: Bool,
+        configOverride: AIConfig? = nil,
         cacheSummaryKey: String? = nil,
         cacheAttachmentNames: [String] = []
     ) {
@@ -1314,7 +1325,7 @@ final class AIAssistantController: ObservableObject {
         let placeholderID = UUID()
         aiMessages.append(AIChatMessage(id: placeholderID, role: .assistant, content: ""))
         isAIThinking = true
-        let configSnapshot = aiConfig
+        let configSnapshot = configOverride ?? aiConfig
 
         aiQueryTask = Task { [weak self] in
             guard let self else { return }
