@@ -790,6 +790,114 @@ public final class EnvelopeIndexReader: @unchecked Sendable {
         return items
     }
 
+    /// Reads To and CC recipients for a single message from Apple Mail's `recipients` + `addresses` tables.
+    public func fetchRecipients(for messageID: Int64) throws -> [MailRecipientInfo] {
+        let db = try openReadOnly()
+        defer { sqlite3_close(db) }
+
+        let recipientCols = inspectColumns(db: db, table: "recipients")
+        guard !recipientCols.isEmpty else { return [] }
+
+        let msgCol = recipientCols.contains("message") ? "message" : (recipientCols.contains("message_id") ? "message_id" : nil)
+        let addrCol = recipientCols.contains("address") ? "address" : (recipientCols.contains("address_id") ? "address_id" : nil)
+        guard let msgCol, let addrCol else { return [] }
+
+        let hasType = recipientCols.contains("type")
+        let hasPosition = recipientCols.contains("position")
+        let typeExpr = hasType ? "COALESCE(r.type, 0)" : "0"
+        let orderClause = hasPosition
+            ? "ORDER BY \(typeExpr) ASC, COALESCE(r.position, 0) ASC, r.ROWID ASC"
+            : "ORDER BY \(typeExpr) ASC, r.ROWID ASC"
+
+        let sql = """
+        SELECT COALESCE(a.address, ''), COALESCE(a.comment, ''), \(typeExpr)
+        FROM recipients r
+        JOIN addresses a ON r.\(addrCol) = a.ROWID
+        WHERE r.\(msgCol) = ?
+        \(orderClause);
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw MailAccessError.queryFailed(message: String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, messageID)
+
+        var seen: Set<String> = []
+        var results: [MailRecipientInfo] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let address = columnText(stmt, 0).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !address.isEmpty else { continue }
+            let name = columnText(stmt, 1).trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawType = sqlite3_column_int(stmt, 2)
+            // Apple Mail convention: 0 = To, 1 = CC, 2 = BCC
+            if rawType == 2 { continue }
+            let isCC = (rawType == 1)
+            let dedupKey = "\(isCC ? "cc" : "to"):\(address.lowercased())"
+            if seen.insert(dedupKey).inserted {
+                results.append(MailRecipientInfo(address: address, name: name, isCC: isCC))
+            }
+        }
+        return results
+    }
+
+    /// Searches local known contacts in Apple Mail's `addresses` table for fast, private compose autocomplete.
+    public func searchContacts(query: String, limit: Int = 8) throws -> [MailContactSuggestion] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty else { return [] }
+
+        let db = try openReadOnly()
+        defer { sqlite3_close(db) }
+
+        let addressCols = inspectColumns(db: db, table: "addresses")
+        guard addressCols.contains("address") else { return [] }
+        let commentExpr = addressCols.contains("comment") ? "COALESCE(a.comment, '')" : "''"
+
+        let sql = """
+        SELECT a.address,
+               MAX(\(commentExpr)) AS display_name,
+               COUNT(*) AS freq,
+               MAX(a.ROWID) AS latest_id
+        FROM addresses a
+        WHERE a.address LIKE '%@%'
+          AND (LOWER(a.address) LIKE ? OR LOWER(\(commentExpr)) LIKE ?)
+        GROUP BY LOWER(a.address)
+        ORDER BY
+            CASE
+                WHEN LOWER(a.address) LIKE ? THEN 0
+                WHEN LOWER(MAX(\(commentExpr))) LIKE ? THEN 1
+                ELSE 2
+            END ASC,
+            freq DESC,
+            latest_id DESC
+        LIMIT ?;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw MailAccessError.queryFailed(message: String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let containsPattern = "%\(trimmed)%"
+        let prefixPattern = "\(trimmed)%"
+        sqlite3_bind_text(stmt, 1, containsPattern, -1, transient)
+        sqlite3_bind_text(stmt, 2, containsPattern, -1, transient)
+        sqlite3_bind_text(stmt, 3, prefixPattern, -1, transient)
+        sqlite3_bind_text(stmt, 4, prefixPattern, -1, transient)
+        sqlite3_bind_int(stmt, 5, Int32(max(1, min(limit, 25))))
+
+        var results: [MailContactSuggestion] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let address = columnText(stmt, 0).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !address.isEmpty, address.contains("@") else { continue }
+            let name = columnText(stmt, 1).trimmingCharacters(in: .whitespacesAndNewlines)
+            let freq = Int(sqlite3_column_int(stmt, 2))
+            results.append(MailContactSuggestion(address: address, name: name, frequency: max(1, freq)))
+        }
+        return results
+    }
+
     // MARK: - SQLite Helpers
 
     private func openReadOnly() throws -> OpaquePointer {

@@ -245,6 +245,7 @@ public enum MailAppleScriptBridge {
         from senderEmail: String?,
         to recipients: [String],
         cc ccRecipients: [String],
+        bcc bccRecipients: [String] = [],
         subject: String,
         body: String,
         attachmentURLs: [URL]
@@ -253,6 +254,7 @@ public enum MailAppleScriptBridge {
             from: senderEmail,
             to: recipients,
             cc: ccRecipients,
+            bcc: bccRecipients,
             subject: subject,
             body: body,
             attachmentURLs: attachmentURLs,
@@ -265,6 +267,7 @@ public enum MailAppleScriptBridge {
         from senderEmail: String?,
         to recipients: [String],
         cc ccRecipients: [String],
+        bcc bccRecipients: [String] = [],
         subject: String,
         body: String,
         attachmentURLs: [URL]
@@ -273,6 +276,7 @@ public enum MailAppleScriptBridge {
             from: senderEmail,
             to: recipients,
             cc: ccRecipients,
+            bcc: bccRecipients,
             subject: subject,
             body: body,
             attachmentURLs: attachmentURLs,
@@ -376,6 +380,7 @@ public enum MailAppleScriptBridge {
         from senderEmail: String?,
         to recipients: [String],
         cc ccRecipients: [String],
+        bcc bccRecipients: [String],
         subject: String,
         body: String,
         attachmentURLs: [URL],
@@ -404,6 +409,7 @@ public enum MailAppleScriptBridge {
             from: senderEmail,
             to: recipients,
             cc: ccRecipients,
+            bcc: bccRecipients,
             subject: subject,
             body: body,
             attachmentURLs: attachmentURLs,
@@ -438,6 +444,7 @@ public enum MailAppleScriptBridge {
         from senderEmail: String?,
         to recipients: [String],
         cc ccRecipients: [String],
+        bcc bccRecipients: [String] = [],
         subject: String,
         body: String,
         attachmentURLs: [URL],
@@ -490,6 +497,12 @@ public enum MailAppleScriptBridge {
             let clean = addr.trimmingCharacters(in: .whitespacesAndNewlines)
             if !clean.isEmpty {
                 recipientLines.append("make new cc recipient at end of cc recipients with properties {address:\"\(escapeAppleScriptString(clean))\"}")
+            }
+        }
+        for addr in bccRecipients {
+            let clean = addr.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !clean.isEmpty {
+                recipientLines.append("make new bcc recipient at end of bcc recipients with properties {address:\"\(escapeAppleScriptString(clean))\"}")
             }
         }
 

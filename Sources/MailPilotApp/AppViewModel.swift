@@ -126,6 +126,7 @@ final class AppViewModel: ObservableObject {
 
     @Published var selectedBody: ParsedMailBody?
     @Published var selectedBodyMessageID: Int64?
+    @Published var selectedMessageRecipients: [MailRecipientInfo] = []
     @Published var selectedPlainAttributedText: AttributedString = AttributedString("")
     @Published var selectedBodyHasRemoteResources: Bool = false
     @Published var isLoadingBody = false
@@ -229,6 +230,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private var bodyLoadTask: Task<Void, Never>?
+    private var recipientsLoadTask: Task<Void, Never>?
     private var reloadTask: Task<Void, Never>?
     private var searchDebounceTask: Task<Void, Never>?
     private var autoMarkReadTask: Task<Void, Never>?
@@ -341,11 +343,50 @@ final class AppViewModel: ObservableObject {
         compose.formattedSenderHeader = { [weak self] rawEmail in
             self?.formattedSenderHeader(for: rawEmail)
         }
+        compose.signatureForSenderEmail = { [weak self] rawEmail in
+            self?.signature(forSenderEmail: rawEmail)
+        }
+        compose.allOwnEmails = { [weak self] in
+            guard let self else { return [] }
+            var emails = self.accountEmails
+            for acct in self.accounts where !acct.email.isEmpty {
+                emails.append(acct.email)
+            }
+            return emails
+        }
         compose.accountEmailsCount = { [weak self] in
             self?.accountEmails.count ?? 0
         }
         compose.onRefreshAccountEmailsIfEmpty = { [weak self] in
             self?.refreshAccountEmailsIfEmpty()
+        }
+        compose.onSearchContacts = { [weak self] query in
+            guard let reader = self?.reader else { return [] }
+            return await Task.detached(priority: .userInitiated) {
+                (try? reader.searchContacts(query: query, limit: 8)) ?? []
+            }.value
+        }
+        compose.onMaterializeAttachment = { attachment, messageID in
+            await Task.detached(priority: .userInitiated) {
+                if let local = attachment.localFileURL, FileManager.default.fileExists(atPath: local.path) {
+                    return local
+                }
+                guard let data = EmlxParser.decodeAttachmentData(attachment) else { return nil }
+                let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+                    ?? FileManager.default.temporaryDirectory
+                let folder = caches
+                    .appendingPathComponent("MailPilot/Attachments", isDirectory: true)
+                    .appendingPathComponent("\(messageID)", isDirectory: true)
+                try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                let safeName = attachment.filename.replacingOccurrences(of: "/", with: "_")
+                let targetURL = folder.appendingPathComponent(safeName)
+                do {
+                    try data.write(to: targetURL, options: .atomic)
+                    return targetURL
+                } catch {
+                    return nil
+                }
+            }.value
         }
         compose.onShowToast = { [weak self] msg in
             self?.showToast(msg)
@@ -364,10 +405,41 @@ final class AppViewModel: ObservableObject {
         compose.openReply(for: target, verifiedBody: verifiedBody, prefilledBody: prefilledBody)
     }
 
-    func openComposeForward(for message: MailMessageSummary? = nil) {
+    func openComposeReplyAll(for message: MailMessageSummary? = nil, prefilledBody: String? = nil) {
         guard let target = message ?? selectedMessage else { return }
         let verifiedBody = (target.id == selectedBodyMessageID && !isLoadingBody) ? selectedBody?.plainText : nil
-        compose.openForward(for: target, verifiedBody: verifiedBody)
+        if target.id == selectedMessageID && !selectedMessageRecipients.isEmpty {
+            compose.openReplyAll(
+                for: target,
+                recipients: selectedMessageRecipients,
+                verifiedBody: verifiedBody,
+                prefilledBody: prefilledBody
+            )
+            return
+        }
+        guard let reader else {
+            compose.openReplyAll(for: target, recipients: [], verifiedBody: verifiedBody, prefilledBody: prefilledBody)
+            return
+        }
+        Task { [weak self] in
+            let fetched = await Task.detached(priority: .userInitiated) {
+                (try? reader.fetchRecipients(for: target.id)) ?? []
+            }.value
+            self?.compose.openReplyAll(
+                for: target,
+                recipients: fetched,
+                verifiedBody: verifiedBody,
+                prefilledBody: prefilledBody
+            )
+        }
+    }
+
+    func openComposeForward(for message: MailMessageSummary? = nil) {
+        guard let target = message ?? selectedMessage else { return }
+        let isLoadedForTarget = (target.id == selectedBodyMessageID && !isLoadingBody)
+        let verifiedBody = isLoadedForTarget ? selectedBody?.plainText : nil
+        let originalAttachments = isLoadedForTarget ? (selectedBody?.attachments ?? []) : []
+        compose.openForward(for: target, verifiedBody: verifiedBody, originalAttachments: originalAttachments)
     }
 
     func generateUnreadBriefing() {
@@ -819,15 +891,27 @@ final class AppViewModel: ObservableObject {
         autoMarkReadTargetID = nil
         bodyLoadTask?.cancel()
         bodyLoadTask = nil
-        // Immediately clear previous email's body so Reply/Forward/Attachments/AI can never read stale content.
+        recipientsLoadTask?.cancel()
+        recipientsLoadTask = nil
+        // Immediately clear previous email's body & recipients so Reply/Forward/Attachments/AI can never read stale content.
         selectedBody = nil
         selectedBodyMessageID = nil
+        selectedMessageRecipients = []
         selectedPlainAttributedText = AttributedString("")
         selectedBodyHasRemoteResources = false
 
         guard let id = selectedMessageID, let parser = emlxParser else {
             isLoadingBody = false
             return
+        }
+        if let reader {
+            recipientsLoadTask = Task { [weak self] in
+                let fetched = await Task.detached(priority: .userInitiated) {
+                    (try? reader.fetchRecipients(for: id)) ?? []
+                }.value
+                guard !Task.isCancelled, let self, self.selectedMessageID == id else { return }
+                self.selectedMessageRecipients = fetched
+            }
         }
         if let cached = cachedBody(for: id) {
             selectedBody = cached.body

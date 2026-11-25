@@ -21,22 +21,84 @@ public struct MailAccountInfo: Identifiable, Hashable, Sendable {
 public struct AccountCustomization: Codable, Equatable, Sendable {
     public var senderDisplayName: String
     public var sidebarName: String
+    public var signature: String
     public var customIconPath: String?
     public var presetLogoID: String?
     public var sfSymbolName: String?
 
+    private enum CodingKeys: String, CodingKey {
+        case senderDisplayName, sidebarName, signature, customIconPath, presetLogoID, sfSymbolName
+    }
+
     public init(
         senderDisplayName: String = "",
         sidebarName: String = "",
+        signature: String = "",
         customIconPath: String? = nil,
         presetLogoID: String? = nil,
         sfSymbolName: String? = nil
     ) {
         self.senderDisplayName = senderDisplayName
         self.sidebarName = sidebarName
+        self.signature = signature
         self.customIconPath = customIconPath
         self.presetLogoID = presetLogoID
         self.sfSymbolName = sfSymbolName
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.senderDisplayName = try c.decodeIfPresent(String.self, forKey: .senderDisplayName) ?? ""
+        self.sidebarName = try c.decodeIfPresent(String.self, forKey: .sidebarName) ?? ""
+        self.signature = try c.decodeIfPresent(String.self, forKey: .signature) ?? ""
+        self.customIconPath = try c.decodeIfPresent(String.self, forKey: .customIconPath)
+        self.presetLogoID = try c.decodeIfPresent(String.self, forKey: .presetLogoID)
+        self.sfSymbolName = try c.decodeIfPresent(String.self, forKey: .sfSymbolName)
+    }
+}
+
+public struct MailRecipientInfo: Identifiable, Hashable, Sendable {
+    public let id: String
+    public let address: String
+    public let name: String
+    public let isCC: Bool
+
+    public init(address: String, name: String = "", isCC: Bool = false) {
+        self.address = address
+        self.name = name
+        self.isCC = isCC
+        self.id = "\(isCC ? "cc" : "to"):\(address.lowercased())"
+    }
+
+    public var displayName: String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? address : trimmed
+    }
+
+    public var formattedDisplay: String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed.caseInsensitiveCompare(address) == .orderedSame {
+            return address
+        }
+        return "\(trimmed) <\(address)>"
+    }
+}
+
+public struct MailContactSuggestion: Identifiable, Hashable, Sendable {
+    public var id: String { address.lowercased() }
+    public let address: String
+    public let name: String
+    public let frequency: Int
+
+    public init(address: String, name: String = "", frequency: Int = 1) {
+        self.address = address
+        self.name = name
+        self.frequency = frequency
+    }
+
+    public var displayName: String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? address : trimmed
     }
 }
 

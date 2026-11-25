@@ -449,6 +449,9 @@ struct ContentView: View {
             Button("回复") {
                 viewModel.openComposeReply(for: msg)
             }
+            Button("全部回复") {
+                viewModel.openComposeReplyAll(for: msg)
+            }
             Button("转发") {
                 viewModel.openComposeForward(for: msg)
             }

@@ -8,7 +8,14 @@ import UniformTypeIdentifiers
 enum ComposeMode: String {
     case new = "写新邮件"
     case reply = "回复邮件"
+    case replyAll = "全部回复"
     case forward = "转发邮件"
+}
+
+enum ComposeRecipientField: Hashable {
+    case to
+    case cc
+    case bcc
 }
 
 enum ComposeAttachmentStatus: Equatable {
@@ -106,8 +113,15 @@ struct ComposeDraftState {
     var fromEmail: String = ""
     var toText: String = ""
     var ccText: String = ""
+    var bccText: String = ""
+    var showBCCField: Bool = false
     var subject: String = ""
     var body: String = ""
+    var appliedSignature: String? = nil
+    var initialToText: String = ""
+    var initialCCText: String = ""
+    var initialSubject: String = ""
+    var initialBody: String = ""
     var attachments: [ComposeAttachmentItem] = []
     var isSending: Bool = false
     var sendPhaseLabel: String? = nil
@@ -116,6 +130,15 @@ struct ComposeDraftState {
     var polishBaseRevision: Int? = nil
     var missingOriginAccountWarning: String? = nil
     var feedbackBanner: ComposeFeedbackBanner? = nil
+    var showDiscardConfirmation: Bool = false
+
+    var hasUnsavedChanges: Bool {
+        if !attachments.isEmpty { return true }
+        if !bccText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        if toText != initialToText || ccText != initialCCText || subject != initialSubject { return true }
+        if body != initialBody { return true }
+        return false
+    }
 
     var isPreparingAttachments: Bool {
         attachments.contains { $0.status.isPreparing }
@@ -153,6 +176,7 @@ struct ComposeMailSheet: View {
     @ObservedObject var viewModel: AppViewModel
     @ObservedObject var compose: ComposeCoordinator
     @StateObject private var dropState = ComposeDropTargetState()
+    @FocusState private var focusedRecipientField: ComposeRecipientField?
 
     init(viewModel: AppViewModel) {
         self._viewModel = ObservedObject(wrappedValue: viewModel)
@@ -183,7 +207,7 @@ struct ComposeMailSheet: View {
                     }
                     Spacer()
                     Button("取消") {
-                        compose.close()
+                        compose.requestClose()
                     }
                     .keyboardShortcut(.cancelAction)
                     .buttonStyle(.bordered)
@@ -230,6 +254,12 @@ struct ComposeMailSheet: View {
 
                 Divider()
 
+                // Discard Confirmation Strip (prevents accidental loss of unsaved drafts)
+                if compose.draft.showDiscardConfirmation {
+                    discardConfirmationBar
+                    Divider()
+                }
+
                 // Inline Feedback Banner (always visible inside the modal sheet)
                 if let banner = compose.draft.feedbackBanner {
                     feedbackBannerView(banner)
@@ -256,7 +286,13 @@ struct ComposeMailSheet: View {
                 VStack(spacing: 0) {
                     if !viewModel.accountEmails.isEmpty {
                         composeRow(label: "发件人") {
-                            Picker("", selection: $compose.draft.fromEmail) {
+                            Picker(
+                                "",
+                                selection: Binding(
+                                    get: { compose.draft.fromEmail },
+                                    set: { compose.updateSenderEmail($0) }
+                                )
+                            ) {
                                 Text(compose.draft.missingOriginAccountWarning == nil ? "默认账号" : "请选择发件账号...").tag("")
                                 ForEach(viewModel.accountEmails, id: \.self) { email in
                                     Text(email).tag(email)
@@ -271,17 +307,77 @@ struct ComposeMailSheet: View {
                     }
 
                     composeRow(label: "收件人") {
-                        TextField("多个邮箱请用逗号分隔", text: $compose.draft.toText)
+                        TextField("输入姓名或邮箱，多个请用逗号分隔", text: $compose.draft.toText)
                             .textFieldStyle(.plain)
+                            .focused($focusedRecipientField, equals: .to)
                             .disabled(compose.draft.isSending)
+                            .onChange(of: compose.draft.toText) { _, newValue in
+                                if focusedRecipientField == .to {
+                                    compose.updateRecipientSuggestions(for: .to, text: newValue)
+                                }
+                            }
+                            .onSubmit {
+                                compose.acceptFirstContactSuggestion(for: .to)
+                            }
+                    }
+                    if compose.activeRecipientField == .to && !compose.contactSuggestions.isEmpty {
+                        contactSuggestionsStrip(for: .to)
                     }
                     Divider().padding(.leading, 72)
 
                     composeRow(label: "抄送") {
                         TextField("可选，多个邮箱请用逗号分隔", text: $compose.draft.ccText)
                             .textFieldStyle(.plain)
+                            .focused($focusedRecipientField, equals: .cc)
                             .disabled(compose.draft.isSending)
+                            .onChange(of: compose.draft.ccText) { _, newValue in
+                                if focusedRecipientField == .cc {
+                                    compose.updateRecipientSuggestions(for: .cc, text: newValue)
+                                }
+                            }
+                            .onSubmit {
+                                compose.acceptFirstContactSuggestion(for: .cc)
+                            }
+
+                        if !compose.draft.showBCCField && compose.draft.bccText.isEmpty {
+                            Button {
+                                compose.draft.showBCCField = true
+                                focusedRecipientField = .bcc
+                            } label: {
+                                Text("+ 密送")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(compose.draft.isSending)
+                            .help("添加密送（BCC）收件人")
+                        }
                     }
+                    if compose.activeRecipientField == .cc && !compose.contactSuggestions.isEmpty {
+                        contactSuggestionsStrip(for: .cc)
+                    }
+
+                    if compose.draft.showBCCField || !compose.draft.bccText.isEmpty {
+                        Divider().padding(.leading, 72)
+                        composeRow(label: "密送") {
+                            TextField("可选，收件人彼此不可见", text: $compose.draft.bccText)
+                                .textFieldStyle(.plain)
+                                .focused($focusedRecipientField, equals: .bcc)
+                                .disabled(compose.draft.isSending)
+                                .onChange(of: compose.draft.bccText) { _, newValue in
+                                    if focusedRecipientField == .bcc {
+                                        compose.updateRecipientSuggestions(for: .bcc, text: newValue)
+                                    }
+                                }
+                                .onSubmit {
+                                    compose.acceptFirstContactSuggestion(for: .bcc)
+                                }
+                        }
+                        if compose.activeRecipientField == .bcc && !compose.contactSuggestions.isEmpty {
+                            contactSuggestionsStrip(for: .bcc)
+                        }
+                    }
+
                     Divider().padding(.leading, 72)
 
                     composeRow(label: "主题") {
@@ -292,6 +388,19 @@ struct ComposeMailSheet: View {
                     }
                 }
                 .background(.background)
+                .onChange(of: focusedRecipientField) { _, newField in
+                    if let newField {
+                        let text: String
+                        switch newField {
+                        case .to: text = compose.draft.toText
+                        case .cc: text = compose.draft.ccText
+                        case .bcc: text = compose.draft.bccText
+                        }
+                        compose.updateRecipientSuggestions(for: newField, text: text)
+                    } else {
+                        compose.clearContactSuggestions()
+                    }
+                }
 
                 Divider()
 
@@ -398,7 +507,7 @@ struct ComposeMailSheet: View {
 
                     Spacer()
 
-                    Text("支持拖拽文件添加 · ⌘↩ 发送")
+                    Text("支持联系人联想与拖拽附件 · ⌘↩ 发送")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -431,11 +540,85 @@ struct ComposeMailSheet: View {
                     .allowsHitTesting(false)
             }
         }
-        .frame(width: 680, height: 590)
+        .frame(width: 700, height: 610)
         .onDrop(of: [UTType.fileURL], isTargeted: $dropState.isTargeted) { providers in
             guard !compose.draft.isSending else { return false }
             return compose.handleDroppedProviders(providers)
         }
+    }
+
+    private var discardConfirmationBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text("当前草稿尚未发送，是否保存到草稿箱？")
+                .font(.caption.weight(.medium))
+            Spacer()
+            Button("继续编辑") {
+                compose.draft.showDiscardConfirmation = false
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Button("放弃草稿", role: .destructive) {
+                compose.forceClose()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Button("存为草稿") {
+                compose.draft.showDiscardConfirmation = false
+                compose.saveDraft()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .disabled(compose.draft.isPreparingAttachments)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 9)
+        .background(Color.orange.opacity(0.11))
+    }
+
+    private func contactSuggestionsStrip(for field: ComposeRecipientField) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                Image(systemName: "person.crop.circle.badge.checkmark")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(compose.contactSuggestions) { contact in
+                    Button {
+                        compose.selectContactSuggestion(contact, for: field)
+                    } label: {
+                        HStack(spacing: 4) {
+                            if !contact.name.isEmpty && contact.name.caseInsensitiveCompare(contact.address) != .orderedSame {
+                                Text(contact.name)
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(.primary)
+                                Text(contact.address)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Text(contact.address)
+                                    .font(.caption)
+                                    .foregroundStyle(.primary)
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color(nsColor: .controlBackgroundColor), in: Capsule())
+                        .overlay(
+                            Capsule()
+                                .strokeBorder(Color.accentColor.opacity(0.28), lineWidth: 0.7)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.leading, 78)
+            .padding(.trailing, 16)
+            .padding(.vertical, 6)
+        }
+        .background(Color.accentColor.opacity(0.05))
     }
 
     private func feedbackBannerView(_ banner: ComposeFeedbackBanner) -> some View {

@@ -6,64 +6,119 @@ import MailPilotCore
 #endif
 import UniformTypeIdentifiers
 
-/// Manages the in-app compose, reply, and forward sheet state, attachments (with live preparation
-/// progress and explicit success/failure feedback), AI polish streaming, and delegating final
-/// send / save-draft execution to Mail.app via AppleScript.
+/// Manages the in-app compose, reply, reply-all, and forward sheet state, local contact
+/// autocomplete, account signatures, attachments (with live preparation progress and explicit
+/// success/failure feedback), AI polish streaming, and delegating final send / save-draft
+/// execution to Mail.app via AppleScript.
 @MainActor
 final class ComposeCoordinator: ObservableObject {
     @Published var isPresented = false
     @Published var draft = ComposeDraftState()
+    @Published var activeRecipientField: ComposeRecipientField? = nil
+    @Published var contactSuggestions: [MailContactSuggestion] = []
 
     var currentAIConfig: (() -> AIConfig)?
     var preferredSenderEmail: (() -> String)?
     var senderEmailForOriginAccount: ((String) -> String?)?
     var formattedSenderHeader: ((String) -> String?)?
+    var signatureForSenderEmail: ((String) -> String?)?
+    var allOwnEmails: (() -> [String])?
     var accountEmailsCount: (() -> Int)?
     var onRefreshAccountEmailsIfEmpty: (() -> Void)?
+    var onSearchContacts: ((String) async -> [MailContactSuggestion])?
+    var onMaterializeAttachment: ((MailAttachment, Int64) async -> URL?)?
     var onShowToast: ((String) -> Void)?
 
     private let aiService = AIService()
     private var polishTask: Task<Void, Never>?
     private var attachmentTasks: [UUID: Task<Void, Never>] = [:]
+    private var forwardImportTask: Task<Void, Never>?
+    private var contactSearchTask: Task<Void, Never>?
     private var bannerDismissTask: Task<Void, Never>?
 
-    func close() {
-        polishTask?.cancel()
-        polishTask = nil
-        cancelAllAttachmentTasks()
-        bannerDismissTask?.cancel()
-        bannerDismissTask = nil
+    func requestClose() {
+        guard !draft.isSending else { return }
+        if draft.hasUnsavedChanges {
+            draft.showDiscardConfirmation = true
+        } else {
+            forceClose()
+        }
+    }
+
+    func forceClose() {
+        resetTasksForNewDraft()
         draft.isAIPolishing = false
+        draft.showDiscardConfirmation = false
         isPresented = false
+    }
+
+    func close() {
+        requestClose()
     }
 
     func openNew() {
         resetTasksForNewDraft()
+        let sender = preferredSenderEmail?() ?? ""
+        let sigBlock = formattedSignatureBlock(for: sender)
+        let initialBody = sigBlock ?? ""
         draft = ComposeDraftState(
             id: UUID(),
             revision: 0,
             mode: .new,
-            fromEmail: preferredSenderEmail?() ?? "",
+            fromEmail: sender,
             toText: "",
             ccText: "",
+            bccText: "",
+            showBCCField: false,
             subject: "",
-            body: ""
+            body: initialBody,
+            appliedSignature: sigBlock,
+            initialToText: "",
+            initialCCText: "",
+            initialSubject: "",
+            initialBody: initialBody
         )
         isPresented = true
         onRefreshAccountEmailsIfEmpty?()
     }
 
     func openReply(for target: MailMessageSummary, verifiedBody: String?, prefilledBody: String? = nil) {
+        openReplyInternal(
+            for: target,
+            verifiedBody: verifiedBody,
+            prefilledBody: prefilledBody,
+            recipients: [],
+            replyAll: false
+        )
+    }
+
+    func openReplyAll(
+        for target: MailMessageSummary,
+        recipients: [MailRecipientInfo],
+        verifiedBody: String?,
+        prefilledBody: String? = nil
+    ) {
+        openReplyInternal(
+            for: target,
+            verifiedBody: verifiedBody,
+            prefilledBody: prefilledBody,
+            recipients: recipients,
+            replyAll: true
+        )
+    }
+
+    private func openReplyInternal(
+        for target: MailMessageSummary,
+        verifiedBody: String?,
+        prefilledBody: String?,
+        recipients: [MailRecipientInfo],
+        replyAll: Bool
+    ) {
         resetTasksForNewDraft()
         let replySubject = target.subject.lowercased().hasPrefix("re:") ? target.subject : "Re: \(target.subject)"
         let quoteHeader = "\n\n---\n在 \(target.dateReceived.formatted(date: .abbreviated, time: .shortened))，\(target.displaySender) <\(target.senderAddress)> 写道：\n"
         let quoteBody = verifiedBody.map { String($0.prefix(1200)) } ?? ""
-        let initialBody: String
-        if let prefilledBody {
-            initialBody = prefilledBody + (quoteBody.isEmpty ? "" : quoteHeader + quoteBody)
-        } else {
-            initialBody = quoteBody.isEmpty ? "" : "\n\n" + quoteHeader + quoteBody
-        }
+
         let originEmail = senderEmailForOriginAccount?(target.accountID)
         let warning: String?
         let resolvedFrom: String
@@ -72,27 +127,91 @@ final class ComposeCoordinator: ObservableObject {
             warning = nil
         } else if (accountEmailsCount?() ?? 0) > 1 {
             resolvedFrom = ""
-            warning = "未能自动匹配原邮件所属发件账号，请手动确认发件人后再发送。"
+            warning = "未能自动匹配原邮件所属发件账号，请手动确认发件人后再回复。"
         } else {
             resolvedFrom = preferredSenderEmail?() ?? ""
             warning = nil
         }
+
+        let sigBlock = formattedSignatureBlock(for: resolvedFrom)
+        let quoteSuffix = quoteBody.isEmpty ? "" : quoteHeader + quoteBody
+        let initialBody: String
+        if let prefilledBody {
+            initialBody = prefilledBody + (sigBlock ?? "") + quoteSuffix
+        } else if let sigBlock {
+            initialBody = sigBlock + quoteSuffix
+        } else {
+            initialBody = quoteBody.isEmpty ? "" : "\n\n" + quoteHeader + quoteBody
+        }
+
+        let toText: String
+        let ccText: String
+        if replyAll {
+            var ownSet = Set((allOwnEmails?() ?? []).map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+            if !resolvedFrom.isEmpty {
+                ownSet.insert(resolvedFrom.lowercased())
+            }
+            var toAddresses: [String] = []
+            var seenLower: Set<String> = []
+            let senderClean = target.senderAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !senderClean.isEmpty && !ownSet.contains(senderClean.lowercased()) {
+                toAddresses.append(senderClean)
+                seenLower.insert(senderClean.lowercased())
+            }
+            for r in recipients where !r.isCC {
+                let addr = r.address.trimmingCharacters(in: .whitespacesAndNewlines)
+                let lower = addr.lowercased()
+                if !addr.isEmpty && !ownSet.contains(lower) && seenLower.insert(lower).inserted {
+                    toAddresses.append(addr)
+                }
+            }
+            if toAddresses.isEmpty && !senderClean.isEmpty {
+                toAddresses.append(senderClean)
+                seenLower.insert(senderClean.lowercased())
+            }
+
+            var ccAddresses: [String] = []
+            for r in recipients where r.isCC {
+                let addr = r.address.trimmingCharacters(in: .whitespacesAndNewlines)
+                let lower = addr.lowercased()
+                if !addr.isEmpty && !ownSet.contains(lower) && seenLower.insert(lower).inserted {
+                    ccAddresses.append(addr)
+                }
+            }
+            toText = toAddresses.joined(separator: ", ")
+            ccText = ccAddresses.joined(separator: ", ")
+        } else {
+            toText = target.senderAddress
+            ccText = ""
+        }
+
         draft = ComposeDraftState(
             id: UUID(),
             revision: 0,
-            mode: .reply,
+            mode: replyAll ? .replyAll : .reply,
             fromEmail: resolvedFrom,
-            toText: target.senderAddress,
-            ccText: "",
+            toText: toText,
+            ccText: ccText,
+            bccText: "",
+            showBCCField: false,
             subject: replySubject,
             body: initialBody,
+            appliedSignature: sigBlock,
+            initialToText: toText,
+            initialCCText: ccText,
+            initialSubject: replySubject,
+            initialBody: initialBody,
             missingOriginAccountWarning: warning
         )
         isPresented = true
         onRefreshAccountEmailsIfEmpty?()
     }
 
-    func openForward(for target: MailMessageSummary, verifiedBody: String?) {
+    func openForward(
+        for target: MailMessageSummary,
+        verifiedBody: String?,
+        originalAttachments: [MailAttachment] = []
+    ) {
         resetTasksForNewDraft()
         let fwdSubject = target.subject.lowercased().hasPrefix("fwd:") ? target.subject : "Fwd: \(target.subject)"
         let header = """
@@ -118,19 +237,158 @@ final class ComposeCoordinator: ObservableObject {
             resolvedFrom = preferredSenderEmail?() ?? ""
             warning = nil
         }
+
+        let sigBlock = formattedSignatureBlock(for: resolvedFrom)
+        let initialBody = (sigBlock ?? "") + header + bodyText
+        let draftID = UUID()
         draft = ComposeDraftState(
-            id: UUID(),
+            id: draftID,
             revision: 0,
             mode: .forward,
             fromEmail: resolvedFrom,
             toText: "",
             ccText: "",
+            bccText: "",
+            showBCCField: false,
             subject: fwdSubject,
-            body: header + bodyText,
+            body: initialBody,
+            appliedSignature: sigBlock,
+            initialToText: "",
+            initialCCText: "",
+            initialSubject: fwdSubject,
+            initialBody: initialBody,
             missingOriginAccountWarning: warning
         )
         isPresented = true
         onRefreshAccountEmailsIfEmpty?()
+
+        // Automatically import original email attachments into the forward draft.
+        if !originalAttachments.isEmpty, let materialize = onMaterializeAttachment {
+            showBanner(
+                ComposeFeedbackBanner(
+                    kind: .progress(nil),
+                    message: "正在带入原邮件的 \(originalAttachments.count) 个附件…"
+                )
+            )
+            forwardImportTask = Task { [weak self] in
+                var urls: [URL] = []
+                var failedNames: [String] = []
+                for att in originalAttachments {
+                    if Task.isCancelled { return }
+                    if let url = await materialize(att, target.id) {
+                        urls.append(url)
+                    } else {
+                        failedNames.append(att.filename)
+                    }
+                }
+                guard !Task.isCancelled, let self, self.draft.id == draftID else { return }
+                if !urls.isEmpty {
+                    self.addAttachments(urls)
+                } else if !failedNames.isEmpty {
+                    self.showBanner(
+                        ComposeFeedbackBanner(
+                            kind: .warning,
+                            message: "原邮件附件未能自动导入（\(failedNames.count) 个）",
+                            detail: "原附件可能尚未缓存到本地：\(failedNames.prefix(2).joined(separator: "、"))"
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    // MARK: - Sender & Signature Switching
+
+    func updateSenderEmail(_ newEmail: String) {
+        guard draft.fromEmail != newEmail else { return }
+        draft.fromEmail = newEmail
+
+        let nextSig = formattedSignatureBlock(for: newEmail)
+        if let oldSig = draft.appliedSignature, !oldSig.isEmpty,
+           let range = draft.body.range(of: oldSig) {
+            draft.body.replaceSubrange(range, with: nextSig ?? "")
+            draft.appliedSignature = nextSig
+            if draft.revision == 0 {
+                draft.initialBody = draft.body
+            }
+        } else if draft.appliedSignature == nil, let nextSig, draft.revision == 0 {
+            if draft.mode == .new && draft.body.isEmpty {
+                draft.body = nextSig
+            } else {
+                draft.body = nextSig + draft.body
+            }
+            draft.appliedSignature = nextSig
+            draft.initialBody = draft.body
+        }
+    }
+
+    private func formattedSignatureBlock(for senderEmail: String) -> String? {
+        guard let raw = signatureForSenderEmail?(senderEmail) else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return "\n\n--\n\(trimmed)"
+    }
+
+    // MARK: - Local Contact Autocomplete
+
+    func updateRecipientSuggestions(for field: ComposeRecipientField, text: String) {
+        activeRecipientField = field
+        contactSearchTask?.cancel()
+
+        let token = Self.trailingRecipientToken(in: text)
+        guard !token.isEmpty, let search = onSearchContacts else {
+            contactSuggestions = []
+            return
+        }
+
+        let existing = Set(parseEmailList(text).map { $0.lowercased() })
+        let draftID = draft.id
+        contactSearchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(120))
+            guard !Task.isCancelled else { return }
+            let results = await search(token)
+            guard !Task.isCancelled, let self, self.draft.id == draftID, self.activeRecipientField == field else { return }
+            self.contactSuggestions = results.filter { !existing.contains($0.address.lowercased()) }
+        }
+    }
+
+    func selectContactSuggestion(_ contact: MailContactSuggestion, for field: ComposeRecipientField) {
+        switch field {
+        case .to:
+            draft.toText = Self.replacingTrailingToken(in: draft.toText, with: contact.address)
+        case .cc:
+            draft.ccText = Self.replacingTrailingToken(in: draft.ccText, with: contact.address)
+        case .bcc:
+            draft.bccText = Self.replacingTrailingToken(in: draft.bccText, with: contact.address)
+        }
+        contactSuggestions = []
+    }
+
+    func acceptFirstContactSuggestion(for field: ComposeRecipientField) {
+        guard activeRecipientField == field, let first = contactSuggestions.first else { return }
+        selectContactSuggestion(first, for: field)
+    }
+
+    func clearContactSuggestions() {
+        contactSearchTask?.cancel()
+        contactSearchTask = nil
+        activeRecipientField = nil
+        contactSuggestions = []
+    }
+
+    private static func trailingRecipientToken(in text: String) -> String {
+        let separators = CharacterSet(charactersIn: ",，;；")
+        let parts = text.components(separatedBy: separators)
+        return parts.last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private static func replacingTrailingToken(in text: String, with address: String) -> String {
+        let separators: [Character] = [",", "，", ";", "；"]
+        if let lastSepIdx = text.lastIndex(where: { separators.contains($0) }) {
+            let prefix = text[...lastSepIdx].trimmingCharacters(in: .whitespaces)
+            return "\(prefix) \(address), "
+        }
+        return "\(address), "
     }
 
     // MARK: - Inline Feedback Banner
@@ -341,8 +599,6 @@ final class ComposeCoordinator: ObservableObject {
             draft.attachments[idx].status = .failed(reason: reason)
         }
 
-        // If any items in this batch are still preparing, keep updating overall progress;
-        // once all surviving batch items settle, display the clear final success/failure summary.
         let batchItems = draft.attachments.filter { batchIDs.contains($0.id) }
         if batchItems.contains(where: { $0.status.isPreparing }) {
             updateBatchPreparationBanner(batchIDs: batchIDs)
@@ -457,7 +713,6 @@ final class ComposeCoordinator: ObservableObject {
                 return .failure("不支持直接添加文件夹，请压缩为 ZIP 后添加")
             }
 
-            // Trigger iCloud Drive download if the file is cloud-only (ubiquitous item not yet local).
             if let values = try? url.resourceValues(forKeys: [
                 .isUbiquitousItemKey,
                 .ubiquitousItemDownloadingStatusKey,
@@ -510,7 +765,6 @@ final class ComposeCoordinator: ObservableObject {
                 return .failure("无法读取文件信息：\(error.localizedDescription)")
             }
 
-            // Stream-verify file readability in 512 KiB chunks (low constant RAM, real I/O progress).
             do {
                 let handle = try FileHandle(forReadingFrom: url)
                 defer { try? handle.close() }
@@ -564,6 +818,8 @@ final class ComposeCoordinator: ObservableObject {
 
     func sendMail() {
         guard !draft.isSending else { return }
+        draft.showDiscardConfirmation = false
+        clearContactSuggestions()
         if draft.isPreparingAttachments {
             showBanner(
                 ComposeFeedbackBanner(kind: .info, message: "附件仍在准备中，请等待完成后发送"),
@@ -603,6 +859,8 @@ final class ComposeCoordinator: ObservableObject {
 
     func saveDraft() {
         guard !draft.isSending else { return }
+        draft.showDiscardConfirmation = false
+        clearContactSuggestions()
         if draft.isPreparingAttachments {
             showBanner(
                 ComposeFeedbackBanner(kind: .info, message: "附件仍在准备中，请等待完成后再保存草稿"),
@@ -626,11 +884,11 @@ final class ComposeCoordinator: ObservableObject {
 
     private func dispatchToMailApp(toList: [String], shouldSend: Bool) {
         let ccList = parseEmailList(draft.ccText)
+        let bccList = parseEmailList(draft.bccText)
         polishTask?.cancel()
         polishTask = nil
         draft.isAIPolishing = false
 
-        // Re-verify attachments still exist on disk before handing off to Mail.app.
         var missingIndex: Int?
         for idx in draft.attachments.indices {
             let url = draft.attachments[idx].url
@@ -693,6 +951,7 @@ final class ComposeCoordinator: ObservableObject {
                         from: senderHeader,
                         to: toList,
                         cc: ccList,
+                        bcc: bccList,
                         subject: currentDraft.subject.isEmpty ? "(无主题)" : currentDraft.subject,
                         body: currentDraft.body,
                         attachmentURLs: attachmentURLs
@@ -702,6 +961,7 @@ final class ComposeCoordinator: ObservableObject {
                         from: senderHeader,
                         to: toList,
                         cc: ccList,
+                        bcc: bccList,
                         subject: currentDraft.subject.isEmpty ? "(无主题)" : currentDraft.subject,
                         body: currentDraft.body,
                         attachmentURLs: attachmentURLs
@@ -845,9 +1105,15 @@ final class ComposeCoordinator: ObservableObject {
     private func resetTasksForNewDraft() {
         polishTask?.cancel()
         polishTask = nil
+        forwardImportTask?.cancel()
+        forwardImportTask = nil
+        contactSearchTask?.cancel()
+        contactSearchTask = nil
         cancelAllAttachmentTasks()
         bannerDismissTask?.cancel()
         bannerDismissTask = nil
+        activeRecipientField = nil
+        contactSuggestions = []
     }
 
     private func cancelAllAttachmentTasks() {

@@ -830,6 +830,34 @@ struct SettingsView: View {
                                 .labelsHidden()
                                 .toggleStyle(.switch)
                             }
+
+                            Divider()
+
+                            // 5. Account Signature
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("默认发件签名")
+                                        .font(.callout.weight(.medium))
+                                    Spacer()
+                                    Text("写信、回复、转发时自动附在正文末尾")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                TextEditor(
+                                    text: Binding(
+                                        get: { viewModel.customization(for: activeGroup.id).signature },
+                                        set: { val in viewModel.updateCustomization(for: activeGroup.id) { $0.signature = val } }
+                                    )
+                                )
+                                .font(.callout)
+                                .frame(height: 70)
+                                .padding(4)
+                                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .strokeBorder(.separator, lineWidth: 0.7)
+                                )
+                            }
                         }
                     }
                 }

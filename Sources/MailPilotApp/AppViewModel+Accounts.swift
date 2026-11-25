@@ -219,6 +219,16 @@ extension AppViewModel {
         return email
     }
 
+    func signature(forSenderEmail rawEmail: String) -> String? {
+        let email = rawEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !email.isEmpty else { return nil }
+        if let matchedGroup = groupedMailboxes.first(where: { $0.email?.caseInsensitiveCompare(email) == .orderedSame }) {
+            let sig = customization(for: matchedGroup.id).signature.trimmingCharacters(in: .whitespacesAndNewlines)
+            return sig.isEmpty ? nil : sig
+        }
+        return nil
+    }
+
     func refreshAccountEmailsIfEmpty() {
         guard accountEmails.isEmpty else { return }
         Task {

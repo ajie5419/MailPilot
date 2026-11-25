@@ -141,6 +141,12 @@ struct MailPilotApp: App {
                 .keyboardShortcut("r", modifiers: [.command])
                 .disabled(viewModel.selectedMessage == nil)
 
+                Button("全部回复") {
+                    viewModel.openComposeReplyAll()
+                }
+                .keyboardShortcut("r", modifiers: [.command, .option])
+                .disabled(viewModel.selectedMessage == nil)
+
                 Button("转发当前邮件") {
                     viewModel.openComposeForward()
                 }

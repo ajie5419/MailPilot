@@ -9,6 +9,7 @@ import WebKit
 struct MailDetailView: View {
     @ObservedObject var viewModel: AppViewModel
     @ObservedObject var ai: AIAssistantController
+    @StateObject private var recipientExpandState = RecipientExpandState()
 
     init(viewModel: AppViewModel) {
         self._viewModel = ObservedObject(wrappedValue: viewModel)
@@ -104,6 +105,9 @@ struct MailDetailView: View {
                 HStack(spacing: 2) {
                     DetailHeaderIconButton(systemImage: "arrowshape.turn.up.left", helpText: "回复（⌘R）") {
                         viewModel.openComposeReply(for: message)
+                    }
+                    DetailHeaderIconButton(systemImage: "arrowshape.turn.up.left.2", helpText: "全部回复（⌥⌘R）") {
+                        viewModel.openComposeReplyAll(for: message)
                     }
                     DetailHeaderIconButton(systemImage: "arrowshape.turn.up.right", helpText: "转发（⇧⌘F）") {
                         viewModel.openComposeForward(for: message)
@@ -201,10 +205,81 @@ struct MailDetailView: View {
                     }
                 }
             }
+
+            if !viewModel.selectedMessageRecipients.isEmpty {
+                recipientsSummaryBar(viewModel.selectedMessageRecipients)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(.background)
+        .onChange(of: message.id) { _, _ in
+            recipientExpandState.isExpanded = false
+        }
+    }
+
+    private func recipientsSummaryBar(_ recipients: [MailRecipientInfo]) -> some View {
+        let toList = recipients.filter { !$0.isCC }
+        let ccList = recipients.filter { $0.isCC }
+        let totalCount = recipients.count
+
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                if !toList.isEmpty {
+                    Text("收件人：")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.tertiary)
+                    Text(
+                        recipientExpandState.isExpanded
+                            ? toList.map(\.formattedDisplay).joined(separator: "、")
+                            : toList.prefix(3).map(\.displayName).joined(separator: "、")
+                                + (toList.count > 3 ? " 等 \(toList.count) 人" : "")
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(recipientExpandState.isExpanded ? nil : 1)
+                    .textSelection(.enabled)
+                }
+
+                if !recipientExpandState.isExpanded && !ccList.isEmpty {
+                    Text("· 抄送 \(ccList.count) 人")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .fixedSize()
+                }
+
+                Spacer(minLength: 4)
+
+                if totalCount > 1 || !ccList.isEmpty {
+                    Button {
+                        recipientExpandState.isExpanded.toggle()
+                    } label: {
+                        HStack(spacing: 2) {
+                            Text(recipientExpandState.isExpanded ? "收起" : "详情")
+                            Image(systemName: recipientExpandState.isExpanded ? "chevron.up" : "chevron.down")
+                                .font(.system(size: 8, weight: .semibold))
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            if recipientExpandState.isExpanded && !ccList.isEmpty {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("抄送：")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.tertiary)
+                    Text(ccList.map(\.formattedDisplay).joined(separator: "、"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .padding(.leading, 40)
+        .padding(.top, 1)
     }
 
     private func verificationBanner(code: String) -> some View {
@@ -513,6 +588,10 @@ struct MailDetailView: View {
         .background(.background)
     }
 
+}
+
+private final class RecipientExpandState: ObservableObject {
+    @Published var isExpanded = false
 }
 
 private final class HeaderIconHoverState: ObservableObject {

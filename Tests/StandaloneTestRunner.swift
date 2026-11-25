@@ -905,7 +905,68 @@ struct StandaloneTestRunner {
         }
         assertTrue(hitCounter.current() > 0, "MailDirectoryWatcher fires on Envelope Index-wal write")
 
-        print("ALL 36 CORE TEST SUITES PASSED")
+        // 37. EnvelopeIndexReader fetchRecipients (To/CC/dedup) & local contact search autocomplete
+        let contactDBURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-contacts-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: contactDBURL) }
+        var contactDB: OpaquePointer?
+        assertEqual(sqlite3_open(contactDBURL.path, &contactDB), SQLITE_OK, "create synthetic contacts Envelope Index")
+        let contactSchema = """
+        CREATE TABLE addresses (ROWID INTEGER PRIMARY KEY, address TEXT, comment TEXT);
+        CREATE TABLE recipients (ROWID INTEGER PRIMARY KEY, message INTEGER, address INTEGER, type INTEGER, position INTEGER);
+        INSERT INTO addresses (ROWID, address, comment) VALUES
+            (1, 'alice@company.com', 'Alice Chen'),
+            (2, 'bob@company.com', 'Bob Wang'),
+            (3, 'carol@partner.io', '张敏 Carol'),
+            (4, 'secret@company.com', 'Hidden BCC'),
+            (5, 'ALICE@company.com', 'Alice Chen'),
+            (6, 'not-an-email', 'Invalid Entry');
+        INSERT INTO recipients (ROWID, message, address, type, position) VALUES
+            (1, 100, 1, 0, 0),
+            (2, 100, 5, 0, 1),
+            (3, 100, 2, 1, 0),
+            (4, 100, 3, 1, 1),
+            (5, 100, 4, 2, 0);
+        """
+        assertEqual(sqlite3_exec(contactDB, contactSchema, nil, nil, nil), SQLITE_OK, "seed recipients & addresses")
+        sqlite3_close(contactDB)
+
+        let contactReader = EnvelopeIndexReader(mailVersionURL: contactDBURL.deletingLastPathComponent(), databaseURL: contactDBURL)
+        let fetchedRecipients = try contactReader.fetchRecipients(for: 100)
+        assertEqual(fetchedRecipients.count, 3, "fetchRecipients returns deduplicated To + CC and omits BCC")
+        assertEqual(fetchedRecipients[0].address, "alice@company.com", "first recipient is To Alice")
+        assertTrue(!fetchedRecipients[0].isCC, "Alice is To recipient")
+        assertEqual(fetchedRecipients[1].address, "bob@company.com", "second recipient is CC Bob")
+        assertTrue(fetchedRecipients[1].isCC, "Bob is CC recipient")
+        assertEqual(fetchedRecipients[2].address, "carol@partner.io", "third recipient is CC Carol")
+
+        let byPrefix = try contactReader.searchContacts(query: "ali", limit: 5)
+        assertEqual(byPrefix.count, 1, "searchContacts deduplicates case-insensitive duplicate addresses")
+        assertEqual(byPrefix.first?.address.lowercased(), "alice@company.com", "searchContacts matches email prefix")
+        assertEqual(byPrefix.first?.frequency, 2, "searchContacts aggregates frequency across duplicate address rows")
+
+        let byChineseName = try contactReader.searchContacts(query: "张敏", limit: 5)
+        assertEqual(byChineseName.first?.address, "carol@partner.io", "searchContacts matches Chinese display name")
+
+        // 38. BCC AppleScript generation & AccountCustomization backward-compatible signature decoding
+        let bccScript = MailAppleScriptBridge.buildComposeScript(
+            from: "me@example.com",
+            to: ["alice@company.com"],
+            cc: ["bob@company.com"],
+            bcc: ["audit@company.com"],
+            subject: "BCC Test",
+            body: "hello",
+            attachmentURLs: [],
+            shouldSend: true
+        )
+        assertTrue(bccScript.contains("make new bcc recipient at end of bcc recipients with properties {address:\"audit@company.com\"}"), "buildComposeScript emits bcc recipient")
+
+        let legacyCustomJSON = Data(#"{"senderDisplayName":"Jay","sidebarName":"Work"}"#.utf8)
+        let decodedLegacyCustom = try JSONDecoder().decode(AccountCustomization.self, from: legacyCustomJSON)
+        assertEqual(decodedLegacyCustom.senderDisplayName, "Jay", "legacy AccountCustomization keeps senderDisplayName")
+        assertEqual(decodedLegacyCustom.signature, "", "legacy AccountCustomization defaults signature to empty string")
+
+        print("ALL 38 CORE TEST SUITES PASSED")
         try await ChatGPTTests.run()
     }
 }
