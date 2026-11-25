@@ -17,11 +17,18 @@ struct MailDetailView: View {
 
     var body: some View {
         if let message = viewModel.selectedMessage {
+            let loadedBody = viewModel.currentLoadedBody
+            let activeHTML: String? = (!viewModel.isLoadingBody && !viewModel.preferPlainText)
+                ? loadedBody?.rawHTML.flatMap { $0.isEmpty ? nil : $0 }
+                : nil
+            let shouldBlockRemote = viewModel.blockRemoteImages && !viewModel.allowedRemoteContentMessageIDs.contains(message.id)
+            let hasBlockedRemote = activeHTML != nil && shouldBlockRemote && viewModel.selectedBodyHasRemoteResources
+
             VStack(spacing: 0) {
                 headerBar(for: message)
                 Divider()
 
-                inlineAIActionBar
+                compactActionStrip(for: message, hasBlockedRemote: hasBlockedRemote)
                 Divider()
 
                 if ai.showInlineSummary {
@@ -29,41 +36,13 @@ struct MailDetailView: View {
                     Divider()
                 }
 
-                if let loadedBody = viewModel.currentLoadedBody,
-                   let code = loadedBody.verificationCode {
+                if let loadedBody, let code = loadedBody.verificationCode {
                     verificationBanner(code: code)
                     Divider()
                 }
 
-                if let loadedBody = viewModel.currentLoadedBody,
-                   !loadedBody.attachments.isEmpty {
+                if let loadedBody, !loadedBody.attachments.isEmpty {
                     attachmentsBar(loadedBody.attachments)
-                    Divider()
-                }
-
-                let loadedBody = viewModel.currentLoadedBody
-                let activeHTML: String? = (!viewModel.isLoadingBody && !viewModel.preferPlainText)
-                    ? loadedBody?.rawHTML.flatMap { $0.isEmpty ? nil : $0 }
-                    : nil
-                let shouldBlockRemote = viewModel.blockRemoteImages && !viewModel.allowedRemoteContentMessageIDs.contains(message.id)
-
-                if activeHTML != nil && shouldBlockRemote && viewModel.selectedBodyHasRemoteResources {
-                    HStack(spacing: 8) {
-                        Image(systemName: "hand.raised.shield.fill")
-                            .foregroundStyle(.blue)
-                        Text("已拦截远程图片与外部资源，防止追踪像素泄露隐私")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Button("加载本封远程图片") {
-                            viewModel.allowRemoteContent(for: message.id)
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.mini)
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 7)
-                    .background(Color.blue.opacity(0.07))
                     Divider()
                 }
 
@@ -105,70 +84,93 @@ struct MailDetailView: View {
     }
 
     private func headerBar(for message: MailMessageSummary) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top) {
-                Text(message.subject)
-                    .font(.title3.weight(.semibold))
-                    .textSelection(.enabled)
-                Spacer()
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .center, spacing: 8) {
                 HStack(spacing: 6) {
-                    Button {
+                    if message.isFlagged {
+                        Image(systemName: "flag.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    Text(message.subject)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                }
+
+                Spacer(minLength: 8)
+
+                // Clean borderless SF Symbols action cluster
+                HStack(spacing: 2) {
+                    DetailHeaderIconButton(systemImage: "arrowshape.turn.up.left", helpText: "回复（⌘R）") {
                         viewModel.openComposeReply(for: message)
-                    } label: {
-                        Image(systemName: "arrowshape.turn.up.left")
                     }
-                    .help("回复（⌘R）")
-
-                    Button {
+                    DetailHeaderIconButton(systemImage: "arrowshape.turn.up.right", helpText: "转发（⇧⌘F）") {
                         viewModel.openComposeForward(for: message)
-                    } label: {
-                        Image(systemName: "arrowshape.turn.up.right")
                     }
-                    .help("转发（⇧⌘F）")
 
-                    Button {
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.12))
+                        .frame(width: 1, height: 14)
+                        .padding(.horizontal, 4)
+
+                    DetailHeaderIconButton(systemImage: "archivebox", helpText: "归档（⌃⌘A）") {
                         viewModel.archiveMessage(message)
-                    } label: {
-                        Image(systemName: "archivebox")
                     }
-                    .help("归档（⌃⌘A）")
-
-                    Button {
+                    DetailHeaderIconButton(systemImage: "trash", helpText: "删除（⌘⌫）", isDestructive: true) {
                         viewModel.deleteMessage(message)
-                    } label: {
-                        Image(systemName: "trash")
                     }
-                    .help("删除（⌘⌫）")
 
-                    if viewModel.currentLoadedBody?.rawHTML != nil {
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.12))
+                        .frame(width: 1, height: 14)
+                        .padding(.horizontal, 4)
+
+                    Menu {
+                        if viewModel.currentLoadedBody?.rawHTML != nil {
+                            Button {
+                                viewModel.preferPlainText.toggle()
+                            } label: {
+                                Label(
+                                    viewModel.preferPlainText ? "切换为 HTML 富文本" : "切换为纯文本",
+                                    systemImage: viewModel.preferPlainText ? "doc.richtext" : "doc.plaintext"
+                                )
+                            }
+                        }
                         Button {
-                            viewModel.preferPlainText.toggle()
+                            viewModel.toggleReadStatus(for: message)
                         } label: {
                             Label(
-                                viewModel.preferPlainText ? "纯文本" : "富文本",
-                                systemImage: viewModel.preferPlainText ? "doc.plaintext" : "doc.richtext"
+                                message.isRead ? "标记为未读" : "标记为已读",
+                                systemImage: message.isRead ? "envelope.badge" : "envelope.open"
                             )
                         }
-                        .help(viewModel.preferPlainText ? "当前为纯文本，点击切换为 HTML 富文本" : "当前为 HTML 富文本，点击切换为纯文本")
-                    }
-
-                    Button {
-                        viewModel.toggleReadStatus(for: message)
+                        Button {
+                            viewModel.toggleFlaggedStatus(for: message)
+                        } label: {
+                            Label(
+                                message.isFlagged ? "取消旗标" : "添加旗标",
+                                systemImage: message.isFlagged ? "flag.slash" : "flag"
+                            )
+                        }
+                        Divider()
+                        Button {
+                            viewModel.openInNativeMail(message)
+                        } label: {
+                            Label("在系统 Mail.app 中打开", systemImage: "arrow.up.forward.app")
+                        }
                     } label: {
-                        Image(systemName: message.isRead ? "envelope.badge" : "envelope.open")
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 28, height: 24)
+                            .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                     }
-                    .help(message.isRead ? "标记为未读" : "标记为已读")
-
-                    Button {
-                        viewModel.toggleFlaggedStatus(for: message)
-                    } label: {
-                        Image(systemName: message.isFlagged ? "flag.fill" : "flag")
-                            .foregroundStyle(message.isFlagged ? .orange : .primary)
-                    }
-                    .help(message.isFlagged ? "取消旗标" : "添加旗标")
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("更多操作（纯文本切换 / 标未读 / 旗标）")
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
             }
 
             HStack(spacing: 10) {
@@ -184,7 +186,7 @@ struct MailDetailView: View {
                 Spacer()
                 VStack(alignment: .trailing, spacing: 2) {
                     Text(message.dateReceived.formatted(date: .abbreviated, time: .shortened))
-                        .font(.caption)
+                        .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                     if let acctName = viewModel.accountDisplayName(for: message.accountID) {
                         AccountBadgePill(
@@ -200,7 +202,8 @@ struct MailDetailView: View {
                 }
             }
         }
-        .padding(16)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
         .background(.background)
     }
 
@@ -226,69 +229,56 @@ struct MailDetailView: View {
     }
 
     private func attachmentsBar(_ attachments: [MailAttachment]) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: "paperclip")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Text("\(attachments.count) 个附件（点击直接打开，右键可另存为）")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(attachments) { att in
+                    Button {
+                        viewModel.openAttachment(att)
+                    } label: {
+                        HStack(spacing: 7) {
+                            Image(systemName: iconForAttachment(att))
+                                .font(.system(size: 13))
+                                .foregroundStyle(colorForAttachment(att))
+                                .frame(width: 22, height: 22)
+                                .background(colorForAttachment(att).opacity(0.12), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(attachments) { att in
-                        Button {
-                            viewModel.openAttachment(att)
-                        } label: {
-                            HStack(spacing: 8) {
-                                Image(systemName: iconForAttachment(att))
-                                    .font(.system(size: 15))
-                                    .foregroundStyle(colorForAttachment(att))
-                                    .frame(width: 24, height: 24)
-                                    .background(colorForAttachment(att).opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(att.filename)
-                                        .font(.caption.weight(.medium))
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(1)
-                                    Text(att.formattedSize)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .frame(maxWidth: 180, alignment: .leading)
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
-                            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .strokeBorder(.separator.opacity(0.6), lineWidth: 0.7)
-                            )
-                            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            Text(att.filename)
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            Text("· \(att.formattedSize)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .fixedSize()
                         }
-                        .buttonStyle(.plain)
-                        .contextMenu {
-                            Button("打开预览") {
-                                viewModel.openAttachment(att)
-                            }
-                            Button("另存为...") {
-                                viewModel.saveAttachmentAs(att)
-                            }
-                            Button("在访达中显示") {
-                                viewModel.revealAttachmentInFinder(att)
-                            }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .strokeBorder(.separator.opacity(0.55), lineWidth: 0.7)
+                        )
+                        .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .help("\(att.filename)（\(att.formattedSize)）· 点击打开，右键可另存为")
+                    .contextMenu {
+                        Button("打开预览") {
+                            viewModel.openAttachment(att)
+                        }
+                        Button("另存为...") {
+                            viewModel.saveAttachmentAs(att)
+                        }
+                        Button("在访达中显示") {
+                            viewModel.revealAttachmentInFinder(att)
                         }
                     }
                 }
             }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 7)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.bar.opacity(0.45))
+        .background(.background)
     }
 
     private func iconForAttachment(_ att: MailAttachment) -> String {
@@ -315,60 +305,138 @@ struct MailDetailView: View {
         }
     }
 
-    private var inlineAIActionBar: some View {
-        HStack(spacing: 8) {
-            Button {
-                ai.summarizeSelectedEmailInline()
-            } label: {
-                Label(
-                    ai.isInlineSummarizing ? "总结中..." : "总结邮件",
-                    systemImage: "sparkles"
-                )
+    private func compactActionStrip(for message: MailMessageSummary, hasBlockedRemote: Bool) -> some View {
+        HStack(spacing: 7) {
+            if ai.isInlineSummarizing {
+                Button {
+                    ai.stopInlineSummary()
+                } label: {
+                    HStack(spacing: 5) {
+                        ProgressView()
+                            .controlSize(.mini)
+                        Text("停止总结")
+                            .font(.caption.weight(.medium))
+                    }
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+                    .overlay(
+                        Capsule()
+                            .strokeBorder(Color.accentColor.opacity(0.28), lineWidth: 0.8)
+                    )
+                }
+                .buttonStyle(.plain)
+                .help("停止正在生成的摘要")
+            } else {
+                Button {
+                    ai.summarizeSelectedEmailInline()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 11, weight: .medium))
+                        Text("总结邮件")
+                            .font(.caption.weight(.medium))
+                    }
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+                    .overlay(
+                        Capsule()
+                            .strokeBorder(Color.accentColor.opacity(0.24), lineWidth: 0.8)
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(viewModel.isLoadingBody)
+                .opacity(viewModel.isLoadingBody ? 0.5 : 1)
+                .help("使用 AI 生成当前邮件摘要")
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(viewModel.isLoadingBody || ai.isInlineSummarizing)
 
             Button {
                 ai.generateReplyDraft(tone: "专业简洁")
             } label: {
-                Label("起草回复", systemImage: "square.and.pencil")
+                HStack(spacing: 4) {
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 11))
+                    Text("起草回复")
+                        .font(.caption)
+                }
+                .foregroundStyle(.primary.opacity(0.85))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(.quaternary.opacity(0.5), in: Capsule())
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
+            .buttonStyle(.plain)
             .disabled(viewModel.isLoadingBody || ai.isAIThinking)
+            .opacity((viewModel.isLoadingBody || ai.isAIThinking) ? 0.5 : 1)
+            .help("基于当前邮件起草回复")
 
             Button {
                 viewModel.showAIPanel.toggle()
             } label: {
-                Label(viewModel.showAIPanel ? "收起对话" : "追问 AI", systemImage: "bubble.left.and.text.bubble.right")
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-
-            Spacer()
-
-            Button {
-                viewModel.settingsTab = .ai
-                viewModel.showSettings = true
-            } label: {
                 HStack(spacing: 4) {
-                    Image(systemName: "cpu")
-                        .font(.caption2)
-                    Text("\(ai.activeAIBadge) · \(ai.activeModelDisplayName)")
+                    Image(systemName: "bubble.left.and.text.bubble.right")
+                        .font(.system(size: 11))
+                    Text(viewModel.showAIPanel ? "收起对话" : "追问 AI")
                         .font(.caption)
                 }
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(.quaternary.opacity(0.55), in: Capsule())
+                .foregroundStyle(viewModel.showAIPanel ? Color.accentColor : .primary.opacity(0.85))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(
+                    viewModel.showAIPanel ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.05),
+                    in: Capsule()
+                )
             }
             .buttonStyle(.plain)
-            .help("点击配置模型或订阅账号")
+            .help(viewModel.showAIPanel ? "收起右侧 AI 对话栏" : "打开右侧 AI 对话栏继续追问")
+
+            Spacer(minLength: 8)
+
+            if hasBlockedRemote {
+                HStack(spacing: 6) {
+                    Image(systemName: "hand.raised.shield")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Text("已拦截远程图")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("显示") {
+                        viewModel.allowedRemoteContentMessageIDs.insert(message.id)
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Color.accentColor)
+                    .help("仅对当前邮件加载远程图片")
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(.quaternary.opacity(0.45), in: Capsule())
+            } else {
+                Button {
+                    viewModel.settingsTab = .ai
+                    viewModel.showSettings = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "cpu")
+                            .font(.system(size: 10))
+                        Text("\(ai.activeAIBadge) · \(ai.activeModelDisplayName)")
+                            .font(.caption)
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.quaternary.opacity(0.45), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .help("点击配置模型或订阅账号")
+            }
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .background(.bar.opacity(0.6))
+        .padding(.vertical, 7)
+        .background(.bar.opacity(0.55))
     }
 
     private var inlineSummaryCard: some View {
@@ -380,6 +448,15 @@ struct MailDetailView: View {
 
                 if ai.isInlineSummarizing {
                     ProgressView().controlSize(.mini)
+                    Button {
+                        ai.stopInlineSummary()
+                    } label: {
+                        Label("停止", systemImage: "stop.circle")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help("停止生成摘要")
                 }
 
                 Spacer()
@@ -405,6 +482,7 @@ struct MailDetailView: View {
                 }
 
                 Button {
+                    ai.stopInlineSummary()
                     ai.showInlineSummary = false
                 } label: {
                     Image(systemName: "xmark")
@@ -435,6 +513,40 @@ struct MailDetailView: View {
         .background(.background)
     }
 
+}
+
+private final class HeaderIconHoverState: ObservableObject {
+    @Published var isHovered = false
+}
+
+private struct DetailHeaderIconButton: View {
+    let systemImage: String
+    let helpText: String
+    var isDestructive: Bool = false
+    let action: () -> Void
+
+    @StateObject private var hoverState = HeaderIconHoverState()
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(isDestructive && hoverState.isHovered ? Color.red : Color.secondary)
+                .frame(width: 28, height: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(
+                            hoverState.isHovered
+                                ? (isDestructive ? Color.red.opacity(0.12) : Color.primary.opacity(0.08))
+                                : Color.clear
+                        )
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { hoverState.isHovered = $0 }
+        .help(helpText)
+    }
 }
 
 enum MailBodyPresentationHelper {

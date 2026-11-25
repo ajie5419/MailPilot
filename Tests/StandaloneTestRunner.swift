@@ -807,7 +807,105 @@ struct StandaloneTestRunner {
         assertEqual(clippedSingle.messages.count, 1, "oversized newest message is clipped instead of dropping all history")
         assertTrue((clippedSingle.messages.first?.content.count ?? 999) <= 50, "oversized newest message fits within maxHistoryChars")
 
-        print("ALL 34 CORE TEST SUITES PASSED")
+        // 35. Compose attachment script generation, error parsing, and pre-flight file validation
+        let sampleAttachURL = URL(fileURLWithPath: "/tmp/mailpilot-sample-report.pdf")
+        let generatedScript = MailAppleScriptBridge.buildComposeScript(
+            from: "me@example.com",
+            to: ["dest@example.com"],
+            cc: [],
+            subject: "带附件测试",
+            body: "",
+            attachmentURLs: [sampleAttachURL],
+            shouldSend: true
+        )
+        assertTrue(generatedScript.contains("content:\"\\n\""), "empty body with attachments injects newline so last paragraph exists")
+        assertTrue(generatedScript.contains("set attachAlias0 to (POSIX file \"/tmp/mailpilot-sample-report.pdf\") as alias"), "POSIX alias resolves outside tell Mail block")
+        assertTrue(generatedScript.contains("tell content of newMsg"), "attachment is added to content of newMsg")
+        assertTrue(generatedScript.contains("return \"ATTACH_FAILED:0:\" & errMsg"), "per-attachment error includes exact index")
+
+        let parsedAttachErr = MailAppleScriptBridge.parseAttachFailure("ATTACH_FAILED:2:Mail got an error: Can't make alias")
+        assertEqual(parsedAttachErr?.index, 2, "parseAttachFailure extracts exact attachment index")
+        assertEqual(parsedAttachErr?.reason, "Mail got an error: Can't make alias", "parseAttachFailure preserves colons in error reason")
+        assertTrue(MailAppleScriptBridge.parseAttachFailure("OK") == nil, "parseAttachFailure ignores OK response")
+
+        let missingAttachURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-nonexistent-\(UUID().uuidString).pdf")
+        var caughtMissingAttach = false
+        do {
+            try await MailAppleScriptBridge.sendMessage(
+                from: nil,
+                to: ["dest@example.com"],
+                cc: [],
+                subject: "Missing test",
+                body: "hello",
+                attachmentURLs: [missingAttachURL]
+            )
+        } catch let err as MailComposeAttachmentError {
+            if case .fileMissing(let idx, let filename) = err {
+                caughtMissingAttach = (idx == 0 && filename == missingAttachURL.lastPathComponent)
+            }
+        }
+        assertTrue(caughtMissingAttach, "sendMessage fails fast with MailComposeAttachmentError.fileMissing before calling Mail.app")
+
+        let dirAttachURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-dir-attach-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dirAttachURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dirAttachURL) }
+        var caughtDirAttach = false
+        do {
+            try await MailAppleScriptBridge.saveDraft(
+                from: nil,
+                to: [],
+                cc: [],
+                subject: "Dir test",
+                body: "",
+                attachmentURLs: [dirAttachURL]
+            )
+        } catch let err as MailComposeAttachmentError {
+            if case .isDirectory(let idx, let filename) = err {
+                caughtDirAttach = (idx == 0 && filename == dirAttachURL.lastPathComponent)
+            }
+        }
+        assertTrue(caughtDirAttach, "saveDraft rejects directory attachment with MailComposeAttachmentError.isDirectory")
+
+        // 36. MailDirectoryWatcher detects writes and atomic replacements to Envelope Index-wal
+        let fallbackWatchDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mailpilot-watch-fallback-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: fallbackWatchDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fallbackWatchDir) }
+        let fakeDB = fallbackWatchDir.appendingPathComponent("Envelope Index")
+        let fakeWAL = fallbackWatchDir.appendingPathComponent("Envelope Index-wal")
+        try Data("init".utf8).write(to: fakeDB)
+        try Data("wal0".utf8).write(to: fakeWAL)
+
+        final class CounterBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = 0
+            func increment() {
+                lock.lock()
+                value += 1
+                lock.unlock()
+            }
+            func current() -> Int {
+                lock.lock()
+                defer { lock.unlock() }
+                return value
+            }
+        }
+        let hitCounter = CounterBox()
+        let fallbackWatcher = MailDirectoryWatcher(directoryURL: fallbackWatchDir) {
+            hitCounter.increment()
+        }
+        defer { fallbackWatcher.stop() }
+        try await Task.sleep(for: .milliseconds(150))
+        try Data("wal1-new-mail-commit".utf8).write(to: fakeWAL)
+        let waitDeadline = Date().addingTimeInterval(3.0)
+        while hitCounter.current() == 0 && Date() < waitDeadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        assertTrue(hitCounter.current() > 0, "MailDirectoryWatcher fires on Envelope Index-wal write")
+
+        print("ALL 36 CORE TEST SUITES PASSED")
         try await ChatGPTTests.run()
     }
 }

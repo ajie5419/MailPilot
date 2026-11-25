@@ -55,6 +55,9 @@ final class AppViewModel: ObservableObject {
 
     @Published var sidebarSelection: SidebarSelection = .allInbox {
         didSet {
+            if sidebarSelection != oldValue {
+                sessionKeptUnreadMessages.removeAll()
+            }
             currentPageLimit = 200
             reloadMessages()
         }
@@ -65,6 +68,27 @@ final class AppViewModel: ObservableObject {
                 currentPageLimit = 200
                 scheduleSearchReload()
             }
+        }
+    }
+    @Published var searchFocusTrigger: Int = 0
+
+    func focusSearchField() {
+        searchFocusTrigger += 1
+    }
+
+    var searchScopePlaceholder: String {
+        switch sidebarSelection {
+        case .allInbox:
+            return "在「收件箱」中搜索…"
+        case .unread:
+            return "在「未读邮件」中搜索…"
+        case .flagged:
+            return "在「已标星」中搜索…"
+        case .smartTag(let tag):
+            return "在「\(tag.rawValue)」中搜索…"
+        case .mailbox(let id):
+            let name = mailboxes.first(where: { $0.id == id })?.displayName ?? "当前文件夹"
+            return "在「\(name)」中搜索…"
         }
     }
 
@@ -189,6 +213,10 @@ final class AppViewModel: ObservableObject {
     var emlxParser: EmlxParser?
     let notificationManager = NotificationManager()
     var lastSeenMaxRowID: Int64?
+    var hasSeededNotificationWatermark = false
+    var notifiedMessageIDs: Set<Int64> = []
+    var isCheckingIncomingNotifications = false
+    var needsFollowUpNotificationCheck = false
     var cachedAccountLookup: [String: CachedAccountMeta] = [:]
     var pendingRemovedIDs: Set<Int64> = []
     var isFetchingAccounts = false
@@ -204,13 +232,17 @@ final class AppViewModel: ObservableObject {
     private var reloadTask: Task<Void, Never>?
     private var searchDebounceTask: Task<Void, Never>?
     private var autoMarkReadTask: Task<Void, Never>?
+    private var autoMarkReadTargetID: Int64?
     private var watcher: MailDirectoryWatcher?
     private var wakeObserver: NSObjectProtocol?
+    private var appLifecycleObservers: [NSObjectProtocol] = []
     private var isRefreshingMailboxes = false
     private var needsFollowUpRefresh = false
     private var cachedMessageTags: [Int64: [MailSmartTag]] = [:]
     private var recentBodyCache: [Int64: CachedRenderedBody] = [:]
     private var recentBodyOrder: [Int64] = []
+    /// Keeps messages auto-marked as read during the current `.unread` session visible so reading never jumps away.
+    private var sessionKeptUnreadMessages: [Int64: MailMessageSummary] = [:]
 
     private static let maxRecentBodyCacheEntries = 8
     private static let maxCacheableBodyBytes = 2 * 1024 * 1024
@@ -267,6 +299,7 @@ final class AppViewModel: ObservableObject {
         requestNotificationPermissionOnLaunch()
         connectToNativeMail()
         observeSystemWake()
+        observeAppLifecycle()
         Task {
             let fetchedAccounts = await MailAppleScriptBridge.fetchAccounts()
             self.accounts = fetchedAccounts
@@ -377,8 +410,33 @@ final class AppViewModel: ObservableObject {
     }
 
     func updateDockUnreadBadge() {
-        let count = totalInboxUnreadCount
-        NSApp.dockTile.badgeLabel = count > 0 ? "\(count)" : nil
+        notificationManager.syncBadgeCount(totalInboxUnreadCount)
+    }
+
+    private func observeAppLifecycle() {
+        let finishLaunching = NotificationCenter.default.addObserver(
+            forName: NSApplication.didFinishLaunchingNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                // Re-apply badge after NSApp.setActivationPolicy(.regular) completes.
+                self?.updateDockUnreadBadge()
+                try? await Task.sleep(for: .milliseconds(400))
+                self?.updateDockUnreadBadge()
+            }
+        }
+        let becomeActive = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.updateDockUnreadBadge()
+                self?.refreshNow()
+            }
+        }
+        appLifecycleObservers = [finishLaunching, becomeActive]
     }
 
     var isUnifiedView: Bool {
@@ -490,12 +548,19 @@ final class AppViewModel: ObservableObject {
                 guard let self else { return }
                 if self.mailboxes != fetchedMailboxes {
                     self.mailboxes = fetchedMailboxes
+                } else {
+                    self.updateDockUnreadBadge()
                 }
                 if self.accessError != nil {
                     self.accessError = nil
                 }
                 self.syncAccountsIfUnknownMailboxPresent(fetchedMailboxes)
                 self.reloadMessages()
+                if self.hasSeededNotificationWatermark {
+                    Task { [weak self] in
+                        await self?.checkAndNotifyIncomingMail()
+                    }
+                }
             } catch is CancellationError {
                 return
             } catch let err as MailAccessError {
@@ -587,10 +652,31 @@ final class AppViewModel: ObservableObject {
                     return (result, tagMap)
                 }
                 guard !Task.isCancelled, let self else { return }
-                let filtered = self.pendingRemovedIDs.isEmpty
+                var filtered = self.pendingRemovedIDs.isEmpty
                     ? page.messages
                     : page.messages.filter { !self.pendingRemovedIDs.contains($0.id) }
-                self.cachedMessageTags = precomputedTags
+                if self.sidebarSelection == .unread && trimmedQuery.isEmpty && !self.sessionKeptUnreadMessages.isEmpty {
+                    let existingIDs = Set(filtered.map(\.id))
+                    var mergedTags = precomputedTags
+                    let keptExtras = self.sessionKeptUnreadMessages.values.filter {
+                        !existingIDs.contains($0.id) && !self.pendingRemovedIDs.contains($0.id)
+                    }
+                    if !keptExtras.isEmpty {
+                        filtered.append(contentsOf: keptExtras)
+                        filtered.sort {
+                            if $0.dateReceived != $1.dateReceived {
+                                return $0.dateReceived > $1.dateReceived
+                            }
+                            return $0.id > $1.id
+                        }
+                        for msg in keptExtras where mergedTags[msg.id] == nil {
+                            mergedTags[msg.id] = MailTagClassifier.classify(msg, settings: self.tagSettings)
+                        }
+                    }
+                    self.cachedMessageTags = mergedTags
+                } else {
+                    self.cachedMessageTags = precomputedTags
+                }
                 let messagesChanged = self.messages != filtered
                 if messagesChanged {
                     self.messages = filtered
@@ -600,8 +686,8 @@ final class AppViewModel: ObservableObject {
                 }
                 let countIndexed = await indexCoordinator.refreshIndexedCount()
                 let newStatus = trimmedQuery.isEmpty
-                    ? "实时同步中 · \(filtered.count) 封邮件"
-                    : "搜索结果 · \(filtered.count)\(page.hasMore ? "+" : "") 封（已索引 \(countIndexed) 封正文）"
+                    ? "实时同步 · \(filtered.count) 封（已索引 \(countIndexed) 正文）"
+                    : "搜索结果 · \(filtered.count)\(page.hasMore ? "+" : "") 封（已索引 \(countIndexed) 正文）"
                 if self.statusText != newStatus {
                     self.statusText = newStatus
                 }
@@ -609,6 +695,10 @@ final class AppViewModel: ObservableObject {
                     self.selectedMessageID = filtered.first?.id
                 } else if self.selectedMessageID == nil {
                     self.selectedMessageID = filtered.first?.id
+                } else if let current = self.selectedMessageID {
+                    // If a notification click selected `current` before `reloadMessages()` populated `messages`,
+                    // ensure auto-mark-read runs once the unread message appears in `messages`.
+                    self.scheduleAutoMarkReadIfNeeded(for: current)
                 }
                 if trimmedQuery.isEmpty && (messagesChanged || indexCoordinator.needsFullSweep) {
                     indexCoordinator.scheduleIndexing(
@@ -725,6 +815,8 @@ final class AppViewModel: ObservableObject {
     private func loadSelectedMessageBody() {
         ai.resetForSelectedMessage(id: selectedMessageID)
         autoMarkReadTask?.cancel()
+        autoMarkReadTask = nil
+        autoMarkReadTargetID = nil
         bodyLoadTask?.cancel()
         bodyLoadTask = nil
         // Immediately clear previous email's body so Reply/Forward/Attachments/AI can never read stale content.
@@ -772,15 +864,40 @@ final class AppViewModel: ObservableObject {
             }
         }
 
-        // Auto-mark as read after staying on an unread message briefly.
-        if let msg = messages.first(where: { $0.id == id }), !msg.isRead {
-            autoMarkReadTask = Task {
-                try? await Task.sleep(for: .milliseconds(500))
-                guard !Task.isCancelled, self.selectedMessageID == id else { return }
-                self.updateLocalReadState(rowID: id, isRead: true)
+        scheduleAutoMarkReadIfNeeded(for: id)
+    }
+
+    private func scheduleAutoMarkReadIfNeeded(for id: Int64) {
+        guard let msg = messages.first(where: { $0.id == id }), !msg.isRead else { return }
+        if autoMarkReadTargetID == id && autoMarkReadTask != nil {
+            return
+        }
+        autoMarkReadTask?.cancel()
+        autoMarkReadTargetID = id
+        autoMarkReadTask = Task { [weak self] in
+            defer {
+                if let self, self.autoMarkReadTargetID == id {
+                    self.autoMarkReadTargetID = nil
+                    self.autoMarkReadTask = nil
+                }
+            }
+            try? await Task.sleep(for: .milliseconds(500))
+            guard let self, !Task.isCancelled, self.selectedMessageID == id else { return }
+            self.updateLocalReadState(rowID: id, isRead: true)
+            if self.sidebarSelection == .unread,
+               let updated = self.messages.first(where: { $0.id == id }) {
+                self.sessionKeptUnreadMessages[id] = updated
+            }
+            // Detach the Mail.app sync from `autoMarkReadTask` so selecting another email after 500ms
+            // never cancels the AppleScript write or the follow-up badge/index refresh.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
                 do {
                     try await MailAppleScriptBridge.setReadStatus(rowID: id, isRead: true)
+                    try? await Task.sleep(for: .milliseconds(500))
+                    self.refreshNow()
                 } catch {
+                    self.sessionKeptUnreadMessages.removeValue(forKey: id)
                     self.updateLocalReadState(rowID: id, isRead: false)
                     self.showToast("自动标已读失败：请在系统设置 → 自动化中允许控制「邮件」")
                 }

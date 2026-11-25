@@ -1,5 +1,48 @@
 import Foundation
 
+public enum MailComposeAttachmentError: LocalizedError, Sendable, Equatable {
+    case fileMissing(index: Int, filename: String)
+    case fileUnreadable(index: Int, filename: String)
+    case isDirectory(index: Int, filename: String)
+    case mailAttachFailed(index: Int, filename: String, reason: String)
+
+    public var attachmentIndex: Int {
+        switch self {
+        case .fileMissing(let idx, _),
+             .fileUnreadable(let idx, _),
+             .isDirectory(let idx, _),
+             .mailAttachFailed(let idx, _, _):
+            return idx
+        }
+    }
+
+    public var shortReason: String {
+        switch self {
+        case .fileMissing:
+            return "文件不存在或已被移动"
+        case .fileUnreadable:
+            return "无读取权限"
+        case .isDirectory:
+            return "不支持直接添加文件夹"
+        case .mailAttachFailed(_, _, let reason):
+            return reason.isEmpty ? "Mail.app 添加附件失败" : reason
+        }
+    }
+
+    public var errorDescription: String? {
+        switch self {
+        case .fileMissing(_, let name):
+            return "附件「\(name)」不存在或已被移动"
+        case .fileUnreadable(_, let name):
+            return "附件「\(name)」无法读取，请检查文件权限"
+        case .isDirectory(_, let name):
+            return "「\(name)」是文件夹，请压缩为 ZIP 后再添加"
+        case .mailAttachFailed(_, let name, let reason):
+            return "附件「\(name)」添加到系统 Mail.app 失败：\(reason)"
+        }
+    }
+}
+
 /// Delegates all write actions (read/flag/draft/check mail) to Apple Mail via AppleScript
 /// so Mail.app remains the sole writer of `Envelope Index` and handles server sync safely.
 public enum MailAppleScriptBridge {
@@ -338,12 +381,102 @@ public enum MailAppleScriptBridge {
         attachmentURLs: [URL],
         shouldSend: Bool
     ) async throws {
+        var totalAttachmentBytes: Int64 = 0
+        for (idx, url) in attachmentURLs.enumerated() {
+            var isDir: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+            if !exists {
+                throw MailComposeAttachmentError.fileMissing(index: idx, filename: url.lastPathComponent)
+            }
+            if isDir.boolValue {
+                throw MailComposeAttachmentError.isDirectory(index: idx, filename: url.lastPathComponent)
+            }
+            if !FileManager.default.isReadableFile(atPath: url.path) {
+                throw MailComposeAttachmentError.fileUnreadable(index: idx, filename: url.lastPathComponent)
+            }
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+               let fileSize = attrs[.size] as? NSNumber {
+                totalAttachmentBytes += fileSize.int64Value
+            }
+        }
+
+        let script = buildComposeScript(
+            from: senderEmail,
+            to: recipients,
+            cc: ccRecipients,
+            subject: subject,
+            body: body,
+            attachmentURLs: attachmentURLs,
+            shouldSend: shouldSend
+        )
+
+        let totalMB = Double(totalAttachmentBytes) / (1024.0 * 1024.0)
+        let timeoutSeconds: TimeInterval = attachmentURLs.isEmpty
+            ? 30
+            : min(180, max(45, 30 + totalMB * 2.0))
+
+        let result = try await runAppleScript(script, timeoutSeconds: timeoutSeconds)
+        if let attachFailure = parseAttachFailure(result) {
+            let filename = attachmentURLs.indices.contains(attachFailure.index)
+                ? attachmentURLs[attachFailure.index].lastPathComponent
+                : "附件 #\(attachFailure.index + 1)"
+            throw MailComposeAttachmentError.mailAttachFailed(
+                index: attachFailure.index,
+                filename: filename,
+                reason: attachFailure.reason
+            )
+        }
+        if shouldSend && result != "OK" {
+            throw MailAccessError.appleScriptFailed(message: "系统 Mail.app 未确认发送成功（状态：\(result.isEmpty ? "未知" : result)），已保留草稿")
+        }
+        if !shouldSend && result != "OK" {
+            throw MailAccessError.appleScriptFailed(message: "系统 Mail.app 未确认草稿保存成功（状态：\(result.isEmpty ? "未知" : result)）")
+        }
+    }
+
+    public static func buildComposeScript(
+        from senderEmail: String?,
+        to recipients: [String],
+        cc ccRecipients: [String],
+        subject: String,
+        body: String,
+        attachmentURLs: [URL],
+        shouldSend: Bool
+    ) -> String {
         let escapedSubject = escapeAppleScriptString(subject)
-        let escapedBody = escapeAppleScriptString(body)
+        // Ensure at least one paragraph exists when attaching files so
+        // `at after the last paragraph` never fails on an empty body.
+        let effectiveBody: String
+        if !attachmentURLs.isEmpty {
+            if body.isEmpty {
+                effectiveBody = "\n"
+            } else if body.hasSuffix("\n") {
+                effectiveBody = body
+            } else {
+                effectiveBody = body + "\n"
+            }
+        } else {
+            effectiveBody = body
+        }
+        let escapedBody = escapeAppleScriptString(effectiveBody)
 
         var props = ["subject:\"\(escapedSubject)\"", "content:\"\(escapedBody)\"", "visible:false"]
         if let sender = senderEmail?.trimmingCharacters(in: .whitespacesAndNewlines), !sender.isEmpty {
             props.append("sender:\"\(escapeAppleScriptString(sender))\"")
+        }
+
+        // Resolve POSIX file aliases outside `tell application "Mail"` to avoid terminology conflicts
+        // and attribute missing/inaccessible files to their exact index.
+        var aliasSetupLines: [String] = []
+        for (idx, url) in attachmentURLs.enumerated() {
+            let escapedPath = escapeAppleScriptString(url.path)
+            aliasSetupLines.append("""
+            try
+                set attachAlias\(idx) to (POSIX file "\(escapedPath)") as alias
+            on error errMsg
+                return "ATTACH_FAILED:\(idx):" & errMsg
+            end try
+            """)
         }
 
         var recipientLines: [String] = []
@@ -359,12 +492,30 @@ public enum MailAppleScriptBridge {
                 recipientLines.append("make new cc recipient at end of cc recipients with properties {address:\"\(escapeAppleScriptString(clean))\"}")
             }
         }
-        for url in attachmentURLs {
-            let escapedPath = escapeAppleScriptString(url.path)
-            recipientLines.append("make new attachment with properties {file name:POSIX file \"\(escapedPath)\"} at after the last paragraph")
+
+        var attachLines: [String] = []
+        for idx in attachmentURLs.indices {
+            attachLines.append("""
+                try
+                    tell content of newMsg
+                        make new attachment with properties {file name:attachAlias\(idx)} at after the last paragraph
+                    end tell
+                on error errMsg
+                    try
+                        delete newMsg
+                    end try
+                    return "ATTACH_FAILED:\(idx):" & errMsg
+                end try
+            """)
         }
 
-        let innerBlock = recipientLines.joined(separator: "\n        ")
+        let aliasBlock = aliasSetupLines.isEmpty ? "" : aliasSetupLines.joined(separator: "\n") + "\n"
+        let recipientBlock = recipientLines.isEmpty ? "" : """
+            tell newMsg
+                \(recipientLines.joined(separator: "\n        "))
+            end tell
+        """
+        let attachBlock = attachLines.joined(separator: "\n")
         let finalAction: String
         if shouldSend {
             finalAction = """
@@ -377,20 +528,27 @@ public enum MailAppleScriptBridge {
             finalAction = "    save newMsg"
         }
 
-        let script = """
-        tell application "Mail"
+        return """
+        \(aliasBlock)tell application "Mail"
             set newMsg to make new outgoing message with properties {\(props.joined(separator: ", "))}
-            tell newMsg
-                \(innerBlock)
-            end tell
+        \(recipientBlock)
+        \(attachBlock)
         \(finalAction)
             return "OK"
         end tell
         """
-        let result = try await runAppleScript(script)
-        if shouldSend && result != "OK" {
-            throw MailAccessError.appleScriptFailed(message: "系统 Mail.app 未确认发送成功（状态：\(result.isEmpty ? "未知" : result)），已保留草稿")
+    }
+
+    public static func parseAttachFailure(_ output: String) -> (index: Int, reason: String)? {
+        let prefix = "ATTACH_FAILED:"
+        guard output.hasPrefix(prefix) else { return nil }
+        let rest = String(output.dropFirst(prefix.count))
+        guard let colon = rest.firstIndex(of: ":") else {
+            return (0, rest.trimmingCharacters(in: .whitespacesAndNewlines))
         }
+        let idx = Int(rest[..<colon]) ?? 0
+        let reason = String(rest[rest.index(after: colon)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (idx, reason)
     }
 
     // MARK: - Execution (Serialized to prevent concurrent osascript storms against Mail.app)

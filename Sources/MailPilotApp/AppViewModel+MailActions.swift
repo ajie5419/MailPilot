@@ -10,6 +10,7 @@ extension AppViewModel {
     func updateLocalReadState(rowID: Int64, isRead: Bool) {
         guard let idx = messages.firstIndex(where: { $0.id == rowID }) else { return }
         let old = messages[idx]
+        guard old.isRead != isRead else { return }
         messages[idx] = MailMessageSummary(
             id: old.id,
             messageIDHeader: old.messageIDHeader,
@@ -23,11 +24,71 @@ extension AppViewModel {
             mailboxName: old.mailboxName,
             accountID: old.accountID
         )
+        adjustLocalUnreadCount(for: old, delta: isRead ? -1 : 1)
+        if isRead {
+            notificationManager.removeDeliveredNotification(for: rowID)
+        }
+    }
+
+    func adjustLocalUnreadCount(for message: MailMessageSummary, delta: Int) {
+        guard delta != 0, !mailboxes.isEmpty else { return }
+        var updated = mailboxes
+        var changed = false
+        var touchedInbox = false
+
+        if let mbIdx = updated.firstIndex(where: { $0.id == message.mailboxID }) {
+            let mb = updated[mbIdx]
+            let nextUnread = max(0, mb.unreadCount + delta)
+            if nextUnread != mb.unreadCount {
+                updated[mbIdx] = MailboxInfo(
+                    id: mb.id,
+                    url: mb.url,
+                    accountID: mb.accountID,
+                    displayName: mb.displayName,
+                    unreadCount: nextUnread,
+                    sortOrder: mb.sortOrder
+                )
+                changed = true
+            }
+            if mb.displayName == "收件箱" {
+                touchedInbox = true
+            }
+        }
+
+        // Gmail/IMAP multi-label inbox messages can store `[Gmail]/All Mail` as their primary `mailboxID`
+        // while also contributing to the account's `收件箱` unread badge via the `labels` table.
+        let isInInboxView = (sidebarSelection == .allInbox || sidebarSelection == .unread)
+        if !touchedInbox && (message.mailboxName == "收件箱" || isInInboxView),
+           let inboxIdx = updated.firstIndex(where: { $0.displayName == "收件箱" && $0.accountID == message.accountID }) {
+            let mb = updated[inboxIdx]
+            let nextUnread = max(0, mb.unreadCount + delta)
+            if nextUnread != mb.unreadCount {
+                updated[inboxIdx] = MailboxInfo(
+                    id: mb.id,
+                    url: mb.url,
+                    accountID: mb.accountID,
+                    displayName: mb.displayName,
+                    unreadCount: nextUnread,
+                    sortOrder: mb.sortOrder
+                )
+                changed = true
+            }
+        }
+
+        if changed {
+            mailboxes = updated
+        } else {
+            updateDockUnreadBadge()
+        }
     }
 
     func removeMessageLocally(rowID: Int64) {
         guard let idx = messages.firstIndex(where: { $0.id == rowID }) else { return }
-        messages.remove(at: idx)
+        let removed = messages.remove(at: idx)
+        if !removed.isRead {
+            adjustLocalUnreadCount(for: removed, delta: -1)
+            notificationManager.removeDeliveredNotification(for: rowID)
+        }
         if selectedMessageID == rowID {
             if idx < messages.count {
                 selectedMessageID = messages[idx].id
@@ -150,9 +211,10 @@ extension AppViewModel {
             if failed == 0 {
                 self.showToast("已批量归档 \(ids.count) 封邮件")
             } else {
-                self.reloadMessages()
                 self.showToast("批量归档完成（\(failed) 封失败）")
             }
+            try? await Task.sleep(for: .milliseconds(450))
+            self.refreshNow()
         }
     }
 
@@ -185,9 +247,10 @@ extension AppViewModel {
             if failed == 0 {
                 self.showToast("已批量删除 \(ids.count) 封邮件")
             } else {
-                self.reloadMessages()
                 self.showToast("批量删除完成（\(failed) 封失败）")
             }
+            try? await Task.sleep(for: .milliseconds(450))
+            self.refreshNow()
         }
     }
 
@@ -201,9 +264,11 @@ extension AppViewModel {
                 self.pendingRemovedIDs.remove(message.id)
                 await self.bodyIndex.deleteRowIDs([message.id])
                 self.showToast("已移入废纸篓")
+                try? await Task.sleep(for: .milliseconds(450))
+                self.refreshNow()
             } catch {
                 self.pendingRemovedIDs.remove(message.id)
-                self.reloadMessages()
+                self.refreshNow()
                 self.showToast("删除失败：\(error.localizedDescription)")
             }
         }
@@ -218,9 +283,11 @@ extension AppViewModel {
                 try await MailAppleScriptBridge.archiveMessage(rowID: message.id)
                 self.pendingRemovedIDs.remove(message.id)
                 self.showToast("已归档")
+                try? await Task.sleep(for: .milliseconds(450))
+                self.refreshNow()
             } catch {
                 self.pendingRemovedIDs.remove(message.id)
-                self.reloadMessages()
+                self.refreshNow()
                 self.showToast("归档失败：\(error.localizedDescription)")
             }
         }

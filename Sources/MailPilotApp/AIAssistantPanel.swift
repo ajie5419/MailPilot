@@ -277,6 +277,11 @@ struct AIAssistantPanel: View {
                         }
                     }
                 }
+                .onChange(of: ai.aiMessages.last?.content) { _, _ in
+                    if ai.isAIThinking, let last = ai.aiMessages.last {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                }
             }
 
             Divider()
@@ -290,15 +295,27 @@ struct AIAssistantPanel: View {
                     }
                     .disabled(ai.isAIThinking)
 
-                Button {
-                    ai.sendCustomAIQuestion()
-                } label: {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.title3)
+                if ai.isAIThinking {
+                    Button {
+                        ai.stopAIQuery()
+                    } label: {
+                        Image(systemName: "stop.circle.fill")
+                            .font(.title3)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("停止生成")
+                } else {
+                    Button {
+                        ai.sendCustomAIQuestion()
+                    } label: {
+                        Image(systemName: "arrow.up.circle.fill")
+                            .font(.title3)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
+                    .disabled(ai.aiInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(Color.accentColor)
-                .disabled(ai.aiInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || ai.isAIThinking)
             }
             .padding(10)
         }

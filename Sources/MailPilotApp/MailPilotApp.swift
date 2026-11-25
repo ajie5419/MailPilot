@@ -166,6 +166,11 @@ struct MailPilotApp: App {
                 .disabled(viewModel.selectedMessage == nil)
             }
             CommandGroup(after: .appSettings) {
+                Button("搜索邮件") {
+                    viewModel.focusSearchField()
+                }
+                .keyboardShortcut("f", modifiers: [.command])
+
                 Button("刷新邮件索引") {
                     viewModel.refreshNow()
                 }

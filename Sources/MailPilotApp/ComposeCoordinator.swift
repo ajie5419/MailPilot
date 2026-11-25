@@ -4,9 +4,11 @@ import Foundation
 #if canImport(MailPilotCore)
 import MailPilotCore
 #endif
+import UniformTypeIdentifiers
 
-/// Manages the in-app compose, reply, and forward sheet state, attachments, AI polish streaming,
-/// and delegating final send / save-draft execution to Mail.app via AppleScript.
+/// Manages the in-app compose, reply, and forward sheet state, attachments (with live preparation
+/// progress and explicit success/failure feedback), AI polish streaming, and delegating final
+/// send / save-draft execution to Mail.app via AppleScript.
 @MainActor
 final class ComposeCoordinator: ObservableObject {
     @Published var isPresented = false
@@ -22,17 +24,21 @@ final class ComposeCoordinator: ObservableObject {
 
     private let aiService = AIService()
     private var polishTask: Task<Void, Never>?
+    private var attachmentTasks: [UUID: Task<Void, Never>] = [:]
+    private var bannerDismissTask: Task<Void, Never>?
 
     func close() {
         polishTask?.cancel()
         polishTask = nil
+        cancelAllAttachmentTasks()
+        bannerDismissTask?.cancel()
+        bannerDismissTask = nil
         draft.isAIPolishing = false
         isPresented = false
     }
 
     func openNew() {
-        polishTask?.cancel()
-        polishTask = nil
+        resetTasksForNewDraft()
         draft = ComposeDraftState(
             id: UUID(),
             revision: 0,
@@ -48,8 +54,7 @@ final class ComposeCoordinator: ObservableObject {
     }
 
     func openReply(for target: MailMessageSummary, verifiedBody: String?, prefilledBody: String? = nil) {
-        polishTask?.cancel()
-        polishTask = nil
+        resetTasksForNewDraft()
         let replySubject = target.subject.lowercased().hasPrefix("re:") ? target.subject : "Re: \(target.subject)"
         let quoteHeader = "\n\n---\n在 \(target.dateReceived.formatted(date: .abbreviated, time: .shortened))，\(target.displaySender) <\(target.senderAddress)> 写道：\n"
         let quoteBody = verifiedBody.map { String($0.prefix(1200)) } ?? ""
@@ -88,8 +93,7 @@ final class ComposeCoordinator: ObservableObject {
     }
 
     func openForward(for target: MailMessageSummary, verifiedBody: String?) {
-        polishTask?.cancel()
-        polishTask = nil
+        resetTasksForNewDraft()
         let fwdSubject = target.subject.lowercased().hasPrefix("fwd:") ? target.subject : "Fwd: \(target.subject)"
         let header = """
         
@@ -129,107 +133,632 @@ final class ComposeCoordinator: ObservableObject {
         onRefreshAccountEmailsIfEmpty?()
     }
 
-    func pickAttachments() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        if panel.runModal() == .OK {
-            for url in panel.urls where !draft.attachmentURLs.contains(url) {
-                draft.attachmentURLs.append(url)
+    // MARK: - Inline Feedback Banner
+
+    func showBanner(_ banner: ComposeFeedbackBanner, autoDismissAfter seconds: Double? = nil) {
+        bannerDismissTask?.cancel()
+        bannerDismissTask = nil
+        draft.feedbackBanner = banner
+
+        if let seconds {
+            let bannerID = banner.id
+            let draftID = draft.id
+            bannerDismissTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(seconds))
+                guard !Task.isCancelled, let self else { return }
+                if self.draft.id == draftID && self.draft.feedbackBanner?.id == bannerID {
+                    self.draft.feedbackBanner = nil
+                }
             }
         }
     }
 
-    func removeAttachment(_ url: URL) {
-        draft.attachmentURLs.removeAll { $0 == url }
+    func dismissBanner() {
+        bannerDismissTask?.cancel()
+        bannerDismissTask = nil
+        draft.feedbackBanner = nil
     }
+
+    // MARK: - Attachments (Pick, Drop, Verify/Prepare with Progress, Retry, Remove)
+
+    func pickAttachments() {
+        guard !draft.isSending else { return }
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.prompt = "添加附件"
+        if panel.runModal() == .OK {
+            addAttachments(panel.urls)
+        }
+    }
+
+    func handleDroppedProviders(_ providers: [NSItemProvider]) -> Bool {
+        let fileProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard !fileProviders.isEmpty else { return false }
+
+        let draftID = draft.id
+        Task { [weak self] in
+            var urls: [URL] = []
+            for provider in fileProviders {
+                if let url = await Self.loadFileURL(from: provider) {
+                    urls.append(url)
+                }
+            }
+            guard let self, self.draft.id == draftID else { return }
+            if urls.isEmpty {
+                self.showBanner(
+                    ComposeFeedbackBanner(
+                        kind: .error,
+                        message: "无法读取拖入的文件",
+                        detail: "请尝试点击左下角「添加附件」按钮选择本地文件"
+                    )
+                )
+            } else {
+                self.addAttachments(urls)
+            }
+        }
+        return true
+    }
+
+    func addAttachments(_ urls: [URL]) {
+        guard !draft.isSending, !urls.isEmpty else { return }
+
+        var existingPaths = Set(draft.attachments.map { $0.url.standardizedFileURL.path })
+        var newItems: [ComposeAttachmentItem] = []
+        var skippedDuplicates: [String] = []
+
+        for url in urls {
+            let normalizedPath = url.standardizedFileURL.path
+            if existingPaths.contains(normalizedPath) {
+                skippedDuplicates.append(url.lastPathComponent)
+                continue
+            }
+            existingPaths.insert(normalizedPath)
+            let item = ComposeAttachmentItem(
+                id: UUID(),
+                url: url,
+                filename: url.lastPathComponent,
+                status: .preparing(progress: 0.05, detail: "准备中…"),
+                sizeBytes: nil
+            )
+            newItems.append(item)
+            draft.attachments.append(item)
+        }
+
+        if newItems.isEmpty {
+            let names = skippedDuplicates.prefix(2).joined(separator: "、")
+            showBanner(
+                ComposeFeedbackBanner(
+                    kind: .info,
+                    message: "所选附件已在列表中，无需重复添加",
+                    detail: names.isEmpty ? nil : names
+                ),
+                autoDismissAfter: 3
+            )
+            return
+        }
+
+        let draftID = draft.id
+        let batchIDs = newItems.map(\.id)
+        let skippedCount = skippedDuplicates.count
+
+        updateBatchPreparationBanner(batchIDs: batchIDs)
+
+        for item in newItems {
+            let task = Task { [weak self] in
+                guard let self else { return }
+                await self.prepareSingleAttachment(
+                    itemID: item.id,
+                    url: item.url,
+                    draftID: draftID,
+                    batchIDs: batchIDs,
+                    skippedDuplicatesCount: skippedCount
+                )
+            }
+            attachmentTasks[item.id] = task
+        }
+    }
+
+    func retryAttachment(_ id: UUID) {
+        guard !draft.isSending,
+              let idx = draft.attachments.firstIndex(where: { $0.id == id }) else { return }
+        attachmentTasks[id]?.cancel()
+        let url = draft.attachments[idx].url
+        let draftID = draft.id
+        draft.attachments[idx].status = .preparing(progress: 0.05, detail: "重试中…")
+        draft.attachments[idx].sizeBytes = nil
+
+        showBanner(
+            ComposeFeedbackBanner(
+                kind: .progress(0.05),
+                message: "正在重新准备附件「\(draft.attachments[idx].filename)」…"
+            )
+        )
+
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.prepareSingleAttachment(
+                itemID: id,
+                url: url,
+                draftID: draftID,
+                batchIDs: [id],
+                skippedDuplicatesCount: 0
+            )
+        }
+        attachmentTasks[id] = task
+    }
+
+    func removeAttachment(_ id: UUID) {
+        guard !draft.isSending else { return }
+        attachmentTasks[id]?.cancel()
+        attachmentTasks[id] = nil
+        draft.attachments.removeAll { $0.id == id }
+
+        if !draft.isPreparingAttachments && draft.failedAttachmentsCount == 0 {
+            if let kind = draft.feedbackBanner?.kind {
+                switch kind {
+                case .error, .warning, .progress:
+                    dismissBanner()
+                case .success, .info:
+                    break
+                }
+            }
+        }
+    }
+
+    private func prepareSingleAttachment(
+        itemID: UUID,
+        url: URL,
+        draftID: UUID,
+        batchIDs: [UUID],
+        skippedDuplicatesCount: Int
+    ) async {
+        defer {
+            if attachmentTasks[itemID] != nil {
+                attachmentTasks[itemID] = nil
+            }
+        }
+
+        let outcome = await Self.verifyAndReadAttachment(url: url) { [weak self] progress, detail in
+            Task { @MainActor [weak self] in
+                guard let self, self.draft.id == draftID,
+                      let idx = self.draft.attachments.firstIndex(where: { $0.id == itemID }) else { return }
+                self.draft.attachments[idx].status = .preparing(progress: progress, detail: detail)
+                self.updateBatchPreparationBanner(batchIDs: batchIDs)
+            }
+        }
+
+        guard !Task.isCancelled, draft.id == draftID,
+              let idx = draft.attachments.firstIndex(where: { $0.id == itemID }) else { return }
+
+        switch outcome {
+        case .success(let sizeBytes):
+            draft.attachments[idx].sizeBytes = sizeBytes
+            draft.attachments[idx].status = .ready(sizeBytes: sizeBytes)
+        case .failure(let reason):
+            draft.attachments[idx].sizeBytes = nil
+            draft.attachments[idx].status = .failed(reason: reason)
+        }
+
+        // If any items in this batch are still preparing, keep updating overall progress;
+        // once all surviving batch items settle, display the clear final success/failure summary.
+        let batchItems = draft.attachments.filter { batchIDs.contains($0.id) }
+        if batchItems.contains(where: { $0.status.isPreparing }) {
+            updateBatchPreparationBanner(batchIDs: batchIDs)
+            return
+        }
+
+        finalizeBatchPreparationBanner(batchItems: batchItems, skippedDuplicatesCount: skippedDuplicatesCount)
+    }
+
+    private func updateBatchPreparationBanner(batchIDs: [UUID]) {
+        let batchItems = draft.attachments.filter { batchIDs.contains($0.id) }
+        guard !batchItems.isEmpty else { return }
+
+        var progressSum: Double = 0
+        var activeName: String?
+        for item in batchItems {
+            switch item.status {
+            case .preparing(let p, _):
+                progressSum += p
+                if activeName == nil { activeName = item.filename }
+            case .ready, .attaching, .attached, .failed:
+                progressSum += 1.0
+            }
+        }
+        let overall = progressSum / Double(batchItems.count)
+        let doneCount = batchItems.filter { !$0.status.isPreparing }.count
+        let pct = Int((overall * 100).rounded())
+        let message: String
+        if batchItems.count == 1, let name = activeName {
+            message = "正在准备附件「\(name)」（\(pct)%）"
+        } else {
+            message = "正在准备附件（\(doneCount)/\(batchItems.count) · \(pct)%）"
+        }
+        showBanner(ComposeFeedbackBanner(kind: .progress(overall), message: message, detail: activeName))
+    }
+
+    private func finalizeBatchPreparationBanner(batchItems: [ComposeAttachmentItem], skippedDuplicatesCount: Int) {
+        guard !batchItems.isEmpty else {
+            dismissBanner()
+            return
+        }
+
+        let succeeded = batchItems.filter { $0.status.isReady }
+        let failed = batchItems.filter { $0.status.failureReason != nil }
+        let batchBytes = succeeded.reduce(Int64(0)) { $0 + ($1.sizeBytes ?? 0) }
+        let batchSizeText = ByteCountFormatter.string(fromByteCount: batchBytes, countStyle: .file)
+        let dupNote = skippedDuplicatesCount > 0 ? "（已跳过 \(skippedDuplicatesCount) 个重复文件）" : ""
+
+        if failed.isEmpty {
+            if draft.exceedsRecommendedAttachmentLimit {
+                showBanner(
+                    ComposeFeedbackBanner(
+                        kind: .warning,
+                        message: "已添加 \(succeeded.count) 个附件（本次 \(batchSizeText)）\(dupNote)",
+                        detail: "当前附件总大小 \(draft.formattedTotalAttachmentSize)，超过 25 MB 可能被部分邮箱拒收"
+                    )
+                )
+            } else {
+                let singleName = succeeded.count == 1 ? "「\(succeeded[0].filename)」" : "\(succeeded.count) 个附件"
+                showBanner(
+                    ComposeFeedbackBanner(
+                        kind: .success,
+                        message: "已成功添加\(singleName)（\(batchSizeText)）\(dupNote)"
+                    ),
+                    autoDismissAfter: 4
+                )
+            }
+        } else if !succeeded.isEmpty {
+            let firstErr = failed[0]
+            let reason = firstErr.status.failureReason ?? "读取失败"
+            showBanner(
+                ComposeFeedbackBanner(
+                    kind: .warning,
+                    message: "成功添加 \(succeeded.count) 个附件，\(failed.count) 个失败",
+                    detail: "「\(firstErr.filename)」：\(reason)"
+                )
+            )
+        } else {
+            let firstErr = failed[0]
+            let reason = firstErr.status.failureReason ?? "读取失败"
+            let title = failed.count == 1
+                ? "添加附件「\(firstErr.filename)」失败"
+                : "\(failed.count) 个附件添加失败"
+            showBanner(
+                ComposeFeedbackBanner(
+                    kind: .error,
+                    message: title,
+                    detail: reason
+                )
+            )
+        }
+    }
+
+    private enum AttachmentPrepOutcome: Sendable {
+        case success(Int64)
+        case failure(String)
+    }
+
+    /// Runs off the main actor: validates file existence, handles iCloud Drive cloud-only downloads,
+    /// and verifies readability in bounded 512 KiB chunks with live progress reporting.
+    private nonisolated static func verifyAndReadAttachment(
+        url: URL,
+        onProgress: @escaping @Sendable (Double, String) -> Void
+    ) async -> AttachmentPrepOutcome {
+        await Task.detached(priority: .userInitiated) {
+            let fm = FileManager.default
+            var isDir: ObjCBool = false
+            if !fm.fileExists(atPath: url.path, isDirectory: &isDir) {
+                return .failure("文件不存在或已被移动")
+            }
+            if isDir.boolValue {
+                return .failure("不支持直接添加文件夹，请压缩为 ZIP 后添加")
+            }
+
+            // Trigger iCloud Drive download if the file is cloud-only (ubiquitous item not yet local).
+            if let values = try? url.resourceValues(forKeys: [
+                .isUbiquitousItemKey,
+                .ubiquitousItemDownloadingStatusKey,
+                .ubiquitousItemDownloadingErrorKey
+            ]), values.isUbiquitousItem == true,
+               values.ubiquitousItemDownloadingStatus != .current {
+                onProgress(0.1, "iCloud 下载中…")
+                do {
+                    try fm.startDownloadingUbiquitousItem(at: url)
+                } catch {
+                    return .failure("无法从 iCloud 下载：\(error.localizedDescription)")
+                }
+
+                let deadline = Date().addingTimeInterval(60)
+                var waitTick = 0
+                while Date() < deadline {
+                    if Task.isCancelled { return .failure("已取消") }
+                    try? await Task.sleep(for: .milliseconds(250))
+                    waitTick += 1
+                    let current = try? url.resourceValues(forKeys: [
+                        .ubiquitousItemDownloadingStatusKey,
+                        .ubiquitousItemDownloadingErrorKey
+                    ])
+                    if let dlErr = current?.ubiquitousItemDownloadingError {
+                        return .failure("iCloud 下载失败：\(dlErr.localizedDescription)")
+                    }
+                    if current?.ubiquitousItemDownloadingStatus == .current {
+                        break
+                    }
+                    let simulated = min(0.55, 0.12 + Double(waitTick) * 0.02)
+                    onProgress(simulated, "iCloud 下载中…")
+                }
+                let finalStatus = (try? url.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]))?.ubiquitousItemDownloadingStatus
+                if finalStatus != .current {
+                    return .failure("iCloud 下载超时，请在访达中下载完成后重试")
+                }
+            }
+
+            if Task.isCancelled { return .failure("已取消") }
+
+            guard fm.isReadableFile(atPath: url.path) else {
+                return .failure("无读取权限，请检查文件权限")
+            }
+
+            let fileSize: Int64
+            do {
+                let attrs = try fm.attributesOfItem(atPath: url.path)
+                fileSize = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+            } catch {
+                return .failure("无法读取文件信息：\(error.localizedDescription)")
+            }
+
+            // Stream-verify file readability in 512 KiB chunks (low constant RAM, real I/O progress).
+            do {
+                let handle = try FileHandle(forReadingFrom: url)
+                defer { try? handle.close() }
+
+                let chunkSize = 512 * 1024
+                var bytesRead: Int64 = 0
+                var lastReportedProgress: Double = 0.05
+                var lastReportTime = Date.distantPast
+
+                while true {
+                    if Task.isCancelled { return .failure("已取消") }
+                    let chunk = try handle.read(upToCount: chunkSize)
+                    guard let chunk, !chunk.isEmpty else { break }
+                    bytesRead += Int64(chunk.count)
+
+                    if fileSize > 0 {
+                        let ratio = min(0.98, 0.10 + (Double(bytesRead) / Double(fileSize)) * 0.88)
+                        let now = Date()
+                        if ratio - lastReportedProgress >= 0.05 || now.timeIntervalSince(lastReportTime) >= 0.08 {
+                            lastReportedProgress = ratio
+                            lastReportTime = now
+                            onProgress(ratio, "校验读取中…")
+                        }
+                    }
+                }
+                onProgress(1.0, "校验完成")
+                return .success(max(fileSize, bytesRead))
+            } catch {
+                return .failure("文件读取失败：\(error.localizedDescription)")
+            }
+        }.value
+    }
+
+    private nonisolated static func loadFileURL(from provider: NSItemProvider) async -> URL? {
+        await withCheckedContinuation { continuation in
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
+                    continuation.resume(returning: url)
+                } else if let url = item as? URL {
+                    continuation.resume(returning: url)
+                } else if let str = item as? String, let url = URL(string: str) {
+                    continuation.resume(returning: url)
+                } else {
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
+    }
+
+    // MARK: - Send & Save Draft
 
     func sendMail() {
         guard !draft.isSending else { return }
+        if draft.isPreparingAttachments {
+            showBanner(
+                ComposeFeedbackBanner(kind: .info, message: "附件仍在准备中，请等待完成后发送"),
+                autoDismissAfter: 3
+            )
+            return
+        }
+        if draft.failedAttachmentsCount > 0 {
+            showBanner(
+                ComposeFeedbackBanner(
+                    kind: .error,
+                    message: "存在 \(draft.failedAttachmentsCount) 个加载失败的附件",
+                    detail: "请点击附件上的刷新按钮重试，或移除失败附件后再发送"
+                )
+            )
+            return
+        }
         let toList = parseEmailList(draft.toText)
         guard !toList.isEmpty else {
-            onShowToast?("请填写至少一个收件人邮箱")
+            showBanner(
+                ComposeFeedbackBanner(kind: .warning, message: "请填写至少一个收件人邮箱"),
+                autoDismissAfter: 3
+            )
             return
         }
         if (accountEmailsCount?() ?? 0) > 0 &&
             draft.fromEmail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
             draft.missingOriginAccountWarning != nil {
-            onShowToast?("请先选择发件账号再发送")
+            showBanner(
+                ComposeFeedbackBanner(kind: .warning, message: "请先选择发件账号再发送"),
+                autoDismissAfter: 3
+            )
             return
         }
-        let ccList = parseEmailList(draft.ccText)
-        polishTask?.cancel()
-        polishTask = nil
-        draft.isAIPolishing = false
-        let currentDraft = draft
-        let draftID = currentDraft.id
-        draft.isSending = true
-
-        let senderHeader = formattedSenderHeader?(currentDraft.fromEmail)
-
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await MailAppleScriptBridge.sendMessage(
-                    from: senderHeader,
-                    to: toList,
-                    cc: ccList,
-                    subject: currentDraft.subject.isEmpty ? "(无主题)" : currentDraft.subject,
-                    body: currentDraft.body,
-                    attachmentURLs: currentDraft.attachmentURLs
-                )
-                if self.draft.id == draftID {
-                    self.draft.isSending = false
-                    self.isPresented = false
-                }
-                self.onShowToast?("已交给系统 Mail.app 发送")
-            } catch {
-                if self.draft.id == draftID {
-                    self.draft.isSending = false
-                }
-                self.onShowToast?("发送失败（草稿已保留）：\(error.localizedDescription)")
-            }
-        }
+        dispatchToMailApp(toList: toList, shouldSend: true)
     }
 
     func saveDraft() {
         guard !draft.isSending else { return }
+        if draft.isPreparingAttachments {
+            showBanner(
+                ComposeFeedbackBanner(kind: .info, message: "附件仍在准备中，请等待完成后再保存草稿"),
+                autoDismissAfter: 3
+            )
+            return
+        }
+        if draft.failedAttachmentsCount > 0 {
+            showBanner(
+                ComposeFeedbackBanner(
+                    kind: .error,
+                    message: "存在 \(draft.failedAttachmentsCount) 个加载失败的附件",
+                    detail: "请先重试或移除失败附件后再保存草稿"
+                )
+            )
+            return
+        }
         let toList = parseEmailList(draft.toText)
+        dispatchToMailApp(toList: toList, shouldSend: false)
+    }
+
+    private func dispatchToMailApp(toList: [String], shouldSend: Bool) {
         let ccList = parseEmailList(draft.ccText)
         polishTask?.cancel()
         polishTask = nil
         draft.isAIPolishing = false
+
+        // Re-verify attachments still exist on disk before handing off to Mail.app.
+        var missingIndex: Int?
+        for idx in draft.attachments.indices {
+            let url = draft.attachments[idx].url
+            if !FileManager.default.fileExists(atPath: url.path) {
+                draft.attachments[idx].status = .failed(reason: "文件已被移动或删除")
+                if missingIndex == nil { missingIndex = idx }
+            } else if !FileManager.default.isReadableFile(atPath: url.path) {
+                draft.attachments[idx].status = .failed(reason: "无读取权限")
+                if missingIndex == nil { missingIndex = idx }
+            }
+        }
+        if let missingIndex {
+            let item = draft.attachments[missingIndex]
+            showBanner(
+                ComposeFeedbackBanner(
+                    kind: .error,
+                    message: "附件「\(item.filename)」无法发送",
+                    detail: item.status.failureReason ?? "请重新添加该附件"
+                )
+            )
+            return
+        }
+
         let currentDraft = draft
         let draftID = currentDraft.id
-        draft.isSending = true
-
+        let attachmentItems = currentDraft.attachments
+        let attachmentURLs = attachmentItems.map(\.url)
         let senderHeader = formattedSenderHeader?(currentDraft.fromEmail)
+
+        draft.isSending = true
+        if !attachmentURLs.isEmpty {
+            draft.sendPhaseLabel = shouldSend ? "附加并发送..." : "附加并保存..."
+            for idx in draft.attachments.indices {
+                draft.attachments[idx].status = .attaching
+            }
+            showBanner(
+                ComposeFeedbackBanner(
+                    kind: .progress(nil),
+                    message: shouldSend
+                        ? "正在将 \(attachmentURLs.count) 个附件（\(currentDraft.formattedTotalAttachmentSize)）交给系统 Mail.app 发送…"
+                        : "正在将 \(attachmentURLs.count) 个附件（\(currentDraft.formattedTotalAttachmentSize)）保存至草稿箱…",
+                    detail: "大附件可能需要数秒，请勿关闭窗口"
+                )
+            )
+        } else {
+            draft.sendPhaseLabel = shouldSend ? "发送中..." : "保存中..."
+            showBanner(
+                ComposeFeedbackBanner(
+                    kind: .progress(nil),
+                    message: shouldSend ? "正在交给系统 Mail.app 发送…" : "正在保存至草稿箱…"
+                )
+            )
+        }
 
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await MailAppleScriptBridge.saveDraft(
-                    from: senderHeader,
-                    to: toList,
-                    cc: ccList,
-                    subject: currentDraft.subject.isEmpty ? "(无主题)" : currentDraft.subject,
-                    body: currentDraft.body,
-                    attachmentURLs: currentDraft.attachmentURLs
-                )
+                if shouldSend {
+                    try await MailAppleScriptBridge.sendMessage(
+                        from: senderHeader,
+                        to: toList,
+                        cc: ccList,
+                        subject: currentDraft.subject.isEmpty ? "(无主题)" : currentDraft.subject,
+                        body: currentDraft.body,
+                        attachmentURLs: attachmentURLs
+                    )
+                } else {
+                    try await MailAppleScriptBridge.saveDraft(
+                        from: senderHeader,
+                        to: toList,
+                        cc: ccList,
+                        subject: currentDraft.subject.isEmpty ? "(无主题)" : currentDraft.subject,
+                        body: currentDraft.body,
+                        attachmentURLs: attachmentURLs
+                    )
+                }
                 if self.draft.id == draftID {
+                    for idx in self.draft.attachments.indices {
+                        self.draft.attachments[idx].status = .attached
+                    }
                     self.draft.isSending = false
+                    self.draft.sendPhaseLabel = nil
+                    self.dismissBanner()
                     self.isPresented = false
                 }
-                self.onShowToast?("已保存至草稿箱")
+                let attachNote = attachmentURLs.isEmpty ? "" : "（含 \(attachmentURLs.count) 个附件）"
+                self.onShowToast?(shouldSend ? "已交给系统 Mail.app 发送\(attachNote)" : "已保存至草稿箱\(attachNote)")
+            } catch let attachErr as MailComposeAttachmentError {
+                if self.draft.id == draftID {
+                    self.restoreAttachingStatuses(failedIndex: attachErr.attachmentIndex, reason: attachErr.shortReason)
+                    self.draft.isSending = false
+                    self.draft.sendPhaseLabel = nil
+                    self.showBanner(
+                        ComposeFeedbackBanner(
+                            kind: .error,
+                            message: shouldSend ? "附件附加失败，邮件未发送" : "附件附加失败，草稿未保存",
+                            detail: attachErr.localizedDescription
+                        )
+                    )
+                }
             } catch {
                 if self.draft.id == draftID {
+                    self.restoreAttachingStatuses(failedIndex: nil, reason: nil)
                     self.draft.isSending = false
+                    self.draft.sendPhaseLabel = nil
+                    self.showBanner(
+                        ComposeFeedbackBanner(
+                            kind: .error,
+                            message: shouldSend ? "发送失败（草稿内容已保留）" : "保存草稿失败",
+                            detail: error.localizedDescription
+                        )
+                    )
                 }
-                self.onShowToast?("保存草稿失败：\(error.localizedDescription)")
             }
         }
     }
+
+    private func restoreAttachingStatuses(failedIndex: Int?, reason: String?) {
+        for idx in draft.attachments.indices {
+            if let failedIndex, idx == failedIndex {
+                draft.attachments[idx].status = .failed(reason: reason ?? "添加附件失败")
+            } else if draft.attachments[idx].status.isAttaching {
+                draft.attachments[idx].status = .ready(sizeBytes: draft.attachments[idx].sizeBytes ?? 0)
+            }
+        }
+    }
+
+    // MARK: - AI Polish
 
     func polishBodyWithAI() {
         guard !draft.isSending, let configSnapshot = currentAIConfig?() else { return }
@@ -270,7 +799,13 @@ final class ComposeCoordinator: ObservableObject {
             } catch {
                 if !Task.isCancelled, self.draft.id == draftID {
                     self.draft.pendingAIPolish = nil
-                    self.onShowToast?("AI 润色失败：\(error.localizedDescription)")
+                    self.showBanner(
+                        ComposeFeedbackBanner(
+                            kind: .error,
+                            message: "AI 润色失败",
+                            detail: error.localizedDescription
+                        )
+                    )
                 }
             }
             if self.draft.id == draftID {
@@ -291,7 +826,10 @@ final class ComposeCoordinator: ObservableObject {
         draft.revision += 1
         draft.pendingAIPolish = nil
         draft.polishBaseRevision = nil
-        onShowToast?("已采纳 AI 润色内容")
+        showBanner(
+            ComposeFeedbackBanner(kind: .success, message: "已采纳 AI 润色内容"),
+            autoDismissAfter: 3
+        )
     }
 
     func discardPendingAIPolish() {
@@ -300,6 +838,23 @@ final class ComposeCoordinator: ObservableObject {
         draft.isAIPolishing = false
         draft.pendingAIPolish = nil
         draft.polishBaseRevision = nil
+    }
+
+    // MARK: - Helpers
+
+    private func resetTasksForNewDraft() {
+        polishTask?.cancel()
+        polishTask = nil
+        cancelAllAttachmentTasks()
+        bannerDismissTask?.cancel()
+        bannerDismissTask = nil
+    }
+
+    private func cancelAllAttachmentTasks() {
+        for (_, task) in attachmentTasks {
+            task.cancel()
+        }
+        attachmentTasks.removeAll()
     }
 
     private func parseEmailList(_ raw: String) -> [String] {

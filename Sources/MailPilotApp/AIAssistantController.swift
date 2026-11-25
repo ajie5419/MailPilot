@@ -498,6 +498,18 @@ final class AIAssistantController: ObservableObject {
         }
     }
 
+    func stopInlineSummary() {
+        inlineSummaryTask?.cancel()
+        inlineSummaryTask = nil
+        isInlineSummarizing = false
+    }
+
+    func stopAIQuery() {
+        aiQueryTask?.cancel()
+        aiQueryTask = nil
+        isAIThinking = false
+    }
+
     func continueInlineSummaryInDrawer() {
         if !inlineSummaryText.isEmpty
             && !inlineSummaryText.hasPrefix("总结失败：")

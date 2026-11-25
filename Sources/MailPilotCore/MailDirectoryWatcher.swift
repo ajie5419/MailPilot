@@ -2,19 +2,37 @@ import CoreServices
 import Darwin
 import Foundation
 
-/// Watches Apple Mail's `MailData` directory via both:
+/// Watches Apple Mail's `MailData` directory via three complementary mechanisms:
 /// 1. Kernel `kqueue` (`O_EVTONLY` vnode sources) on `Envelope Index-wal` and `Envelope Index`
 ///    for sub-second notification of SQLite WAL writes even while Mail.app holds the fd open.
 /// 2. Unfiltered macOS FSEvents on `MailData` so directory-level / sibling file updates never get missed
 ///    and recreated WAL files are automatically re-attached.
+/// 3. Lightweight `stat()` signature polling (every 8s, 0 SQLite queries when unchanged) on
+///    `Envelope Index`, `Envelope Index-wal`, and `Envelope Index-shm` as a safety net against
+///    `mmap`-only writes or App Nap FSEvent coalescing.
 public final class MailDirectoryWatcher: @unchecked Sendable {
+    private struct FileSignature: Equatable {
+        let inode: UInt64
+        let size: Int64
+        let mtimeSec: Int
+        let mtimeNsec: Int
+    }
+
+    private struct DirectorySnapshot: Equatable {
+        let db: FileSignature?
+        let wal: FileSignature?
+        let shm: FileSignature?
+    }
+
     private let directoryURL: URL
     private let queue = DispatchQueue(label: "com.mailpilot.fsevents", qos: .utility)
     private let stateLock = NSLock()
     private var streamRef: FSEventStreamRef?
     private var walSource: DispatchSourceFileSystemObject?
     private var dbSource: DispatchSourceFileSystemObject?
+    private var fallbackTimer: DispatchSourceTimer?
     private var debounceWorkItem: DispatchWorkItem?
+    private var lastSnapshot: DirectorySnapshot?
     private var isStopped = false
     private let onChange: @Sendable () -> Void
 
@@ -37,6 +55,8 @@ public final class MailDirectoryWatcher: @unchecked Sendable {
         walSource = nil
         let db = dbSource
         dbSource = nil
+        let timer = fallbackTimer
+        fallbackTimer = nil
         let stream = streamRef
         streamRef = nil
         stateLock.unlock()
@@ -44,6 +64,7 @@ public final class MailDirectoryWatcher: @unchecked Sendable {
         workItem?.cancel()
         wal?.cancel()
         db?.cancel()
+        timer?.cancel()
         if let stream {
             FSEventStreamStop(stream)
             FSEventStreamInvalidate(stream)
@@ -52,7 +73,13 @@ public final class MailDirectoryWatcher: @unchecked Sendable {
     }
 
     private func startWatching() {
+        let initialSnapshot = captureSnapshot()
+        stateLock.lock()
+        lastSnapshot = initialSnapshot
+        stateLock.unlock()
+
         attachVnodeWatchers()
+        startFallbackStatTimer()
 
         let pathsToWatch = [directoryURL.path] as CFArray
         var context = FSEventStreamContext(
@@ -100,7 +127,81 @@ public final class MailDirectoryWatcher: @unchecked Sendable {
         stateLock.unlock()
     }
 
+    private func startFallbackStatTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .seconds(8), repeating: .seconds(8), leeway: .seconds(2))
+        timer.setEventHandler { [weak self] in
+            self?.checkSnapshotFallback()
+        }
+
+        stateLock.lock()
+        if isStopped {
+            stateLock.unlock()
+            timer.cancel()
+            return
+        }
+        fallbackTimer = timer
+        stateLock.unlock()
+
+        timer.resume()
+    }
+
+    private func checkSnapshotFallback() {
+        let current = captureSnapshot()
+        stateLock.lock()
+        let stopped = isStopped
+        let previous = lastSnapshot
+        let walInodeChanged = current.wal?.inode != previous?.wal?.inode
+        let dbInodeChanged = current.db?.inode != previous?.db?.inode
+        let changed = (previous != nil && current != previous)
+        if !stopped {
+            lastSnapshot = current
+        }
+        stateLock.unlock()
+
+        guard !stopped else { return }
+        if walInodeChanged {
+            reattachVnodeWatcher(fileName: "Envelope Index-wal", isWal: true)
+        } else {
+            attachVnodeWatchersIfNeeded()
+        }
+        if dbInodeChanged {
+            reattachVnodeWatcher(fileName: "Envelope Index", isWal: false)
+        }
+        if changed {
+            scheduleNotify()
+        }
+    }
+
+    private func captureSnapshot() -> DirectorySnapshot {
+        DirectorySnapshot(
+            db: statSignature(fileName: "Envelope Index"),
+            wal: statSignature(fileName: "Envelope Index-wal"),
+            shm: statSignature(fileName: "Envelope Index-shm")
+        )
+    }
+
+    private func statSignature(fileName: String) -> FileSignature? {
+        let path = directoryURL.appendingPathComponent(fileName).path
+        var info = stat()
+        guard stat(path, &info) == 0 else { return nil }
+        return FileSignature(
+            inode: UInt64(info.st_ino),
+            size: Int64(info.st_size),
+            mtimeSec: info.st_mtimespec.tv_sec,
+            mtimeNsec: info.st_mtimespec.tv_nsec
+        )
+    }
+
     private func handleFSEvent() {
+        // Keep snapshot updated so fallback poll does not re-fire redundantly for events already handled.
+        let current = captureSnapshot()
+        stateLock.lock()
+        if !isStopped {
+            lastSnapshot = current
+        }
+        stateLock.unlock()
+
         // If Mail.app just created/recreated `Envelope Index-wal`, ensure our kqueue vnode watcher is attached.
         attachVnodeWatchersIfNeeded()
         scheduleNotify()
@@ -141,6 +242,13 @@ public final class MailDirectoryWatcher: @unchecked Sendable {
         source.setEventHandler { [weak self] in
             guard let self else { return }
             let flags = source.data
+            let current = self.captureSnapshot()
+            self.stateLock.lock()
+            if !self.isStopped {
+                self.lastSnapshot = current
+            }
+            self.stateLock.unlock()
+
             self.scheduleNotify()
             if flags.contains(.delete) || flags.contains(.rename) || flags.contains(.revoke) {
                 self.reattachVnodeWatcher(fileName: fileName, isWal: isWal)

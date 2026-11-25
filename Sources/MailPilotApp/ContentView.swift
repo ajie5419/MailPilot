@@ -7,6 +7,7 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var viewModel: AppViewModel
     @FocusState private var isMessageListFocused: Bool
+    @FocusState private var isSearchFieldFocused: Bool
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -228,21 +229,6 @@ struct ContentView: View {
                 }
             }
         }
-        .safeAreaInset(edge: .bottom) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(viewModel.isWatchingLive ? Color.green : Color.orange)
-                    .frame(width: 7, height: 7)
-                Text(viewModel.statusText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer()
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.bar)
-        }
     }
 
     private var messageListView: some View {
@@ -251,9 +237,18 @@ struct ContentView: View {
                 Image(systemName: "magnifyingglass")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                TextField("搜索主题、发件人或正文", text: $viewModel.searchQuery)
+                TextField(viewModel.searchScopePlaceholder, text: $viewModel.searchQuery)
                     .textFieldStyle(.plain)
                     .font(.callout)
+                    .focused($isSearchFieldFocused)
+                    .onKeyPress(.escape) {
+                        if !viewModel.searchQuery.isEmpty {
+                            viewModel.searchQuery = ""
+                        }
+                        isSearchFieldFocused = false
+                        isMessageListFocused = true
+                        return .handled
+                    }
                 if !viewModel.searchQuery.isEmpty {
                     Button {
                         viewModel.searchQuery = ""
@@ -263,6 +258,14 @@ struct ContentView: View {
                             .foregroundStyle(.tertiary)
                     }
                     .buttonStyle(.plain)
+                    .help("清空搜索（Esc）")
+                } else if !isSearchFieldFocused {
+                    Text("⌘F")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 4.5)
+                        .padding(.vertical, 1.5)
+                        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
                 }
             }
             .padding(.horizontal, 10)
@@ -270,6 +273,9 @@ struct ContentView: View {
             .background(.quaternary.opacity(0.65), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
+            .onChange(of: viewModel.searchFocusTrigger) { _, _ in
+                isSearchFieldFocused = true
+            }
 
             Divider()
 
@@ -352,6 +358,17 @@ struct ContentView: View {
                     moveMessageSelection(by: 1, scrollProxy: scrollProxy)
                     return .handled
                 }
+                .onKeyPress(.escape) {
+                    if viewModel.selectedMessageIDs.count > 1 {
+                        viewModel.clearMultiSelection()
+                        return .handled
+                    }
+                    if !viewModel.searchQuery.isEmpty {
+                        viewModel.searchQuery = ""
+                        return .handled
+                    }
+                    return .ignored
+                }
             }
             .background(Color(nsColor: .textBackgroundColor))
             .overlay {
@@ -363,6 +380,22 @@ struct ContentView: View {
                     )
                 }
             }
+
+            Divider()
+
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(viewModel.isWatchingLive ? Color.green : Color.orange)
+                    .frame(width: 6.5, height: 6.5)
+                Text(viewModel.statusText)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.bar.opacity(0.65))
         }
     }
 
