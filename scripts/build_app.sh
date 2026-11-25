@@ -104,9 +104,11 @@ PLIST
 ICON_CACHE="$DIST_DIR/MailPilotCrane.icns"
 if [[ ! -f "$ICON_CACHE" || "$ROOT_DIR/scripts/generate_icon.swift" -nt "$ICON_CACHE" ]]; then
   echo "Generating MailPilotCrane.icns..."
-  ICON_GEN_BIN="${TMPDIR:-/tmp}/mailpilot-generate-icon"
-  ICONSET_DIR="${TMPDIR:-/tmp}/MailPilot.iconset"
-  rm -rf "$ICONSET_DIR"
+  ICON_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mailpilot-icon.XXXXXX")"
+  trap 'rm -rf "${ICON_TMP_DIR:-}"' EXIT
+  ICON_GEN_BIN="$ICON_TMP_DIR/mailpilot-generate-icon"
+  ICONSET_DIR="$ICON_TMP_DIR/MailPilot.iconset"
+  ICON_OUT="$ICON_TMP_DIR/MailPilotCrane.icns"
   swiftc \
     -target arm64-apple-macosx14.0 \
     -module-cache-path "$MODULE_CACHE" \
@@ -114,10 +116,11 @@ if [[ ! -f "$ICON_CACHE" || "$ROOT_DIR/scripts/generate_icon.swift" -nt "$ICON_C
     -o "$ICON_GEN_BIN" \
     "$ROOT_DIR/scripts/generate_icon.swift"
   "$ICON_GEN_BIN" --iconset "$ICONSET_DIR"
-  if ! iconutil --convert icns "$ICONSET_DIR" -o "$ICON_CACHE"; then
-    "$ICON_GEN_BIN" "$ICON_CACHE"
+  if ! iconutil --convert icns "$ICONSET_DIR" -o "$ICON_OUT"; then
+    "$ICON_GEN_BIN" "$ICON_OUT"
   fi
-  rm -rf "$ICONSET_DIR" "$ICON_GEN_BIN"
+  mv "$ICON_OUT" "$ICON_CACHE"
+  rm -rf "$ICON_TMP_DIR"
 fi
 cp "$ICON_CACHE" "$RESOURCES_DIR/MailPilotCrane.icns"
 
@@ -142,7 +145,7 @@ fi
 rm -rf "$APP_BUNDLE"
 mv "$STAGING_BUNDLE" "$APP_BUNDLE"
 
-# Refresh macOS LaunchServices icon registration so Finder & Notification Center pick up AppIcon.icns
+# Refresh macOS LaunchServices icon registration so Finder & Notification Center pick up MailPilotCrane.icns
 touch "$APP_BUNDLE"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 if [[ -x "$LSREGISTER" ]]; then

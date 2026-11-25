@@ -163,11 +163,11 @@ struct MessageRowView: View, Equatable {
 
     private static func subtleTagColor(_ tag: MailSmartTag) -> Color {
         switch tag {
-        case .verification: return Color(red: 0.44, green: 0.42, blue: 0.80)
-        case .billing: return Color(red: 0.72, green: 0.54, blue: 0.18)
-        case .orderLogistics: return Color(red: 0.76, green: 0.44, blue: 0.24)
-        case .meeting: return Color(red: 0.24, green: 0.50, blue: 0.82)
-        case .promotion: return Color(red: 0.64, green: 0.36, blue: 0.54)
+        case .verification: return Color(red: 0.36, green: 0.32, blue: 0.76)
+        case .billing: return Color(red: 0.56, green: 0.38, blue: 0.04)
+        case .orderLogistics: return Color(red: 0.66, green: 0.28, blue: 0.10)
+        case .meeting: return Color(red: 0.14, green: 0.42, blue: 0.76)
+        case .promotion: return Color(red: 0.58, green: 0.22, blue: 0.44)
         case .notification: return .secondary
         }
     }

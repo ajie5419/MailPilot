@@ -11,6 +11,7 @@ extension AppViewModel {
         guard let idx = messages.firstIndex(where: { $0.id == rowID }) else { return }
         let old = messages[idx]
         guard old.isRead != isRead else { return }
+        localListMutationVersion &+= 1
         messages[idx] = MailMessageSummary(
             id: old.id,
             messageIDHeader: old.messageIDHeader,
@@ -84,6 +85,7 @@ extension AppViewModel {
 
     func removeMessageLocally(rowID: Int64) {
         guard let idx = messages.firstIndex(where: { $0.id == rowID }) else { return }
+        localListMutationVersion &+= 1
         let removed = messages.remove(at: idx)
         if !removed.isRead {
             adjustLocalUnreadCount(for: removed, delta: -1)
@@ -113,16 +115,24 @@ extension AppViewModel {
 
     func toggleReadStatus(for message: MailMessageSummary) {
         let nextState = !message.isRead
+        pendingReadOverrides[message.id] = nextState
         updateLocalReadState(rowID: message.id, isRead: nextState)
-        Task {
+        Task { [weak self] in
+            guard let self else { return }
             do {
                 try await MailAppleScriptBridge.setReadStatus(rowID: message.id, isRead: nextState)
-                showToast(nextState ? "已标记为已读" : "已标记为未读")
+                self.showToast(nextState ? "已标记为已读" : "已标记为未读")
                 try? await Task.sleep(for: .milliseconds(400))
-                refreshNow()
+                if self.pendingReadOverrides[message.id] == nextState {
+                    self.pendingReadOverrides.removeValue(forKey: message.id)
+                }
+                self.refreshNow()
             } catch {
-                updateLocalReadState(rowID: message.id, isRead: message.isRead)
-                showToast(error.localizedDescription)
+                if self.pendingReadOverrides[message.id] == nextState {
+                    self.pendingReadOverrides.removeValue(forKey: message.id)
+                }
+                self.updateLocalReadState(rowID: message.id, isRead: message.isRead)
+                self.showToast(error.localizedDescription)
             }
         }
     }
@@ -165,6 +175,7 @@ extension AppViewModel {
         let targets = messages.filter { selectedMessageIDs.contains($0.id) }
         guard !targets.isEmpty else { return }
         for msg in targets {
+            pendingReadOverrides[msg.id] = isRead
             updateLocalReadState(rowID: msg.id, isRead: isRead)
         }
         let ids = targets.map(\.id)
@@ -176,6 +187,9 @@ extension AppViewModel {
                     try await MailAppleScriptBridge.setReadStatus(rowID: id, isRead: isRead)
                 } catch {
                     failed += 1
+                }
+                if self.pendingReadOverrides[id] == isRead {
+                    self.pendingReadOverrides.removeValue(forKey: id)
                 }
             }
             if failed == 0 {

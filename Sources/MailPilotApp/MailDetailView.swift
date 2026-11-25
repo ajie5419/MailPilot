@@ -10,6 +10,7 @@ struct MailDetailView: View {
     @ObservedObject var viewModel: AppViewModel
     @ObservedObject var ai: AIAssistantController
     @StateObject private var recipientExpandState = RecipientExpandState()
+    @StateObject private var inlineCardHeightState = InlineCardHeightState()
 
     init(viewModel: AppViewModel) {
         self._viewModel = ObservedObject(wrappedValue: viewModel)
@@ -610,6 +611,7 @@ struct MailDetailView: View {
                     }
                     .buttonStyle(.borderless)
                     .help(isTranslation ? "重新翻译" : "重新生成摘要")
+                    .accessibilityLabel(isTranslation ? "重新翻译" : "重新生成摘要")
 
                     Button {
                         viewModel.copyToClipboard(
@@ -623,11 +625,11 @@ struct MailDetailView: View {
                     }
                     .buttonStyle(.borderless)
                     .help(isTranslation ? "复制译文" : "复制摘要")
+                    .accessibilityLabel(isTranslation ? "复制译文" : "复制摘要")
                 }
 
                 Button {
-                    ai.stopInlineSummary()
-                    ai.showInlineSummary = false
+                    ai.closeInlineCard()
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 10, weight: .semibold))
@@ -637,6 +639,7 @@ struct MailDetailView: View {
                 }
                 .buttonStyle(.plain)
                 .help(isTranslation ? "收起译文" : "收起摘要")
+                .accessibilityLabel(isTranslation ? "收起译文" : "收起摘要")
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -652,17 +655,23 @@ struct MailDetailView: View {
                 .fill(Color.primary.opacity(0.06))
                 .frame(height: 0.5)
 
-            // Card Body
-            Group {
-                if isTranslation && ai.inlineSummaryText.count > 360 {
-                    ScrollView {
-                        inlineCardBodyContent(isTranslation: isTranslation)
-                    }
-                    .frame(height: 240)
-                } else {
-                    inlineCardBodyContent(isTranslation: isTranslation)
-                }
+            // Card Body: stable ScrollView bounded by measured content height (max 240pt)
+            // so multi-line outputs never push the email body off-screen or swap containers mid-stream.
+            ScrollView {
+                inlineCardBodyContent(isTranslation: isTranslation)
+                    .background(
+                        GeometryReader { proxy in
+                            Color.clear
+                                .onAppear {
+                                    inlineCardHeightState.update(proxy.size.height)
+                                }
+                                .onChange(of: proxy.size.height) { _, newHeight in
+                                    inlineCardHeightState.update(newHeight)
+                                }
+                        }
+                    )
             }
+            .frame(height: inlineCardHeightState.clampedHeight(maxHeight: isTranslation ? 240 : 210))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
@@ -705,15 +714,26 @@ struct MailDetailView: View {
 
     private func inlineCardBodyContent(isTranslation: Bool) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            if !isTranslation && !ai.lastReadAttachmentNames.isEmpty {
+            if !isTranslation && !ai.inlineAttachmentNames.isEmpty {
                 HStack(spacing: 4) {
                     Image(systemName: "paperclip")
                         .font(.caption2)
                         .foregroundStyle(Color.accentColor)
-                    Text("已结合附件：\(ai.lastReadAttachmentNames.joined(separator: "、"))")
+                    Text("已结合附件：\(ai.inlineAttachmentNames.joined(separator: "、"))")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                }
+            }
+
+            if let notice = ai.inlineNoticeText, !notice.isEmpty {
+                HStack(spacing: 5) {
+                    Image(systemName: "info.circle")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(notice)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -730,6 +750,24 @@ struct MailDetailView: View {
         .padding(.vertical, 12)
     }
 
+}
+
+private final class InlineCardHeightState: ObservableObject {
+    @Published var contentHeight: CGFloat = 48
+
+    func update(_ height: CGFloat) {
+        let rounded = ceil(max(44, height))
+        if abs(rounded - contentHeight) >= 1 {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, abs(rounded - self.contentHeight) >= 1 else { return }
+                self.contentHeight = rounded
+            }
+        }
+    }
+
+    func clampedHeight(maxHeight: CGFloat) -> CGFloat {
+        min(max(44, contentHeight), maxHeight)
+    }
 }
 
 private final class RecipientExpandState: ObservableObject {

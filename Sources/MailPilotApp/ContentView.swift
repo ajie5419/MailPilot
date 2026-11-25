@@ -333,6 +333,7 @@ struct ContentView: View {
                 .menuIndicator(.hidden)
                 .fixedSize()
                 .help("筛选条件（未读 / 附件 / 时间范围）")
+                .accessibilityLabel("筛选邮件")
             }
             .padding(.horizontal, 10)
             .padding(.top, 9)
@@ -620,19 +621,22 @@ struct ContentView: View {
     }
 
     private func activeFilterChip(title: String, onRemove: @escaping () -> Void) -> some View {
-        HStack(spacing: 3) {
-            Text(title)
-                .font(.caption2.weight(.medium))
-            Button(action: onRemove) {
+        Button(action: onRemove) {
+            HStack(spacing: 4) {
+                Text(title)
+                    .font(.caption2.weight(.medium))
                 Image(systemName: "xmark")
-                    .font(.system(size: 8, weight: .bold))
+                    .font(.system(size: 8.5, weight: .bold))
             }
-            .buttonStyle(.plain)
+            .foregroundStyle(Color.accentColor)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3.5)
+            .background(Color.accentColor.opacity(0.12), in: Capsule())
+            .contentShape(Capsule())
         }
-        .foregroundStyle(Color.accentColor)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 3)
-        .background(Color.accentColor.opacity(0.12), in: Capsule())
+        .buttonStyle(.plain)
+        .accessibilityLabel("移除「\(title)」筛选")
+        .help("点击移除「\(title)」筛选")
     }
 
     private func sidebarItemRow(title: String, icon: String, color: Color, badge: Int?) -> some View {
