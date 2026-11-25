@@ -85,6 +85,9 @@ final class AppViewModel: ObservableObject {
     @Published var searchQuery: String = "" {
         didSet {
             if searchQuery != oldValue {
+                reloadGeneration &+= 1
+                reloadTask?.cancel()
+                snippetFetchTask?.cancel()
                 currentPageLimit = 200
                 scheduleSearchReload()
             }
@@ -154,7 +157,12 @@ final class AppViewModel: ObservableObject {
     }
     @Published var groupedMailboxes: [AccountMailboxGroup] = []
     @Published var messages: [MailMessageSummary] = []
+    @Published var messageSnippets: [Int64: String] = [:]
     @Published var currentPageLimit: Int = 200
+
+    func snippet(for messageID: Int64) -> String? {
+        messageSnippets[messageID]
+    }
     @Published var hasMoreMessages: Bool = false
     @Published var selectedMessageIDs: Set<Int64> = [] {
         didSet {
@@ -285,6 +293,9 @@ final class AppViewModel: ObservableObject {
     var needsFollowUpNotificationCheck = false
     var cachedAccountLookup: [String: CachedAccountMeta] = [:]
     var pendingRemovedIDs: Set<Int64> = []
+    var pendingReadOverrides: [Int64: (isRead: Bool, token: UInt64)] = [:]
+    var nextReadOpToken: UInt64 = 0
+    var localListMutationVersion: UInt64 = 0
     var isFetchingAccounts = false
     var lastAccountsFetchAt: Date = .distantPast
 
@@ -297,6 +308,10 @@ final class AppViewModel: ObservableObject {
     private var bodyLoadTask: Task<Void, Never>?
     private var recipientsLoadTask: Task<Void, Never>?
     private var reloadTask: Task<Void, Never>?
+    private var reloadGeneration: UInt64 = 0
+    private var snippetFetchTask: Task<Void, Never>?
+    private var snippetGeneration: UInt64 = 0
+    private var pendingSnippetRefreshIDs: Set<Int64> = []
     private var searchDebounceTask: Task<Void, Never>?
     private var autoMarkReadTask: Task<Void, Never>?
     private var autoMarkReadTargetID: Int64?
@@ -309,7 +324,7 @@ final class AppViewModel: ObservableObject {
     private var recentBodyCache: [Int64: CachedRenderedBody] = [:]
     private var recentBodyOrder: [Int64] = []
     /// Keeps messages auto-marked as read during the current `.unread` session visible so reading never jumps away.
-    private var sessionKeptUnreadMessages: [Int64: MailMessageSummary] = [:]
+    var sessionKeptUnreadMessages: [Int64: MailMessageSummary] = [:]
 
     private static let maxRecentBodyCacheEntries = 8
     private static let maxCacheableBodyBytes = 2 * 1024 * 1024
@@ -383,6 +398,16 @@ final class AppViewModel: ObservableObject {
     }
 
     private func wireCoordinators() {
+        bodyIndex.onIndexedRowIDsUpdated = { [weak self] updatedIDs in
+            self?.handleIndexedRowIDsUpdated(updatedIDs)
+        }
+        bodyIndex.onIndexCleared = { [weak self] in
+            self?.invalidateAllSnippets()
+        }
+        bodyIndex.onRowIDsDeleted = { [weak self] deletedIDs in
+            self?.removeSnippets(for: deletedIDs)
+        }
+
         ai.onShowToast = { [weak self] msg in
             self?.showToast(msg)
         }
@@ -799,7 +824,11 @@ final class AppViewModel: ObservableObject {
         let currentTagSettings = tagSettings
         let baseLimit = filterTag != nil ? max(400, currentPageLimit) : currentPageLimit
         let indexCoordinator = bodyIndex
+        reloadGeneration &+= 1
+        let generation = reloadGeneration
+        let mutationVersionAtStart = localListMutationVersion
         reloadTask?.cancel()
+        snippetFetchTask?.cancel()
 
         reloadTask = Task { [weak self] in
             do {
@@ -808,9 +837,12 @@ final class AppViewModel: ObservableObject {
                 let bodyHitIDs: [Int64] = trimmedQuery.isEmpty
                     ? []
                     : await indexCoordinator.searchRowIDs(query: trimmedQuery, limit: nil)
+                guard !Task.isCancelled, let self, self.reloadGeneration == generation else { return }
+
                 let fallbackAttachmentRowIDs: Set<Int64>? = effectiveOnlyAttachments
                     ? await indexCoordinator.fetchRowIDsWithAttachments()
                     : nil
+                guard !Task.isCancelled, self.reloadGeneration == generation else { return }
 
                 let (page, precomputedTags) = try await Self.runCancellableDetached(priority: .userInitiated) {
                     try Task.checkCancellation()
@@ -838,10 +870,36 @@ final class AppViewModel: ObservableObject {
                     }
                     return (result, tagMap)
                 }
-                guard !Task.isCancelled, let self else { return }
-                var filtered = self.pendingRemovedIDs.isEmpty
-                    ? page.messages
-                    : page.messages.filter { !self.pendingRemovedIDs.contains($0.id) }
+                guard !Task.isCancelled, self.reloadGeneration == generation else { return }
+
+                // Reject stale DB snapshots that crossed a local archive/delete/read mutation
+                // and immediately re-query so removed rows never flash back and read states never revert.
+                if self.localListMutationVersion != mutationVersionAtStart {
+                    self.reloadMessages()
+                    return
+                }
+
+                // Apply active optimistic removals & read-state overrides right before committing synchronously.
+                var filtered: [MailMessageSummary] = page.messages.compactMap { msg in
+                    guard !self.pendingRemovedIDs.contains(msg.id) else { return nil }
+                    if let overrideEntry = self.pendingReadOverrides[msg.id], overrideEntry.isRead != msg.isRead {
+                        return MailMessageSummary(
+                            id: msg.id,
+                            messageIDHeader: msg.messageIDHeader,
+                            subject: msg.subject,
+                            senderAddress: msg.senderAddress,
+                            senderName: msg.senderName,
+                            dateReceived: msg.dateReceived,
+                            isRead: overrideEntry.isRead,
+                            isFlagged: msg.isFlagged,
+                            mailboxID: msg.mailboxID,
+                            mailboxName: msg.mailboxName,
+                            accountID: msg.accountID
+                        )
+                    }
+                    return msg
+                }
+
                 if self.sidebarSelection == .unread && trimmedQuery.isEmpty && !self.sessionKeptUnreadMessages.isEmpty {
                     let existingIDs = Set(filtered.map(\.id))
                     var mergedTags = precomputedTags
@@ -864,6 +922,8 @@ final class AppViewModel: ObservableObject {
                 } else {
                     self.cachedMessageTags = precomputedTags
                 }
+
+                // Commit message page & selection immediately before any secondary awaits.
                 let messagesChanged = self.messages != filtered
                 if messagesChanged {
                     self.messages = filtered
@@ -871,22 +931,17 @@ final class AppViewModel: ObservableObject {
                 if self.hasMoreMessages != page.hasMore {
                     self.hasMoreMessages = page.hasMore
                 }
-                let countIndexed = await indexCoordinator.refreshIndexedCount()
-                let newStatus = trimmedQuery.isEmpty
-                    ? "实时同步 · \(filtered.count) 封（已索引 \(countIndexed) 正文）"
-                    : "搜索结果 · \(filtered.count)\(page.hasMore ? "+" : "") 封（已索引 \(countIndexed) 正文）"
-                if self.statusText != newStatus {
-                    self.statusText = newStatus
-                }
                 if let current = self.selectedMessageID, !filtered.contains(where: { $0.id == current }) {
                     self.selectedMessageID = filtered.first?.id
                 } else if self.selectedMessageID == nil {
                     self.selectedMessageID = filtered.first?.id
                 } else if let current = self.selectedMessageID {
-                    // If a notification click selected `current` before `reloadMessages()` populated `messages`,
-                    // ensure auto-mark-read runs once the unread message appears in `messages`.
                     self.scheduleAutoMarkReadIfNeeded(for: current)
                 }
+
+                // Incrementally hydrate missing/pending snippets in the background without blocking list display.
+                self.refreshVisibleSnippets(for: filtered.map(\.id))
+
                 if trimmedQuery.isEmpty && (messagesChanged || indexCoordinator.needsFullSweep) {
                     indexCoordinator.scheduleIndexing(
                         visiblePriority: filtered,
@@ -894,14 +949,133 @@ final class AppViewModel: ObservableObject {
                         parser: self.emlxParser
                     )
                 }
+
+                let countIndexed = await indexCoordinator.refreshIndexedCount()
+                guard !Task.isCancelled, self.reloadGeneration == generation else { return }
+                let liveCount = self.messages.count
+                let newStatus = trimmedQuery.isEmpty
+                    ? "实时同步 · \(liveCount) 封（已索引 \(countIndexed) 正文）"
+                    : "搜索结果 · \(liveCount)\(page.hasMore ? "+" : "") 封（已索引 \(countIndexed) 正文）"
+                if self.statusText != newStatus {
+                    self.statusText = newStatus
+                }
             } catch is CancellationError {
                 return
             } catch let err as MailAccessError {
-                self?.accessError = err
+                guard let self, self.reloadGeneration == generation else { return }
+                self.accessError = err
             } catch {
-                self?.statusText = "查询失败：\(error.localizedDescription)"
+                guard let self, self.reloadGeneration == generation else { return }
+                self.statusText = "查询失败：\(error.localizedDescription)"
             }
         }
+    }
+
+    private func invalidateAllSnippets() {
+        snippetGeneration &+= 1
+        snippetFetchTask?.cancel()
+        snippetFetchTask = nil
+        pendingSnippetRefreshIDs.removeAll()
+        if !messageSnippets.isEmpty {
+            messageSnippets = [:]
+        }
+    }
+
+    private func removeSnippets(for rowIDs: [Int64]) {
+        guard !rowIDs.isEmpty else { return }
+        snippetGeneration &+= 1
+        snippetFetchTask?.cancel()
+        snippetFetchTask = nil
+        for id in rowIDs {
+            pendingSnippetRefreshIDs.remove(id)
+        }
+        if !messageSnippets.isEmpty {
+            var updated = messageSnippets
+            var changed = false
+            for id in rowIDs where updated.removeValue(forKey: id) != nil {
+                changed = true
+            }
+            if changed {
+                messageSnippets = updated
+            }
+        }
+        if !pendingSnippetRefreshIDs.isEmpty && !messages.isEmpty {
+            refreshVisibleSnippets(for: messages.map(\.id))
+        }
+    }
+
+    private func handleIndexedRowIDsUpdated(_ updatedIDs: [Int64]) {
+        guard !updatedIDs.isEmpty, !messages.isEmpty else { return }
+        let visibleSet = Set(messages.map(\.id))
+        var addedAny = false
+        for id in updatedIDs where visibleSet.contains(id) {
+            if pendingSnippetRefreshIDs.insert(id).inserted {
+                addedAny = true
+            }
+        }
+        guard addedAny || !pendingSnippetRefreshIDs.isEmpty else { return }
+        refreshVisibleSnippets(for: messages.map(\.id))
+    }
+
+    private func refreshVisibleSnippets(for visibleIDs: [Int64]) {
+        let visibleSet = Set(visibleIDs)
+        // Drop cached & pending snippet entries for rows no longer in the active list.
+        if messageSnippets.keys.contains(where: { !visibleSet.contains($0) }) {
+            messageSnippets = messageSnippets.filter { visibleSet.contains($0.key) }
+        }
+        if !pendingSnippetRefreshIDs.isEmpty {
+            pendingSnippetRefreshIDs = pendingSnippetRefreshIDs.intersection(visibleSet)
+        }
+
+        let pendingSnapshot = pendingSnippetRefreshIDs
+        let idsToFetch = visibleIDs.filter { pendingSnapshot.contains($0) || messageSnippets[$0] == nil }
+        guard !idsToFetch.isEmpty else { return }
+
+        let indexCoordinator = bodyIndex
+        snippetGeneration &+= 1
+        let gen = snippetGeneration
+        snippetFetchTask?.cancel()
+        snippetFetchTask = Task { [weak self] in
+            let rawSnippets = await indexCoordinator.fetchSnippets(for: idsToFetch, maxChars: 180)
+            guard !Task.isCancelled, let self, self.snippetGeneration == gen else { return }
+            let currentVisible = Set(self.messages.map(\.id))
+            var merged = self.messageSnippets
+            var changed = false
+            for id in idsToFetch {
+                self.pendingSnippetRefreshIDs.remove(id)
+                guard currentVisible.contains(id) else { continue }
+                if let raw = rawSnippets[id] {
+                    let cleaned = Self.cleanListSnippet(raw)
+                    if merged[id] != cleaned {
+                        merged[id] = cleaned
+                        changed = true
+                    }
+                }
+            }
+            if changed {
+                self.messageSnippets = merged
+            }
+        }
+    }
+
+    private static func cleanListSnippet(_ raw: String) -> String? {
+        var text = raw
+        // BodyIndexCoordinator appends attachment filenames using the unambiguous record separator "\n\u{001E}[附件] ".
+        if let range = text.range(of: "\n\u{001E}[附件] ") {
+            text = String(text[..<range.lowerBound])
+        } else if let range = text.range(of: "\u{001E}[附件] ") {
+            text = String(text[..<range.lowerBound])
+        }
+        let collapsed = text
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !collapsed.isEmpty else { return nil }
+        if collapsed.count <= 120 {
+            return collapsed
+        }
+        return String(collapsed.prefix(120)) + "…"
     }
 
     func loadMoreMessages() {
@@ -1082,6 +1256,7 @@ final class AppViewModel: ObservableObject {
             }
             try? await Task.sleep(for: .milliseconds(500))
             guard let self, !Task.isCancelled, self.selectedMessageID == id else { return }
+            let readToken = self.beginReadOverride(rowID: id, isRead: true)
             self.updateLocalReadState(rowID: id, isRead: true)
             if self.sidebarSelection == .unread,
                let updated = self.messages.first(where: { $0.id == id }) {
@@ -1094,10 +1269,11 @@ final class AppViewModel: ObservableObject {
                 do {
                     try await MailAppleScriptBridge.setReadStatus(rowID: id, isRead: true)
                     try? await Task.sleep(for: .milliseconds(500))
+                    self.finishReadOverride(rowID: id, token: readToken, succeeded: true, fallbackIsRead: false)
                     self.refreshNow()
                 } catch {
                     self.sessionKeptUnreadMessages.removeValue(forKey: id)
-                    self.updateLocalReadState(rowID: id, isRead: false)
+                    self.finishReadOverride(rowID: id, token: readToken, succeeded: false, fallbackIsRead: false)
                     self.showToast("自动标已读失败：请在系统设置 → 自动化中允许控制「邮件」")
                 }
             }

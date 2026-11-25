@@ -11,8 +11,14 @@ final class BodyIndexCoordinator: ObservableObject {
     @Published private(set) var indexedBodyCount: Int = 0
     @Published private(set) var errorMessage: String?
 
+    var onIndexedRowIDsUpdated: (([Int64]) -> Void)?
+    var onIndexCleared: (() -> Void)?
+    var onRowIDsDeleted: (([Int64]) -> Void)?
+
     private let index: BodySearchIndex
     private var indexingTask: Task<Void, Never>?
+    private var isClearingOrRebuilding = false
+    private var deletedRowIDsInFlight: Set<Int64> = []
     private var hasCompletedFullSweep = false
     private var hasPrunedStale = false
     private var resumeCursorRowID: Int64?
@@ -48,9 +54,13 @@ final class BodyIndexCoordinator: ObservableObject {
 
     func deleteRowIDs(_ rowIDs: [Int64]) async {
         guard !rowIDs.isEmpty else { return }
+        for id in rowIDs {
+            deletedRowIDsInFlight.insert(id)
+        }
         do {
             try await index.deleteRowIDs(rowIDs)
             indexedBodyCount = await index.totalIndexedCount()
+            onRowIDsDeleted?(rowIDs)
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -62,26 +72,36 @@ final class BodyIndexCoordinator: ObservableObject {
         parser: EmlxParser?,
         onToast: @escaping (String) -> Void
     ) {
+        guard !isClearingOrRebuilding else { return }
+        isClearingOrRebuilding = true
+        let previousTask = indexingTask
         indexingTask?.cancel()
+        indexingTask = nil
         hasCompletedFullSweep = false
         hasPrunedStale = false
         resumeCursorRowID = nil
         errorMessage = nil
         let ftsIndex = index
         Task { [weak self] in
+            await previousTask?.value
+            guard let self else { return }
             do {
                 try await ftsIndex.clearAll()
-                self?.indexedBodyCount = 0
-                self?.errorMessage = nil
+                self.deletedRowIDsInFlight.removeAll()
+                self.indexedBodyCount = 0
+                self.errorMessage = nil
+                self.onIndexCleared?()
                 onToast("已清空正文索引，正在后台重建...")
-                self?.scheduleIndexing(
+                self.isClearingOrRebuilding = false
+                self.scheduleIndexing(
                     visiblePriority: visiblePriority,
                     reader: reader,
                     parser: parser,
                     forceFullSweep: true
                 )
             } catch {
-                self?.errorMessage = error.localizedDescription
+                self.isClearingOrRebuilding = false
+                self.errorMessage = error.localizedDescription
                 onToast("清空正文索引失败：\(error.localizedDescription)")
             }
         }
@@ -93,6 +113,7 @@ final class BodyIndexCoordinator: ObservableObject {
         parser: EmlxParser?,
         onToast: @escaping (String) -> Void
     ) {
+        guard !isClearingOrRebuilding else { return }
         errorMessage = nil
         onToast("正在重试本地正文索引...")
         scheduleIndexing(
@@ -104,20 +125,29 @@ final class BodyIndexCoordinator: ObservableObject {
     }
 
     func clear(onToast: @escaping (String) -> Void) {
+        guard !isClearingOrRebuilding else { return }
+        isClearingOrRebuilding = true
+        let previousTask = indexingTask
         indexingTask?.cancel()
+        indexingTask = nil
         hasCompletedFullSweep = false
         hasPrunedStale = false
         resumeCursorRowID = nil
         errorMessage = nil
         let ftsIndex = index
         Task { [weak self] in
+            await previousTask?.value
+            guard let self else { return }
+            defer { self.isClearingOrRebuilding = false }
             do {
                 try await ftsIndex.clearAll()
-                self?.indexedBodyCount = 0
-                self?.errorMessage = nil
+                self.deletedRowIDsInFlight.removeAll()
+                self.indexedBodyCount = 0
+                self.errorMessage = nil
+                self.onIndexCleared?()
                 onToast("已清空本地正文全文搜索缓存")
             } catch {
-                self?.errorMessage = error.localizedDescription
+                self.errorMessage = error.localizedDescription
                 onToast("清空本地正文缓存失败：\(error.localizedDescription)")
             }
         }
@@ -133,13 +163,16 @@ final class BodyIndexCoordinator: ObservableObject {
         parser: EmlxParser?,
         forceFullSweep: Bool = false
     ) {
-        guard let parser else { return }
+        guard !isClearingOrRebuilding, let parser else { return }
         let ftsIndex = index
         let shouldRunFullSweep = forceFullSweep || !hasCompletedFullSweep
         let shouldPruneStale = shouldRunFullSweep && !hasPrunedStale
         let initialCursor = forceFullSweep ? nil : resumeCursorRowID
+        let previousTask = indexingTask
         indexingTask?.cancel()
         indexingTask = Task.detached(priority: .background) { [weak self] in
+            await previousTask?.value
+            if Task.isCancelled { return }
             var processedIDs: Set<Int64> = []
             var anyChanges = false
 
@@ -152,6 +185,9 @@ final class BodyIndexCoordinator: ObservableObject {
                         if !Task.isCancelled, !staleIDs.isEmpty {
                             try await ftsIndex.deleteRowIDs(staleIDs)
                             anyChanges = true
+                            await MainActor.run { [weak self] in
+                                self?.onRowIDsDeleted?(staleIDs)
+                            }
                         }
                     }
                     if !Task.isCancelled {
@@ -166,16 +202,49 @@ final class BodyIndexCoordinator: ObservableObject {
                     guard !unique.isEmpty else { return }
                     let storedVersions = await ftsIndex.indexedVersions(in: unique.map(\.id))
                     var batch: [(rowID: Int64, subject: String, sender: String, body: String, fileMTime: Double, hasAttachments: Bool)] = []
-                    var chunkWrote = false
+                    func flushBatch() async throws {
+                        guard !batch.isEmpty else { return }
+                        let deletedSnapshot = await MainActor.run { [weak self] () -> Set<Int64> in
+                            self?.deletedRowIDsInFlight ?? []
+                        }
+                        let liveBatch = deletedSnapshot.isEmpty
+                            ? batch
+                            : batch.filter { !deletedSnapshot.contains($0.rowID) }
+                        batch.removeAll(keepingCapacity: true)
+                        guard !Task.isCancelled, !liveBatch.isEmpty else { return }
+                        try await ftsIndex.upsertBatchWithMetadata(liveBatch)
+                        var committedIDs = liveBatch.map(\.rowID)
+                        let postUpsertDeleted = await MainActor.run { [weak self] () -> Set<Int64> in
+                            self?.deletedRowIDsInFlight ?? []
+                        }
+                        let racedDeleted = committedIDs.filter { postUpsertDeleted.contains($0) }
+                        if !racedDeleted.isEmpty {
+                            try? await ftsIndex.deleteRowIDs(racedDeleted)
+                            let racedSet = Set(racedDeleted)
+                            committedIDs.removeAll { racedSet.contains($0) }
+                        }
+                        let finalCommittedIDs = committedIDs
+                        anyChanges = true
+                        let total = await ftsIndex.totalIndexedCount()
+                        await MainActor.run { [weak self] in
+                            self?.indexedBodyCount = total
+                            self?.errorMessage = nil
+                            if !finalCommittedIDs.isEmpty {
+                                self?.onIndexedRowIDsUpdated?(finalCommittedIDs)
+                            }
+                        }
+                    }
+
                     for msg in unique {
                         if Task.isCancelled { break }
                         let result = await parser.loadPlainTextForIndexing(for: msg.id, cachedMTime: storedVersions[msg.id])
                         guard case let .parsed(plainText, attachmentNames, mtime) = result else { continue }
+                        if Task.isCancelled { break }
                         let indexedBody: String
                         if attachmentNames.isEmpty {
                             indexedBody = plainText
                         } else {
-                            indexedBody = "\(plainText)\n[附件] \(attachmentNames.joined(separator: " "))"
+                            indexedBody = "\(plainText)\n\u{001E}[附件] \(attachmentNames.joined(separator: " "))"
                         }
                         batch.append((
                             rowID: msg.id,
@@ -186,23 +255,11 @@ final class BodyIndexCoordinator: ObservableObject {
                             hasAttachments: !attachmentNames.isEmpty
                         ))
                         if batch.count >= 25 {
-                            try await ftsIndex.upsertBatchWithMetadata(batch)
-                            batch.removeAll(keepingCapacity: true)
-                            chunkWrote = true
-                            anyChanges = true
+                            try await flushBatch()
                         }
                     }
-                    if !batch.isEmpty {
-                        try await ftsIndex.upsertBatchWithMetadata(batch)
-                        chunkWrote = true
-                        anyChanges = true
-                    }
-                    if chunkWrote {
-                        let total = await ftsIndex.totalIndexedCount()
-                        await MainActor.run { [weak self] in
-                            self?.indexedBodyCount = total
-                            self?.errorMessage = nil
-                        }
+                    if !Task.isCancelled && !batch.isEmpty {
+                        try await flushBatch()
                     }
                 }
 

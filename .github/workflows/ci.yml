@@ -30,3 +30,6 @@ jobs:
         run: |
           test -x dist/MailPilot.app/Contents/MacOS/MailPilot
           defaults read "$PWD/dist/MailPilot.app/Contents/Info.plist" CFBundleShortVersionString
+          ICON_FILE="$(plutil -extract CFBundleIconFile raw dist/MailPilot.app/Contents/Info.plist)"
+          test -s "dist/MailPilot.app/Contents/Resources/$ICON_FILE"
+          sips -g pixelWidth "dist/MailPilot.app/Contents/Resources/$ICON_FILE"

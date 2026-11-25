@@ -289,13 +289,14 @@ public actor BodySearchIndex {
         return ids
     }
 
-    /// Returns bounded plain-text body excerpts for a batch of message ROWIDs (for cross-mail AI QA).
+    /// Returns bounded plain-text body excerpts for a batch of message ROWIDs (for list previews & cross-mail AI QA).
     public func fetchSnippets(for rowIDs: [Int64], maxChars: Int = 600) -> [Int64: String] {
-        guard !rowIDs.isEmpty, let db = try? ensureOpen() else { return [:] }
+        guard !Task.isCancelled, !rowIDs.isEmpty, let db = try? ensureOpen() else { return [:] }
         var snippets: [Int64: String] = [:]
         let chunkSize = 200
         var start = 0
         while start < rowIDs.count {
+            if Task.isCancelled { return [:] }
             let end = min(start + chunkSize, rowIDs.count)
             let chunk = Array(rowIDs[start..<end])
             let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")

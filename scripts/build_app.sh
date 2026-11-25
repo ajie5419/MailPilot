@@ -77,7 +77,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <key>CFBundleExecutable</key>
     <string>MailPilot</string>
     <key>CFBundleIconFile</key>
-    <string>AppIcon.icns</string>
+    <string>MailPilotCrane.icns</string>
     <key>CFBundleIdentifier</key>
     <string>com.mailpilot.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -100,13 +100,15 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Generate official AppIcon.icns using Apple's iconutil when available (with direct writer fallback)
-ICON_CACHE="$DIST_DIR/AppIcon.icns"
+# Generate official MailPilotCrane.icns using Apple's iconutil when available (with direct writer fallback)
+ICON_CACHE="$DIST_DIR/MailPilotCrane.icns"
 if [[ ! -f "$ICON_CACHE" || "$ROOT_DIR/scripts/generate_icon.swift" -nt "$ICON_CACHE" ]]; then
-  echo "Generating MailPilot AppIcon.icns..."
-  ICON_GEN_BIN="${TMPDIR:-/tmp}/mailpilot-generate-icon"
-  ICONSET_DIR="${TMPDIR:-/tmp}/MailPilot.iconset"
-  rm -rf "$ICONSET_DIR"
+  echo "Generating MailPilotCrane.icns..."
+  ICON_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mailpilot-icon.XXXXXX")"
+  trap 'rm -rf "${ICON_TMP_DIR:-}"' EXIT
+  ICON_GEN_BIN="$ICON_TMP_DIR/mailpilot-generate-icon"
+  ICONSET_DIR="$ICON_TMP_DIR/MailPilot.iconset"
+  ICON_OUT="$ICON_TMP_DIR/MailPilotCrane.icns"
   swiftc \
     -target arm64-apple-macosx14.0 \
     -module-cache-path "$MODULE_CACHE" \
@@ -114,12 +116,13 @@ if [[ ! -f "$ICON_CACHE" || "$ROOT_DIR/scripts/generate_icon.swift" -nt "$ICON_C
     -o "$ICON_GEN_BIN" \
     "$ROOT_DIR/scripts/generate_icon.swift"
   "$ICON_GEN_BIN" --iconset "$ICONSET_DIR"
-  if ! iconutil --convert icns "$ICONSET_DIR" -o "$ICON_CACHE"; then
-    "$ICON_GEN_BIN" "$ICON_CACHE"
+  if ! iconutil --convert icns "$ICONSET_DIR" -o "$ICON_OUT"; then
+    "$ICON_GEN_BIN" "$ICON_OUT"
   fi
-  rm -rf "$ICONSET_DIR" "$ICON_GEN_BIN"
+  mv "$ICON_OUT" "$ICON_CACHE"
+  rm -rf "$ICON_TMP_DIR"
 fi
-cp "$ICON_CACHE" "$RESOURCES_DIR/AppIcon.icns"
+cp "$ICON_CACHE" "$RESOURCES_DIR/MailPilotCrane.icns"
 
 # Prefer a stable local code-signing identity so macOS TCC permissions persist across rebuilds.
 SIGN_IDENTITY="${CODESIGN_IDENTITY:-}"
@@ -142,11 +145,13 @@ fi
 rm -rf "$APP_BUNDLE"
 mv "$STAGING_BUNDLE" "$APP_BUNDLE"
 
-# Refresh macOS LaunchServices icon registration so Finder & Notification Center pick up AppIcon.icns
+# Refresh macOS LaunchServices icon registration unless caller (e.g. install_app.sh) handles final install registration
 touch "$APP_BUNDLE"
-LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-if [[ -x "$LSREGISTER" ]]; then
-  "$LSREGISTER" -f "$APP_BUNDLE" || true
+if [[ "${SKIP_LSREGISTER:-0}" != "1" ]]; then
+  LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+  if [[ -x "$LSREGISTER" ]]; then
+    "$LSREGISTER" -f "$APP_BUNDLE" || true
+  fi
 fi
 
 echo "Built app bundle: $APP_BUNDLE"

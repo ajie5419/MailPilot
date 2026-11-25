@@ -11,6 +11,7 @@ extension AppViewModel {
         guard let idx = messages.firstIndex(where: { $0.id == rowID }) else { return }
         let old = messages[idx]
         guard old.isRead != isRead else { return }
+        localListMutationVersion &+= 1
         messages[idx] = MailMessageSummary(
             id: old.id,
             messageIDHeader: old.messageIDHeader,
@@ -83,7 +84,9 @@ extension AppViewModel {
     }
 
     func removeMessageLocally(rowID: Int64) {
+        sessionKeptUnreadMessages.removeValue(forKey: rowID)
         guard let idx = messages.firstIndex(where: { $0.id == rowID }) else { return }
+        localListMutationVersion &+= 1
         let removed = messages.remove(at: idx)
         if !removed.isRead {
             adjustLocalUnreadCount(for: removed, delta: -1)
@@ -111,18 +114,38 @@ extension AppViewModel {
         }
     }
 
+    func beginReadOverride(rowID: Int64, isRead: Bool) -> UInt64 {
+        nextReadOpToken &+= 1
+        let token = nextReadOpToken
+        pendingReadOverrides[rowID] = (isRead: isRead, token: token)
+        localListMutationVersion &+= 1
+        return token
+    }
+
+    func finishReadOverride(rowID: Int64, token: UInt64, succeeded: Bool, fallbackIsRead: Bool) {
+        guard pendingReadOverrides[rowID]?.token == token else { return }
+        pendingReadOverrides.removeValue(forKey: rowID)
+        localListMutationVersion &+= 1
+        if !succeeded {
+            updateLocalReadState(rowID: rowID, isRead: fallbackIsRead)
+        }
+    }
+
     func toggleReadStatus(for message: MailMessageSummary) {
         let nextState = !message.isRead
+        let token = beginReadOverride(rowID: message.id, isRead: nextState)
         updateLocalReadState(rowID: message.id, isRead: nextState)
-        Task {
+        Task { [weak self] in
+            guard let self else { return }
             do {
                 try await MailAppleScriptBridge.setReadStatus(rowID: message.id, isRead: nextState)
-                showToast(nextState ? "已标记为已读" : "已标记为未读")
+                self.showToast(nextState ? "已标记为已读" : "已标记为未读")
                 try? await Task.sleep(for: .milliseconds(400))
-                refreshNow()
+                self.finishReadOverride(rowID: message.id, token: token, succeeded: true, fallbackIsRead: message.isRead)
+                self.refreshNow()
             } catch {
-                updateLocalReadState(rowID: message.id, isRead: message.isRead)
-                showToast(error.localizedDescription)
+                self.finishReadOverride(rowID: message.id, token: token, succeeded: false, fallbackIsRead: message.isRead)
+                self.showToast(error.localizedDescription)
             }
         }
     }
@@ -164,22 +187,28 @@ extension AppViewModel {
     func batchMarkSelected(isRead: Bool) {
         let targets = messages.filter { selectedMessageIDs.contains($0.id) }
         guard !targets.isEmpty else { return }
+        var opTokens: [(id: Int64, previousRead: Bool, token: UInt64)] = []
+        opTokens.reserveCapacity(targets.count)
         for msg in targets {
+            let token = beginReadOverride(rowID: msg.id, isRead: isRead)
+            opTokens.append((id: msg.id, previousRead: msg.isRead, token: token))
             updateLocalReadState(rowID: msg.id, isRead: isRead)
         }
-        let ids = targets.map(\.id)
         Task { [weak self] in
             guard let self else { return }
             var failed = 0
-            for id in ids {
+            for item in opTokens {
+                guard self.pendingReadOverrides[item.id]?.token == item.token else { continue }
                 do {
-                    try await MailAppleScriptBridge.setReadStatus(rowID: id, isRead: isRead)
+                    try await MailAppleScriptBridge.setReadStatus(rowID: item.id, isRead: isRead)
+                    self.finishReadOverride(rowID: item.id, token: item.token, succeeded: true, fallbackIsRead: item.previousRead)
                 } catch {
                     failed += 1
+                    self.finishReadOverride(rowID: item.id, token: item.token, succeeded: false, fallbackIsRead: item.previousRead)
                 }
             }
             if failed == 0 {
-                self.showToast("已批量标记 \(ids.count) 封为\(isRead ? "已读" : "未读")")
+                self.showToast("已批量标记 \(opTokens.count) 封为\(isRead ? "已读" : "未读")")
             } else {
                 self.showToast("批量更新完成（\(failed) 封失败）")
             }
@@ -195,6 +224,7 @@ extension AppViewModel {
             pendingRemovedIDs.insert(id)
             removeMessageLocally(rowID: id)
         }
+        localListMutationVersion &+= 1
         selectedMessageIDs = selectedMessageID.map { [$0] } ?? []
 
         Task { [weak self] in
@@ -206,7 +236,6 @@ extension AppViewModel {
                 } catch {
                     failed += 1
                 }
-                self.pendingRemovedIDs.remove(id)
             }
             if failed == 0 {
                 self.showToast("已批量归档 \(ids.count) 封邮件", actionTitle: "撤销", duration: 5.0) { [weak self] in
@@ -216,6 +245,10 @@ extension AppViewModel {
                 self.showToast("批量归档完成（\(failed) 封失败）")
             }
             try? await Task.sleep(for: .milliseconds(450))
+            for id in ids {
+                self.pendingRemovedIDs.remove(id)
+            }
+            self.localListMutationVersion &+= 1
             self.refreshNow()
         }
     }
@@ -228,6 +261,7 @@ extension AppViewModel {
             pendingRemovedIDs.insert(id)
             removeMessageLocally(rowID: id)
         }
+        localListMutationVersion &+= 1
         selectedMessageIDs = selectedMessageID.map { [$0] } ?? []
 
         Task { [weak self] in
@@ -241,7 +275,6 @@ extension AppViewModel {
                 } catch {
                     failed += 1
                 }
-                self.pendingRemovedIDs.remove(id)
             }
             if !deletedIDs.isEmpty {
                 await self.bodyIndex.deleteRowIDs(deletedIDs)
@@ -254,6 +287,10 @@ extension AppViewModel {
                 self.showToast("批量删除完成（\(failed) 封失败）")
             }
             try? await Task.sleep(for: .milliseconds(450))
+            for id in ids {
+                self.pendingRemovedIDs.remove(id)
+            }
+            self.localListMutationVersion &+= 1
             self.refreshNow()
         }
     }
@@ -261,19 +298,22 @@ extension AppViewModel {
     func deleteMessage(_ message: MailMessageSummary) {
         pendingRemovedIDs.insert(message.id)
         removeMessageLocally(rowID: message.id)
+        localListMutationVersion &+= 1
         Task { [weak self] in
             guard let self else { return }
             do {
                 try await MailAppleScriptBridge.deleteMessage(rowID: message.id)
-                self.pendingRemovedIDs.remove(message.id)
                 await self.bodyIndex.deleteRowIDs([message.id])
                 self.showToast("已移入废纸篓", actionTitle: "撤销", duration: 5.0) { [weak self] in
                     self?.undoMoveToInbox(rowIDs: [message.id])
                 }
                 try? await Task.sleep(for: .milliseconds(450))
+                self.pendingRemovedIDs.remove(message.id)
+                self.localListMutationVersion &+= 1
                 self.refreshNow()
             } catch {
                 self.pendingRemovedIDs.remove(message.id)
+                self.localListMutationVersion &+= 1
                 self.refreshNow()
                 self.showToast("删除失败：\(error.localizedDescription)")
             }
@@ -283,18 +323,21 @@ extension AppViewModel {
     func archiveMessage(_ message: MailMessageSummary) {
         pendingRemovedIDs.insert(message.id)
         removeMessageLocally(rowID: message.id)
+        localListMutationVersion &+= 1
         Task { [weak self] in
             guard let self else { return }
             do {
                 try await MailAppleScriptBridge.archiveMessage(rowID: message.id)
-                self.pendingRemovedIDs.remove(message.id)
                 self.showToast("已归档", actionTitle: "撤销", duration: 5.0) { [weak self] in
                     self?.undoMoveToInbox(rowIDs: [message.id])
                 }
                 try? await Task.sleep(for: .milliseconds(450))
+                self.pendingRemovedIDs.remove(message.id)
+                self.localListMutationVersion &+= 1
                 self.refreshNow()
             } catch {
                 self.pendingRemovedIDs.remove(message.id)
+                self.localListMutationVersion &+= 1
                 self.refreshNow()
                 self.showToast("归档失败：\(error.localizedDescription)")
             }
