@@ -80,6 +80,10 @@ public struct MailRecipientInfo: Identifiable, Hashable, Sendable {
         if trimmed.isEmpty || trimmed.caseInsensitiveCompare(address) == .orderedSame {
             return address
         }
+        if let atIndex = address.firstIndex(of: "@"),
+           trimmed.caseInsensitiveCompare(String(address[..<atIndex])) == .orderedSame {
+            return address
+        }
         return "\(trimmed) <\(address)>"
     }
 }

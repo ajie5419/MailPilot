@@ -242,7 +242,7 @@ struct MailDetailView: View {
                     Text(
                         recipientExpandState.isExpanded
                             ? toList.map(\.formattedDisplay).joined(separator: "、")
-                            : toList.prefix(3).map(\.displayName).joined(separator: "、")
+                            : toList.prefix(3).map(\.formattedDisplay).joined(separator: "、")
                                 + (toList.count > 3 ? " 等 \(toList.count) 人" : "")
                     )
                     .font(.caption)

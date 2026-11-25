@@ -2,6 +2,11 @@
 
 All notable changes to MailPilot are documented in this file.
 
+## [0.5.1] - 2026-11-25
+
+### Fixed
+- 修复邮件详情页收件人折叠态在邮件头包含显示名（如与邮箱前缀同名的 `ajie5419`）时隐藏邮箱域名导致显示不全的问题，统一展示完整邮箱地址或 `姓名 <邮箱>`。
+
 ## [0.5.0] - 2026-11-25
 
 ### Added
