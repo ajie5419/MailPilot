@@ -14,7 +14,7 @@ if [[ -f /Applications/MailPilot.app/Contents/Info.plist ]]; then
   PREV_ICON="$(plutil -extract CFBundleIconFile raw /Applications/MailPilot.app/Contents/Info.plist 2>/dev/null || true)"
 fi
 
-"$ROOT_DIR/scripts/build_app.sh"
+SKIP_LSREGISTER=1 "$ROOT_DIR/scripts/build_app.sh"
 NEW_ICON="$(plutil -extract CFBundleIconFile raw "$ROOT_DIR/dist/MailPilot.app/Contents/Info.plist" 2>/dev/null || true)"
 
 pkill -x MailPilot || true

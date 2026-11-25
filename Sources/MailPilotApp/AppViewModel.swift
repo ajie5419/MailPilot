@@ -293,7 +293,8 @@ final class AppViewModel: ObservableObject {
     var needsFollowUpNotificationCheck = false
     var cachedAccountLookup: [String: CachedAccountMeta] = [:]
     var pendingRemovedIDs: Set<Int64> = []
-    var pendingReadOverrides: [Int64: Bool] = [:]
+    var pendingReadOverrides: [Int64: (isRead: Bool, token: UInt64)] = [:]
+    var nextReadOpToken: UInt64 = 0
     var localListMutationVersion: UInt64 = 0
     var isFetchingAccounts = false
     var lastAccountsFetchAt: Date = .distantPast
@@ -310,6 +311,7 @@ final class AppViewModel: ObservableObject {
     private var reloadGeneration: UInt64 = 0
     private var snippetFetchTask: Task<Void, Never>?
     private var snippetGeneration: UInt64 = 0
+    private var pendingSnippetRefreshIDs: Set<Int64> = []
     private var searchDebounceTask: Task<Void, Never>?
     private var autoMarkReadTask: Task<Void, Never>?
     private var autoMarkReadTargetID: Int64?
@@ -824,6 +826,7 @@ final class AppViewModel: ObservableObject {
         let indexCoordinator = bodyIndex
         reloadGeneration &+= 1
         let generation = reloadGeneration
+        let mutationVersionAtStart = localListMutationVersion
         reloadTask?.cancel()
         snippetFetchTask?.cancel()
 
@@ -869,10 +872,17 @@ final class AppViewModel: ObservableObject {
                 }
                 guard !Task.isCancelled, self.reloadGeneration == generation else { return }
 
-                // Apply latest optimistic removals & read-state overrides right before committing synchronously.
+                // Reject stale DB snapshots that crossed a local archive/delete/read mutation
+                // and immediately re-query so removed rows never flash back and read states never revert.
+                if self.localListMutationVersion != mutationVersionAtStart {
+                    self.reloadMessages()
+                    return
+                }
+
+                // Apply active optimistic removals & read-state overrides right before committing synchronously.
                 var filtered: [MailMessageSummary] = page.messages.compactMap { msg in
                     guard !self.pendingRemovedIDs.contains(msg.id) else { return nil }
-                    if let overrideRead = self.pendingReadOverrides[msg.id], overrideRead != msg.isRead {
+                    if let overrideEntry = self.pendingReadOverrides[msg.id], overrideEntry.isRead != msg.isRead {
                         return MailMessageSummary(
                             id: msg.id,
                             messageIDHeader: msg.messageIDHeader,
@@ -880,7 +890,7 @@ final class AppViewModel: ObservableObject {
                             senderAddress: msg.senderAddress,
                             senderName: msg.senderName,
                             dateReceived: msg.dateReceived,
-                            isRead: overrideRead,
+                            isRead: overrideEntry.isRead,
                             isFlagged: msg.isFlagged,
                             mailboxID: msg.mailboxID,
                             mailboxName: msg.mailboxName,
@@ -929,8 +939,8 @@ final class AppViewModel: ObservableObject {
                     self.scheduleAutoMarkReadIfNeeded(for: current)
                 }
 
-                // Incrementally hydrate missing snippets in the background without blocking list display.
-                self.refreshVisibleSnippets(for: filtered.map(\.id), forceRefreshIDs: nil)
+                // Incrementally hydrate missing/pending snippets in the background without blocking list display.
+                self.refreshVisibleSnippets(for: filtered.map(\.id))
 
                 if trimmedQuery.isEmpty && (messagesChanged || indexCoordinator.needsFullSweep) {
                     indexCoordinator.scheduleIndexing(
@@ -965,44 +975,60 @@ final class AppViewModel: ObservableObject {
         snippetGeneration &+= 1
         snippetFetchTask?.cancel()
         snippetFetchTask = nil
+        pendingSnippetRefreshIDs.removeAll()
         if !messageSnippets.isEmpty {
             messageSnippets = [:]
         }
     }
 
     private func removeSnippets(for rowIDs: [Int64]) {
-        guard !rowIDs.isEmpty, !messageSnippets.isEmpty else { return }
-        var updated = messageSnippets
-        var changed = false
-        for id in rowIDs where updated.removeValue(forKey: id) != nil {
-            changed = true
+        guard !rowIDs.isEmpty else { return }
+        snippetGeneration &+= 1
+        snippetFetchTask?.cancel()
+        snippetFetchTask = nil
+        for id in rowIDs {
+            pendingSnippetRefreshIDs.remove(id)
         }
-        if changed {
-            messageSnippets = updated
+        if !messageSnippets.isEmpty {
+            var updated = messageSnippets
+            var changed = false
+            for id in rowIDs where updated.removeValue(forKey: id) != nil {
+                changed = true
+            }
+            if changed {
+                messageSnippets = updated
+            }
+        }
+        if !pendingSnippetRefreshIDs.isEmpty && !messages.isEmpty {
+            refreshVisibleSnippets(for: messages.map(\.id))
         }
     }
 
     private func handleIndexedRowIDsUpdated(_ updatedIDs: [Int64]) {
         guard !updatedIDs.isEmpty, !messages.isEmpty else { return }
         let visibleSet = Set(messages.map(\.id))
-        let affectedVisible = updatedIDs.filter { visibleSet.contains($0) }
-        guard !affectedVisible.isEmpty else { return }
-        refreshVisibleSnippets(for: messages.map(\.id), forceRefreshIDs: Set(affectedVisible))
+        var addedAny = false
+        for id in updatedIDs where visibleSet.contains(id) {
+            if pendingSnippetRefreshIDs.insert(id).inserted {
+                addedAny = true
+            }
+        }
+        guard addedAny || !pendingSnippetRefreshIDs.isEmpty else { return }
+        refreshVisibleSnippets(for: messages.map(\.id))
     }
 
-    private func refreshVisibleSnippets(for visibleIDs: [Int64], forceRefreshIDs: Set<Int64>?) {
+    private func refreshVisibleSnippets(for visibleIDs: [Int64]) {
         let visibleSet = Set(visibleIDs)
-        // Drop cached snippets for rows no longer in the active list so memory stays bounded.
+        // Drop cached & pending snippet entries for rows no longer in the active list.
         if messageSnippets.keys.contains(where: { !visibleSet.contains($0) }) {
             messageSnippets = messageSnippets.filter { visibleSet.contains($0.key) }
         }
-
-        let idsToFetch: [Int64]
-        if let forceRefreshIDs {
-            idsToFetch = visibleIDs.filter { forceRefreshIDs.contains($0) || messageSnippets[$0] == nil }
-        } else {
-            idsToFetch = visibleIDs.filter { messageSnippets[$0] == nil }
+        if !pendingSnippetRefreshIDs.isEmpty {
+            pendingSnippetRefreshIDs = pendingSnippetRefreshIDs.intersection(visibleSet)
         }
+
+        let pendingSnapshot = pendingSnippetRefreshIDs
+        let idsToFetch = visibleIDs.filter { pendingSnapshot.contains($0) || messageSnippets[$0] == nil }
         guard !idsToFetch.isEmpty else { return }
 
         let indexCoordinator = bodyIndex
@@ -1015,11 +1041,15 @@ final class AppViewModel: ObservableObject {
             let currentVisible = Set(self.messages.map(\.id))
             var merged = self.messageSnippets
             var changed = false
-            for (id, raw) in rawSnippets where currentVisible.contains(id) {
-                let cleaned = Self.cleanListSnippet(raw)
-                if merged[id] != cleaned {
-                    merged[id] = cleaned
-                    changed = true
+            for id in idsToFetch {
+                self.pendingSnippetRefreshIDs.remove(id)
+                guard currentVisible.contains(id) else { continue }
+                if let raw = rawSnippets[id] {
+                    let cleaned = Self.cleanListSnippet(raw)
+                    if merged[id] != cleaned {
+                        merged[id] = cleaned
+                        changed = true
+                    }
                 }
             }
             if changed {
@@ -1030,9 +1060,10 @@ final class AppViewModel: ObservableObject {
 
     private static func cleanListSnippet(_ raw: String) -> String? {
         var text = raw
-        // BodyIndexCoordinator always appends attachment filenames with "\n[附件] ".
-        // Match that exact delimiter from the tail so bodies starting with "[附件]" are preserved.
-        if let range = text.range(of: "\n[附件] ", options: .backwards) {
+        // BodyIndexCoordinator appends attachment filenames using the unambiguous record separator "\n\u{001E}[附件] ".
+        if let range = text.range(of: "\n\u{001E}[附件] ") {
+            text = String(text[..<range.lowerBound])
+        } else if let range = text.range(of: "\u{001E}[附件] ") {
             text = String(text[..<range.lowerBound])
         }
         let collapsed = text
@@ -1225,7 +1256,7 @@ final class AppViewModel: ObservableObject {
             }
             try? await Task.sleep(for: .milliseconds(500))
             guard let self, !Task.isCancelled, self.selectedMessageID == id else { return }
-            self.pendingReadOverrides[id] = true
+            let readToken = self.beginReadOverride(rowID: id, isRead: true)
             self.updateLocalReadState(rowID: id, isRead: true)
             if self.sidebarSelection == .unread,
                let updated = self.messages.first(where: { $0.id == id }) {
@@ -1238,16 +1269,11 @@ final class AppViewModel: ObservableObject {
                 do {
                     try await MailAppleScriptBridge.setReadStatus(rowID: id, isRead: true)
                     try? await Task.sleep(for: .milliseconds(500))
-                    if self.pendingReadOverrides[id] == true {
-                        self.pendingReadOverrides.removeValue(forKey: id)
-                    }
+                    self.finishReadOverride(rowID: id, token: readToken, succeeded: true, fallbackIsRead: false)
                     self.refreshNow()
                 } catch {
-                    if self.pendingReadOverrides[id] == true {
-                        self.pendingReadOverrides.removeValue(forKey: id)
-                    }
                     self.sessionKeptUnreadMessages.removeValue(forKey: id)
-                    self.updateLocalReadState(rowID: id, isRead: false)
+                    self.finishReadOverride(rowID: id, token: readToken, succeeded: false, fallbackIsRead: false)
                     self.showToast("自动标已读失败：请在系统设置 → 自动化中允许控制「邮件」")
                 }
             }

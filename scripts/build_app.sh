@@ -145,11 +145,13 @@ fi
 rm -rf "$APP_BUNDLE"
 mv "$STAGING_BUNDLE" "$APP_BUNDLE"
 
-# Refresh macOS LaunchServices icon registration so Finder & Notification Center pick up MailPilotCrane.icns
+# Refresh macOS LaunchServices icon registration unless caller (e.g. install_app.sh) handles final install registration
 touch "$APP_BUNDLE"
-LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-if [[ -x "$LSREGISTER" ]]; then
-  "$LSREGISTER" -f "$APP_BUNDLE" || true
+if [[ "${SKIP_LSREGISTER:-0}" != "1" ]]; then
+  LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+  if [[ -x "$LSREGISTER" ]]; then
+    "$LSREGISTER" -f "$APP_BUNDLE" || true
+  fi
 fi
 
 echo "Built app bundle: $APP_BUNDLE"

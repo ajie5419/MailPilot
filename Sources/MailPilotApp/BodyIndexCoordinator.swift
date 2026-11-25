@@ -67,13 +67,16 @@ final class BodyIndexCoordinator: ObservableObject {
         parser: EmlxParser?,
         onToast: @escaping (String) -> Void
     ) {
+        let previousTask = indexingTask
         indexingTask?.cancel()
+        indexingTask = nil
         hasCompletedFullSweep = false
         hasPrunedStale = false
         resumeCursorRowID = nil
         errorMessage = nil
         let ftsIndex = index
         Task { [weak self] in
+            await previousTask?.value
             do {
                 try await ftsIndex.clearAll()
                 self?.indexedBodyCount = 0
@@ -110,13 +113,16 @@ final class BodyIndexCoordinator: ObservableObject {
     }
 
     func clear(onToast: @escaping (String) -> Void) {
+        let previousTask = indexingTask
         indexingTask?.cancel()
+        indexingTask = nil
         hasCompletedFullSweep = false
         hasPrunedStale = false
         resumeCursorRowID = nil
         errorMessage = nil
         let ftsIndex = index
         Task { [weak self] in
+            await previousTask?.value
             do {
                 try await ftsIndex.clearAll()
                 self?.indexedBodyCount = 0
@@ -182,11 +188,12 @@ final class BodyIndexCoordinator: ObservableObject {
                         if Task.isCancelled { break }
                         let result = await parser.loadPlainTextForIndexing(for: msg.id, cachedMTime: storedVersions[msg.id])
                         guard case let .parsed(plainText, attachmentNames, mtime) = result else { continue }
+                        if Task.isCancelled { break }
                         let indexedBody: String
                         if attachmentNames.isEmpty {
                             indexedBody = plainText
                         } else {
-                            indexedBody = "\(plainText)\n[附件] \(attachmentNames.joined(separator: " "))"
+                            indexedBody = "\(plainText)\n\u{001E}[附件] \(attachmentNames.joined(separator: " "))"
                         }
                         batch.append((
                             rowID: msg.id,
@@ -197,6 +204,7 @@ final class BodyIndexCoordinator: ObservableObject {
                             hasAttachments: !attachmentNames.isEmpty
                         ))
                         if batch.count >= 25 {
+                            if Task.isCancelled { break }
                             try await ftsIndex.upsertBatchWithMetadata(batch)
                             writtenIDs.append(contentsOf: batch.map(\.rowID))
                             batch.removeAll(keepingCapacity: true)
@@ -204,13 +212,13 @@ final class BodyIndexCoordinator: ObservableObject {
                             anyChanges = true
                         }
                     }
-                    if !batch.isEmpty {
+                    if !Task.isCancelled && !batch.isEmpty {
                         try await ftsIndex.upsertBatchWithMetadata(batch)
                         writtenIDs.append(contentsOf: batch.map(\.rowID))
                         chunkWrote = true
                         anyChanges = true
                     }
-                    if chunkWrote {
+                    if !Task.isCancelled && chunkWrote {
                         let total = await ftsIndex.totalIndexedCount()
                         let notifiedIDs = writtenIDs
                         await MainActor.run { [weak self] in
