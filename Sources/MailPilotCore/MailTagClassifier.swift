@@ -66,6 +66,45 @@ public struct MailTagSettings: Codable, Equatable, Sendable {
 /// Zero-latency local classifier that assigns up to 2 semantic tags per email
 /// based on subject, sender name, sender address, and user-configured rules.
 public enum MailTagClassifier {
+    /// Pre-parsed rule snapshot to avoid repeatedly splitting/encoding `customKeywords` across a batch.
+    public struct PreparedRules: Sendable {
+        let isEnabled: Bool
+        let enabledTags: Set<MailSmartTag>
+        let customStrings: [MailSmartTag: [String]]
+        let customBytes: [MailSmartTag: [[UInt8]]]
+        let customFastPathSafe: [MailSmartTag: Bool]
+        let hasCustom: Bool
+
+        public init(settings: MailTagSettings) {
+            self.isEnabled = settings.isEnabled
+            var enabled: Set<MailSmartTag> = []
+            var stringsMap: [MailSmartTag: [String]] = [:]
+            var bytesMap: [MailSmartTag: [[UInt8]]] = [:]
+            var safeMap: [MailSmartTag: Bool] = [:]
+            var anyCustom = false
+            for tag in MailSmartTag.allCases {
+                if settings.isTagEnabled(tag) {
+                    enabled.insert(tag)
+                }
+                let list = settings.customKeywordList(for: tag)
+                if !list.isEmpty {
+                    anyCustom = true
+                    stringsMap[tag] = list
+                    let allSafe = list.allSatisfy { MailTagClassifier.isASCIIOrCJKSafe($0) }
+                    safeMap[tag] = allSafe
+                    if allSafe {
+                        bytesMap[tag] = MailTagClassifier.encodeKeywords(list)
+                    }
+                }
+            }
+            self.enabledTags = enabled
+            self.customStrings = stringsMap
+            self.customBytes = bytesMap
+            self.customFastPathSafe = safeMap
+            self.hasCustom = anyCustom
+        }
+    }
+
     public static func classify(
         _ message: MailMessageSummary,
         settings: MailTagSettings = MailTagSettings()
@@ -74,7 +113,19 @@ public enum MailTagClassifier {
             subject: message.subject,
             senderName: message.senderName,
             senderAddress: message.senderAddress,
-            settings: settings
+            prepared: PreparedRules(settings: settings)
+        )
+    }
+
+    public static func classify(
+        _ message: MailMessageSummary,
+        prepared: PreparedRules
+    ) -> [MailSmartTag] {
+        classify(
+            subject: message.subject,
+            senderName: message.senderName,
+            senderAddress: message.senderAddress,
+            prepared: prepared
         )
     }
 
@@ -131,11 +182,37 @@ public enum MailTagClassifier {
         senderAddress: String,
         settings: MailTagSettings = MailTagSettings()
     ) -> [MailSmartTag] {
-        guard settings.isEnabled else { return [] }
+        classify(
+            subject: subject,
+            senderName: senderName,
+            senderAddress: senderAddress,
+            prepared: PreparedRules(settings: settings)
+        )
+    }
 
-        let subjBytes = lowercasedUTF8Bytes(subject)
-        let addrBytes = lowercasedUTF8Bytes(senderAddress)
-        let nameBytes = lowercasedUTF8Bytes(senderName)
+    public static func classify(
+        subject: String,
+        senderName: String,
+        senderAddress: String,
+        prepared: PreparedRules
+    ) -> [MailSmartTag] {
+        guard prepared.isEnabled else { return [] }
+
+        // Only use the zero-allocation UTF-8 byte matcher when inputs consist strictly of
+        // ASCII + CJK Unified Ideographs (U+4000..U+9FFF) — zero combining marks, zero canonical
+        // decompositions, and zero case-folding ambiguities. Any other Unicode falls back to exact
+        // Foundation/Swift `String.lowercased()` + `String.contains` semantics.
+        guard let subjBytes = fastPathLowercasedUTF8(subject),
+              let addrBytes = fastPathLowercasedUTF8(senderAddress),
+              let nameBytes = fastPathLowercasedUTF8(senderName) else {
+            return classifyUnicodeExact(
+                subject: subject,
+                senderName: senderName,
+                senderAddress: senderAddress,
+                prepared: prepared
+            )
+        }
+
         var combinedBytes: [UInt8] = []
         combinedBytes.reserveCapacity(subjBytes.count + nameBytes.count + addrBytes.count + 2)
         combinedBytes.append(contentsOf: subjBytes)
@@ -143,55 +220,62 @@ public enum MailTagClassifier {
         combinedBytes.append(contentsOf: nameBytes)
         combinedBytes.append(0x20)
         combinedBytes.append(contentsOf: addrBytes)
-        let hasCustom = !settings.customKeywords.isEmpty
+
+        var lazyCombinedString: String?
+        func matchesCustom(_ tag: MailSmartTag) -> Bool {
+            guard prepared.hasCustom else { return false }
+            if prepared.customFastPathSafe[tag] == true, let kwBytes = prepared.customBytes[tag] {
+                return matchesAnyUTF8(combinedBytes, kwBytes)
+            }
+            guard let kwStrings = prepared.customStrings[tag], !kwStrings.isEmpty else { return false }
+            if lazyCombinedString == nil {
+                lazyCombinedString = "\(subject.lowercased()) \(senderName.lowercased()) \(senderAddress.lowercased())"
+            }
+            return matchesAnyString(lazyCombinedString!, kwStrings)
+        }
 
         var tags: [MailSmartTag] = []
         tags.reserveCapacity(2)
 
         // 1. Verification / Security Code
-        if settings.isTagEnabled(.verification) {
-            if matchesAnyUTF8(subjBytes, verificationKeywordBytes)
-                || (hasCustom && matchesAnyUTF8(combinedBytes, encodeKeywords(settings.customKeywordList(for: .verification)))) {
+        if prepared.enabledTags.contains(.verification) {
+            if matchesAnyUTF8(subjBytes, verificationKeywordBytes) || matchesCustom(.verification) {
                 tags.append(.verification)
             }
         }
 
         // 2. Billing / Invoice / Payment
-        if settings.isTagEnabled(.billing) {
-            if matchesAnyUTF8(combinedBytes, billingKeywordBytes)
-                || (hasCustom && matchesAnyUTF8(combinedBytes, encodeKeywords(settings.customKeywordList(for: .billing)))) {
+        if prepared.enabledTags.contains(.billing) {
+            if matchesAnyUTF8(combinedBytes, billingKeywordBytes) || matchesCustom(.billing) {
                 tags.append(.billing)
             }
         }
 
         // 3. Order & Logistics
-        if tags.count < 2 && settings.isTagEnabled(.orderLogistics) {
-            if matchesAnyUTF8(combinedBytes, orderLogisticsKeywordBytes)
-                || (hasCustom && matchesAnyUTF8(combinedBytes, encodeKeywords(settings.customKeywordList(for: .orderLogistics)))) {
+        if tags.count < 2 && prepared.enabledTags.contains(.orderLogistics) {
+            if matchesAnyUTF8(combinedBytes, orderLogisticsKeywordBytes) || matchesCustom(.orderLogistics) {
                 tags.append(.orderLogistics)
             }
         }
 
         // 4. Meeting & Calendar
-        if tags.count < 2 && settings.isTagEnabled(.meeting) {
-            if matchesAnyUTF8(subjBytes, meetingKeywordBytes)
-                || (hasCustom && matchesAnyUTF8(combinedBytes, encodeKeywords(settings.customKeywordList(for: .meeting)))) {
+        if tags.count < 2 && prepared.enabledTags.contains(.meeting) {
+            if matchesAnyUTF8(subjBytes, meetingKeywordBytes) || matchesCustom(.meeting) {
                 tags.append(.meeting)
             }
         }
 
         // 5. Promotion / Newsletter
-        if tags.count < 2 && settings.isTagEnabled(.promotion) {
-            if matchesAnyUTF8(subjBytes, promotionKeywordBytes)
-                || (hasCustom && matchesAnyUTF8(combinedBytes, encodeKeywords(settings.customKeywordList(for: .promotion)))) {
+        if tags.count < 2 && prepared.enabledTags.contains(.promotion) {
+            if matchesAnyUTF8(subjBytes, promotionKeywordBytes) || matchesCustom(.promotion) {
                 tags.append(.promotion)
             }
         }
 
         // 6. System Notification / Security / Welcome / Support
-        if tags.count < 2 && settings.isTagEnabled(.notification) {
+        if tags.count < 2 && prepared.enabledTags.contains(.notification) {
             let hasNotifyKeyword = matchesAnyUTF8(subjBytes, notificationKeywordBytes)
-            let matchedCustom = hasCustom && matchesAnyUTF8(combinedBytes, encodeKeywords(settings.customKeywordList(for: .notification)))
+            let matchedCustom = matchesCustom(.notification)
             if matchedCustom || hasNotifyKeyword || (tags.isEmpty && matchesAnyUTF8(addrBytes, automatedSenderKeywordBytes)) {
                 if !tags.contains(.promotion) {
                     tags.append(.notification)
@@ -202,23 +286,110 @@ public enum MailTagClassifier {
         return tags
     }
 
-    /// Lowercases ASCII in-place directly on UTF-8 bytes; falls back to full Unicode `lowercased()`
-    /// only when non-ASCII Latin/script characters are present (CJK bytes pass through untouched).
-    private static func lowercasedUTF8Bytes(_ text: String) -> [UInt8] {
-        var bytes = Array(text.utf8)
-        var needsUnicodeLowercase = false
-        for i in bytes.indices {
-            let b = bytes[i]
-            if b >= 0x41 && b <= 0x5A {
-                bytes[i] = b &+ 32
-            } else if b >= 0xC0 && !(b >= 0xE3 && b <= 0xE9) {
-                // Non-CJK multi-byte UTF-8 lead byte (Latin Extended, Greek, Cyrillic, Fullwidth Latin, etc.).
-                needsUnicodeLowercase = true
-                break
+    /// Exact Swift `String.contains` fallback preserving canonical Unicode equivalence (NFC/NFD)
+    /// and extended grapheme cluster boundaries (e.g. combining accents, Kana voiced marks, `İ`).
+    private static func classifyUnicodeExact(
+        subject: String,
+        senderName: String,
+        senderAddress: String,
+        prepared: PreparedRules
+    ) -> [MailSmartTag] {
+        let subj = subject.lowercased()
+        let addrLower = senderAddress.lowercased()
+        let sender = "\(senderName.lowercased()) \(addrLower)"
+        let combined = "\(subj) \(sender)"
+
+        var tags: [MailSmartTag] = []
+        tags.reserveCapacity(2)
+
+        if prepared.enabledTags.contains(.verification) {
+            if matchesAnyString(subj, verificationKeywords)
+                || (prepared.hasCustom && matchesAnyString(combined, prepared.customStrings[.verification] ?? [])) {
+                tags.append(.verification)
             }
         }
-        if needsUnicodeLowercase {
-            return Array(text.lowercased().utf8)
+        if prepared.enabledTags.contains(.billing) {
+            if matchesAnyString(combined, billingKeywords)
+                || (prepared.hasCustom && matchesAnyString(combined, prepared.customStrings[.billing] ?? [])) {
+                tags.append(.billing)
+            }
+        }
+        if tags.count < 2 && prepared.enabledTags.contains(.orderLogistics) {
+            if matchesAnyString(combined, orderLogisticsKeywords)
+                || (prepared.hasCustom && matchesAnyString(combined, prepared.customStrings[.orderLogistics] ?? [])) {
+                tags.append(.orderLogistics)
+            }
+        }
+        if tags.count < 2 && prepared.enabledTags.contains(.meeting) {
+            if matchesAnyString(subj, meetingKeywords)
+                || (prepared.hasCustom && matchesAnyString(combined, prepared.customStrings[.meeting] ?? [])) {
+                tags.append(.meeting)
+            }
+        }
+        if tags.count < 2 && prepared.enabledTags.contains(.promotion) {
+            if matchesAnyString(subj, promotionKeywords)
+                || (prepared.hasCustom && matchesAnyString(combined, prepared.customStrings[.promotion] ?? [])) {
+                tags.append(.promotion)
+            }
+        }
+        if tags.count < 2 && prepared.enabledTags.contains(.notification) {
+            let hasNotifyKeyword = matchesAnyString(subj, notificationKeywords)
+            let matchedCustom = prepared.hasCustom && matchesAnyString(combined, prepared.customStrings[.notification] ?? [])
+            if matchedCustom || hasNotifyKeyword || (tags.isEmpty && matchesAnyString(addrLower, automatedSenderKeywords)) {
+                if !tags.contains(.promotion) {
+                    tags.append(.notification)
+                }
+            }
+        }
+        return tags
+    }
+
+    private static func matchesAnyString(_ text: String, _ keywords: [String]) -> Bool {
+        for kw in keywords where !kw.isEmpty {
+            if text.contains(kw) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Returns `true` iff every UTF-8 sequence is ASCII (`0x00..0x7F`, excluding CR) or a 3-byte
+    /// CJK ideograph (`0xE4..0xE9`, i.e. `U+4000..U+9FFF`), which have no combining marks or decompositions.
+    private static func isASCIIOrCJKSafe(_ text: String) -> Bool {
+        for b in text.utf8 {
+            if b < 0x80 {
+                if b == 0x0D { return false }
+                continue
+            }
+            if b >= 0x80 && b <= 0xBF {
+                continue
+            }
+            if b >= 0xE4 && b <= 0xE9 {
+                continue
+            }
+            return false
+        }
+        return true
+    }
+
+    /// Lowercases ASCII in-place directly on UTF-8 bytes when safe; returns `nil` for any text
+    /// containing non-CJK Unicode so the caller uses exact Swift grapheme-aware matching.
+    private static func fastPathLowercasedUTF8(_ text: String) -> [UInt8]? {
+        var bytes = Array(text.utf8)
+        for i in bytes.indices {
+            let b = bytes[i]
+            if b < 0x80 {
+                if b == 0x0D { return nil }
+                if b >= 0x41 && b <= 0x5A {
+                    bytes[i] = b &+ 32
+                }
+            } else if b >= 0x80 && b <= 0xBF {
+                continue
+            } else if b >= 0xE4 && b <= 0xE9 {
+                continue
+            } else {
+                return nil
+            }
         }
         return bytes
     }

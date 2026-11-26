@@ -1065,7 +1065,33 @@ struct StandaloneTestRunner {
         let recentAttPage = try filterReader.fetchMessagePage(onlyInbox: true, onlyWithAttachments: true, sinceDate: recentCutoff, limit: 50)
         assertEqual(recentAttPage.messages.map(\.id), [1], "combined sinceDate + onlyWithAttachments matches only row 1")
 
-        print("ALL 41 CORE TEST SUITES PASSED")
+        // 42. MailTagClassifier UTF-8 fast path preserves exact Unicode canonical equivalence & grapheme boundaries
+        var unicodeSettings = MailTagSettings()
+        unicodeSettings.customKeywords[MailSmartTag.meeting.rawValue] = "café, ガ"
+        unicodeSettings.customKeywords[MailSmartTag.billing.rawValue] = "i"
+        let preparedUnicode = MailTagClassifier.PreparedRules(settings: unicodeSettings)
+        assertTrue(
+            MailTagClassifier.classify(subject: "Cafe\u{0301} sync", senderName: "Team", senderAddress: "a@b.com", prepared: preparedUnicode).contains(.meeting),
+            "NFD Cafe\\u{0301} matches NFC custom keyword café"
+        )
+        assertTrue(
+            MailTagClassifier.classify(subject: "カ\u{3099}イド", senderName: "Team", senderAddress: "a@b.com", prepared: preparedUnicode).contains(.meeting),
+            "NFD Katakana voiced mark matches precomposed ガ"
+        )
+        assertTrue(
+            !MailTagClassifier.classify(subject: "OTP\u{0301} test", senderName: "Bob", senderAddress: "bob@example.com", prepared: preparedUnicode).contains(.verification),
+            "Combining accent on P in OTP\\u{0301} does not false-match ASCII otp"
+        )
+        assertTrue(
+            !MailTagClassifier.classify(subject: "İ", senderName: "Bob", senderAddress: "bob@example.com", prepared: preparedUnicode).contains(.billing),
+            "Turkish dotted İ does not false-match ASCII custom keyword i"
+        )
+        assertTrue(
+            MailTagClassifier.classify(subject: "发票与账单提醒", senderName: "Stripe", senderAddress: "billing@stripe.com", prepared: preparedUnicode).contains(.billing),
+            "CJK + ASCII fast path matches built-in billing keywords"
+        )
+
+        print("ALL 42 CORE TEST SUITES PASSED")
         try await ChatGPTTests.run()
     }
 }

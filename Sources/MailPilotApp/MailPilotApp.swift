@@ -269,13 +269,19 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
     func setSettingsWindowVisible(_ visible: Bool, viewModel: AppViewModel) {
         boundViewModel = viewModel
         if !visible {
+            viewModel.showIconPickerSheet = false
             if let window = settingsWindow {
+                if let sheet = window.attachedSheet {
+                    window.endSheet(sheet)
+                }
                 if window.isVisible {
                     window.orderOut(nil)
                 }
-                // Tear down hidden SettingsView hosting controller so its ObservableObject subscriptions
-                // and behindWindow NSVisualEffectView incur zero background overhead while closed.
-                window.contentViewController = nil
+                // Tear down hidden SettingsView hosting controller only once no sheet is attached,
+                // so ObservableObject subscriptions & behindWindow blur incur zero background overhead.
+                if window.attachedSheet == nil {
+                    window.contentViewController = nil
+                }
             }
             return
         }
@@ -316,12 +322,20 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
 
             let delegate = SettingsWindowDelegate { [weak viewModel] in
                 MainActor.assumeIsolated {
+                    viewModel?.showIconPickerSheet = false
                     viewModel?.showSettings = false
-                    MailPilotAppDelegate.shared?.detachHiddenSettingsContent()
+                    MailPilotAppDelegate.shared?.detachHiddenSettingsContentIfIdle()
                 }
             }
             settingsWindowDelegate = delegate
             created.delegate = delegate
+            NotificationCenter.default.removeObserver(self, name: NSWindow.didEndSheetNotification, object: created)
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleSettingsWindowDidEndSheet(_:)),
+                name: NSWindow.didEndSheetNotification,
+                object: created
+            )
             settingsWindow = created
             window = created
         }
@@ -337,8 +351,17 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
     }
 
     @MainActor
-    func detachHiddenSettingsContent() {
-        settingsWindow?.contentViewController = nil
+    func detachHiddenSettingsContentIfIdle() {
+        guard let window = settingsWindow, !(boundViewModel?.showSettings ?? false) else { return }
+        if let sheet = window.attachedSheet {
+            window.endSheet(sheet)
+            return
+        }
+        window.contentViewController = nil
+    }
+
+    @MainActor @objc private func handleSettingsWindowDidEndSheet(_ notification: Notification) {
+        detachHiddenSettingsContentIfIdle()
     }
 
     // MARK: - Application Lifecycle & Main Window
@@ -409,13 +432,13 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
     @MainActor @objc private func handleMainWindowDidEndSheet(_ notification: Notification) {
         guard let deferred = pendingMainWindowMode else { return }
         pendingMainWindowMode = nil
-        applyMainWindowMode(isOnboarding: deferred.isOnboarding, animate: deferred.animate)
+        applyMainWindowMode(isOnboarding: deferred.isOnboarding, animate: deferred.animate, force: true)
     }
 
     @MainActor
-    func applyMainWindowMode(isOnboarding: Bool, animate: Bool) {
+    func applyMainWindowMode(isOnboarding: Bool, animate: Bool, force: Bool = false) {
         guard let window = mainWindow else { return }
-        if appliedMainWindowOnboarding == isOnboarding && pendingMainWindowMode == nil {
+        if !force && appliedMainWindowOnboarding == isOnboarding && pendingMainWindowMode == nil {
             return
         }
         // Never mutate styleMask or frame while a sheet is attached; defer until `didEndSheetNotification`.

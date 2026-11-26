@@ -1027,8 +1027,9 @@ final class AppViewModel: ObservableObject {
 
                 let (page, precomputedTags, pinnedFetchedMessage) = try await Self.runCancellableDetached(priority: .userInitiated) {
                     try Task.checkCancellation()
+                    let preparedRules = MailTagClassifier.PreparedRules(settings: currentTagSettings)
                     let tagPredicate: ((MailMessageSummary) -> Bool)? = filterTag.map { tag in
-                        { MailTagClassifier.classify($0, settings: currentTagSettings).contains(tag) }
+                        { MailTagClassifier.classify($0, prepared: preparedRules).contains(tag) }
                     }
                     let result = try reader.fetchMessagePage(
                         mailboxID: mailboxID,
@@ -1052,10 +1053,10 @@ final class AppViewModel: ObservableObject {
                     var tagMap: [Int64: [MailSmartTag]] = [:]
                     tagMap.reserveCapacity(result.messages.count + (pinnedMsg == nil ? 0 : 1))
                     for msg in result.messages {
-                        tagMap[msg.id] = MailTagClassifier.classify(msg, settings: currentTagSettings)
+                        tagMap[msg.id] = MailTagClassifier.classify(msg, prepared: preparedRules)
                     }
                     if let pinnedMsg {
-                        tagMap[pinnedMsg.id] = MailTagClassifier.classify(pinnedMsg, settings: currentTagSettings)
+                        tagMap[pinnedMsg.id] = MailTagClassifier.classify(pinnedMsg, prepared: preparedRules)
                     }
                     return (result, tagMap, pinnedMsg)
                 }
@@ -1390,10 +1391,11 @@ final class AppViewModel: ObservableObject {
     }
 
     private func recomputeCachedTags() {
+        let prepared = MailTagClassifier.PreparedRules(settings: tagSettings)
         var fresh: [Int64: [MailSmartTag]] = [:]
         fresh.reserveCapacity(messages.count)
         for msg in messages {
-            fresh[msg.id] = MailTagClassifier.classify(msg, settings: tagSettings)
+            fresh[msg.id] = MailTagClassifier.classify(msg, prepared: prepared)
         }
         cachedMessageTags = fresh
     }
