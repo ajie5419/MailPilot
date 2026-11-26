@@ -108,21 +108,24 @@ final class SenderAvatarLoader: ObservableObject {
         let diskURL = cacheDir.appendingPathComponent("\(domain).png")
         Task.detached(priority: .utility) {
             // Fast disk cache hit off the main thread (never block SwiftUI view body with disk I/O).
-            if let diskImage = NSImage(contentsOf: diskURL), diskImage.size.width >= 16 {
+            if let diskData = try? Data(contentsOf: diskURL), diskData.count > 120 {
                 await MainActor.run {
-                    SenderAvatarLoader.shared.enqueueLoaded(domain: domain, image: diskImage)
+                    if let diskImage = NSImage(data: diskData), diskImage.size.width >= 16 {
+                        SenderAvatarLoader.shared.enqueueLoaded(domain: domain, image: diskImage)
+                    } else {
+                        SenderAvatarLoader.shared.enqueueLoaded(domain: domain, image: nil)
+                    }
                 }
                 return
             }
 
-            let fetched = await Self.fetchBrandIcon(for: domain)
-            if let fetched, let tiff = fetched.tiffRepresentation,
-               let rep = NSBitmapImageRep(data: tiff),
-               let pngData = rep.representation(using: .png, properties: [:]) {
-                try? pngData.write(to: diskURL, options: .atomic)
+            let fetchedPNG = await Self.fetchBrandIconPNGData(for: domain)
+            if let fetchedPNG {
+                try? fetchedPNG.write(to: diskURL, options: .atomic)
             }
             await MainActor.run {
-                SenderAvatarLoader.shared.enqueueLoaded(domain: domain, image: fetched)
+                let image = fetchedPNG.flatMap { NSImage(data: $0) }
+                SenderAvatarLoader.shared.enqueueLoaded(domain: domain, image: image)
             }
         }
         return nil
@@ -157,7 +160,7 @@ final class SenderAvatarLoader: ObservableObject {
         }
     }
 
-    private static func fetchBrandIcon(for domain: String) async -> NSImage? {
+    private static func fetchBrandIconPNGData(for domain: String) async -> Data? {
         let encoded = domain.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? domain
         let candidates = [
             "https://www.google.com/s2/favicons?domain=\(encoded)&sz=128",
@@ -175,10 +178,13 @@ final class SenderAvatarLoader: ObservableObject {
                       data.count > 120,
                       let img = NSImage(data: data),
                       img.size.width >= 16,
-                      img.size.height >= 16 else {
+                      img.size.height >= 16,
+                      let tiff = img.tiffRepresentation,
+                      let rep = NSBitmapImageRep(data: tiff),
+                      let pngData = rep.representation(using: .png, properties: [:]) else {
                     continue
                 }
-                return img
+                return pngData
             } catch {
                 continue
             }

@@ -79,7 +79,7 @@ extension AppViewModel {
         }
     }
 
-    func adjustLocalUnreadCount(for message: MailMessageSummary, delta: Int) {
+    func adjustLocalUnreadCount(for message: MailMessageSummary, delta: Int, forceInbox: Bool = false) {
         guard delta != 0, !mailboxes.isEmpty else { return }
         var updated = mailboxes
         var changed = false
@@ -106,8 +106,7 @@ extension AppViewModel {
 
         // Gmail/IMAP multi-label inbox messages can store `[Gmail]/All Mail` as their primary `mailboxID`
         // while also contributing to the account's `收件箱` unread badge via the `labels` table.
-        let isInInboxView = (sidebarSelection == .allInbox || sidebarSelection == .unread)
-        if !touchedInbox && (message.mailboxName == "收件箱" || isInInboxView),
+        if !touchedInbox && (forceInbox || message.mailboxName == "收件箱" || isShowingInboxScopedView),
            let inboxIdx = updated.firstIndex(where: { $0.displayName == "收件箱" && $0.accountID == message.accountID }) {
             let mb = updated[inboxIdx]
             let nextUnread = max(0, mb.unreadCount + delta)
@@ -133,6 +132,7 @@ extension AppViewModel {
 
     func removeMessageLocally(rowID: Int64) {
         sessionKeptUnreadMessages.removeValue(forKey: rowID)
+        evictVerificationCodeCache(for: rowID)
         menuBarUnreadVerificationCodes.removeValue(forKey: rowID)
         if menuBarRecentVerificationCode?.messageID == rowID {
             menuBarRecentVerificationCode = nil
@@ -215,7 +215,11 @@ extension AppViewModel {
         let original = pendingReadOriginals.removeValue(forKey: rowID)
         localListMutationVersion &+= 1
         if !succeeded {
+            let wasInMessages = messages.contains(where: { $0.id == rowID })
             updateLocalReadState(rowID: rowID, isRead: fallbackIsRead)
+            if !wasInMessages, let original {
+                adjustLocalUnreadCount(for: original.message, delta: fallbackIsRead ? -1 : 1, forceInbox: original.isInbox)
+            }
             if fallbackIsRead {
                 applyOptimisticMenuBarPreviewMutation(updatedMessage: nil, removedRowID: rowID)
             } else if let original, original.isInbox {

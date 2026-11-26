@@ -20,6 +20,15 @@ struct MenuBarPopoverView: View {
         viewModel.totalInboxUnreadCount
     }
 
+    private var activeRecentVerificationCode: RecentVerificationCode? {
+        guard viewModel.accessError == nil,
+              let recent = viewModel.menuBarRecentVerificationCode,
+              Date().timeIntervalSince(recent.dateReceived) <= 15 * 60 else {
+            return nil
+        }
+        return recent
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             headerBar
@@ -28,10 +37,10 @@ struct MenuBarPopoverView: View {
                 .opacity(colorScheme == .dark ? 0.35 : 0.45)
 
             if let feedback = viewModel.menuBarCopyFeedbackText {
-                copyFeedbackBanner(text: feedback)
+                copyFeedbackBanner(text: feedback, isError: viewModel.menuBarCopyFeedbackIsError)
             }
 
-            if viewModel.accessError == nil, let recentCode = viewModel.menuBarRecentVerificationCode {
+            if let recentCode = activeRecentVerificationCode {
                 verificationCodeBanner(for: recentCode)
             }
 
@@ -94,9 +103,12 @@ struct MenuBarPopoverView: View {
         .padding(.vertical, 11)
     }
 
-    private func copyFeedbackBanner(text: String) -> some View {
+    /// High-contrast emerald fill (>= 5.3:1 WCAG AA against white text).
+    private static let copiedSuccessGreen = Color(red: 0.09, green: 0.48, blue: 0.25)
+
+    private func copyFeedbackBanner(text: String, isError: Bool) -> some View {
         HStack(spacing: 6) {
-            Image(systemName: "checkmark.circle.fill")
+            Image(systemName: isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white)
             Text(text)
@@ -107,7 +119,10 @@ struct MenuBarPopoverView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(Color(red: 0.14, green: 0.58, blue: 0.34), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .background(
+            isError ? BrandPalette.coralBadge : Self.copiedSuccessGreen,
+            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+        )
         .padding(.horizontal, 10)
         .padding(.top, 8)
     }
@@ -177,7 +192,7 @@ struct MenuBarPopoverView: View {
                 .padding(.vertical, 6)
                 .background(
                     isCopied
-                        ? AnyShapeStyle(Color(red: 0.14, green: 0.60, blue: 0.34))
+                        ? AnyShapeStyle(Self.copiedSuccessGreen)
                         : AnyShapeStyle(BrandPalette.coralButtonGradient),
                     in: RoundedRectangle(cornerRadius: 9, style: .continuous)
                 )
@@ -263,7 +278,7 @@ struct MenuBarPopoverView: View {
                             .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, viewModel.menuBarRecentVerificationCode != nil ? 18 : 28)
+                    .padding(.vertical, activeRecentVerificationCode != nil ? 18 : 28)
                 } else {
                     VStack(spacing: 4) {
                         ForEach(items) { msg in
@@ -367,7 +382,7 @@ struct MenuBarPopoverView: View {
                         .padding(.vertical, 4)
                         .background(
                             isCopied
-                                ? AnyShapeStyle(Color(red: 0.14, green: 0.60, blue: 0.34))
+                                ? AnyShapeStyle(Self.copiedSuccessGreen)
                                 : AnyShapeStyle(BrandPalette.coralButtonGradient),
                             in: Capsule()
                         )

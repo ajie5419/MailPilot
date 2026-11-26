@@ -284,6 +284,7 @@ final class AppViewModel: ObservableObject {
     @Published var menuBarUnreadVerificationCodes: [Int64: String] = [:]
     @Published var copiedVerificationMessageID: Int64?
     @Published var menuBarCopyFeedbackText: String?
+    @Published var menuBarCopyFeedbackIsError = false
     @Published var launchAtLoginEnabled: Bool = false
 
     @Published var accounts: [MailAccountInfo] = [] {
@@ -359,9 +360,9 @@ final class AppViewModel: ObservableObject {
     private var menuBarCodeTask: Task<Void, Never>?
     private var menuBarCodeGeneration: UInt64 = 0
     private var copiedCodeResetTask: Task<Void, Never>?
-    /// Maps message ROWID -> extracted OTP code (`nil` means parsed and confirmed no code).
+    /// Maps message ROWID -> extracted OTP code (`nil` means parsed full `.emlx` and confirmed no code).
     var cachedVerificationCodes: [Int64: String?] = [:]
-    private var cachedVerificationOrder: [Int64] = []
+    var cachedVerificationOrder: [Int64] = []
     private static let maxCachedVerificationEntries = 128
     private var pendingJumpMessageID: Int64?
     var pinnedJumpMessageID: Int64?
@@ -675,13 +676,14 @@ final class AppViewModel: ObservableObject {
     }
 
     func refreshMenuBarUnreadPreview() {
+        menuBarCodeGeneration &+= 1
+        menuBarCodeTask?.cancel()
+        menuBarCodeTask = nil
         guard let activeReader = reader else {
             menuBarPreviewGeneration &+= 1
             menuBarPreviewTask?.cancel()
             menuBarPreviewTask = nil
-            menuBarCodeGeneration &+= 1
-            menuBarCodeTask?.cancel()
-            menuBarCodeTask = nil
+            clearVerificationCodeCache()
             menuBarUnreadPreviewState = accessError != nil ? .loaded([]) : .loading
             menuBarRecentVerificationCode = nil
             menuBarUnreadVerificationCodes = [:]
@@ -821,7 +823,9 @@ final class AppViewModel: ObservableObject {
                 self.refreshMenuBarVerificationCodes(
                     for: codeCandidates,
                     topUnreadIDs: Set(topUnread.map(\.id)),
-                    activeReader: activeReader
+                    activeReader: activeReader,
+                    previewGeneration: generation,
+                    mutationVersionAtStart: mutationVersionAtStart
                 )
             } catch is CancellationError {
                 return
@@ -831,8 +835,22 @@ final class AppViewModel: ObservableObject {
                       self.reader === activeReader else {
                     return
                 }
+                self.menuBarCodeGeneration &+= 1
+                self.menuBarCodeTask?.cancel()
+                self.menuBarCodeTask = nil
                 self.menuBarUnreadPreviewState = .failed
             }
+        }
+    }
+
+    func clearVerificationCodeCache() {
+        cachedVerificationCodes.removeAll()
+        cachedVerificationOrder.removeAll()
+    }
+
+    func evictVerificationCodeCache(for rowID: Int64) {
+        if cachedVerificationCodes.removeValue(forKey: rowID) != nil {
+            cachedVerificationOrder.removeAll { $0 == rowID }
         }
     }
 
@@ -850,48 +868,62 @@ final class AppViewModel: ObservableObject {
     func recordIncomingVerificationCode(_ code: String, for message: MailMessageSummary) {
         guard !code.isEmpty, !pendingRemovedIDs.contains(message.id) else { return }
         cacheVerificationCode(code, for: message.id)
-        if !message.isRead {
+        let effectiveRead = pendingReadOverrides[message.id]?.isRead ?? message.isRead
+        if !effectiveRead {
             menuBarUnreadVerificationCodes[message.id] = code
-        }
-        let candidate = RecentVerificationCode(
-            messageID: message.id,
-            code: code,
-            sender: message.displaySender,
-            subject: message.subject,
-            dateReceived: message.dateReceived,
-            isUnread: !message.isRead
-        )
-        if let existing = menuBarRecentVerificationCode {
-            if candidate.dateReceived >= existing.dateReceived || candidate.messageID == existing.messageID {
+            if menuBarRecentVerificationCode?.messageID == message.id {
+                menuBarRecentVerificationCode = nil
+            }
+        } else if Date().timeIntervalSince(message.dateReceived) <= 15 * 60 {
+            let candidate = RecentVerificationCode(
+                messageID: message.id,
+                code: code,
+                sender: message.displaySender,
+                subject: message.subject,
+                dateReceived: message.dateReceived,
+                isUnread: false
+            )
+            if let existing = menuBarRecentVerificationCode {
+                if candidate.dateReceived >= existing.dateReceived || candidate.messageID == existing.messageID {
+                    menuBarRecentVerificationCode = candidate
+                }
+            } else {
                 menuBarRecentVerificationCode = candidate
             }
-        } else {
-            menuBarRecentVerificationCode = candidate
+        }
+        if showMenuBarExtra {
+            refreshMenuBarUnreadPreview()
+        }
+    }
+
+    private func showMenuBarCopyFeedback(_ text: String, messageID: Int64, isError: Bool = false) {
+        copiedVerificationMessageID = isError ? nil : messageID
+        menuBarCopyFeedbackText = text
+        menuBarCopyFeedbackIsError = isError
+        copiedCodeResetTask?.cancel()
+        copiedCodeResetTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2.4))
+            guard !Task.isCancelled, let self, self.menuBarCopyFeedbackText == text else { return }
+            self.copiedVerificationMessageID = nil
+            self.menuBarCopyFeedbackText = nil
+            self.menuBarCopyFeedbackIsError = false
         }
     }
 
     func copyVerificationCode(_ code: String, messageID: Int64) {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(code, forType: .string)
-        let markedRead = markVerificationMessageReadIfNeeded(rowID: messageID)
-        copiedVerificationMessageID = messageID
-        menuBarCopyFeedbackText = markedRead
-            ? "已复制 \(code) · 已标为已读"
-            : "已复制验证码 \(code)"
-        copiedCodeResetTask?.cancel()
-        copiedCodeResetTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(2.4))
-            guard !Task.isCancelled, let self, self.copiedVerificationMessageID == messageID else { return }
-            self.copiedVerificationMessageID = nil
-            self.menuBarCopyFeedbackText = nil
+        guard NSPasteboard.general.setString(code, forType: .string) else {
+            showMenuBarCopyFeedback("复制失败，请重试", messageID: messageID, isError: true)
+            return
         }
+        showMenuBarCopyFeedback("已复制验证码 \(code)", messageID: messageID, isError: false)
+        markVerificationMessageReadIfNeeded(rowID: messageID, copiedCode: code)
     }
 
-    @discardableResult
-    private func markVerificationMessageReadIfNeeded(rowID: Int64) -> Bool {
+    private func markVerificationMessageReadIfNeeded(rowID: Int64, copiedCode: String) {
         // Skip if a mark-read write is already in flight for this row.
         if let existingOverride = pendingReadOverrides[rowID], existingOverride.isRead {
-            return false
+            return
         }
 
         let messageInList = messages.first(where: { $0.id == rowID })
@@ -907,7 +939,7 @@ final class AppViewModel: ObservableObject {
             || (messageInPreview != nil)
             || (menuBarUnreadVerificationCodes[rowID] != nil)
             || (menuBarRecentVerificationCode?.messageID == rowID && menuBarRecentVerificationCode?.isUnread == true)
-        guard isUnread else { return false }
+        guard isUnread else { return }
 
         if autoMarkReadTargetID == rowID {
             autoMarkReadTask?.cancel()
@@ -937,7 +969,7 @@ final class AppViewModel: ObservableObject {
         } else {
             if let previewMsg = messageInPreview {
                 pendingReadOriginals[rowID] = (message: previewMsg, isInbox: true)
-                adjustLocalUnreadCount(for: previewMsg, delta: -1)
+                adjustLocalUnreadCount(for: previewMsg, delta: -1, forceInbox: true)
             }
             updateLocalReadState(rowID: rowID, isRead: true)
             notificationManager.removeDeliveredNotification(for: rowID)
@@ -948,22 +980,33 @@ final class AppViewModel: ObservableObject {
             do {
                 try await MailAppleScriptBridge.setReadStatus(rowID: rowID, isRead: true)
                 try? await Task.sleep(for: .milliseconds(500))
+                let isCurrentToken = self.pendingReadOverrides[rowID]?.token == readToken
                 self.finishReadOverride(rowID: rowID, token: readToken, succeeded: true, fallbackIsRead: false)
+                if isCurrentToken && self.copiedVerificationMessageID == rowID {
+                    self.showMenuBarCopyFeedback("已复制 \(copiedCode) · 已标为已读", messageID: rowID, isError: false)
+                }
                 self.refreshNow()
             } catch {
-                self.sessionKeptUnreadMessages.removeValue(forKey: rowID)
+                let isCurrentToken = self.pendingReadOverrides[rowID]?.token == readToken
+                if isCurrentToken {
+                    self.sessionKeptUnreadMessages.removeValue(forKey: rowID)
+                }
                 self.finishReadOverride(rowID: rowID, token: readToken, succeeded: false, fallbackIsRead: false)
+                if isCurrentToken {
+                    self.showMenuBarCopyFeedback("已复制 \(copiedCode) · 标已读失败", messageID: rowID, isError: true)
+                    self.showToast("标记已读失败：请在系统设置 → 自动化中允许控制「邮件」")
+                }
                 self.refreshNow()
-                self.showToast("标记已读失败：请在系统设置 → 自动化中允许控制「邮件」")
             }
         }
-        return true
     }
 
     private func refreshMenuBarVerificationCodes(
         for candidates: [MailMessageSummary],
         topUnreadIDs: Set<Int64>,
-        activeReader: EnvelopeIndexReader
+        activeReader: EnvelopeIndexReader,
+        previewGeneration: UInt64,
+        mutationVersionAtStart: UInt64
     ) {
         let now = Date()
         let recentWindowCutoff = now.addingTimeInterval(-15 * 60)
@@ -1002,29 +1045,38 @@ final class AppViewModel: ObservableObject {
         let generation = menuBarCodeGeneration
         menuBarCodeTask?.cancel()
         menuBarCodeTask = Task { [weak self] in
-            var parsedResults: [(id: Int64, code: String?)] = []
+            var parsedResults: [(id: Int64, code: String?, isPartial: Bool)] = []
             parsedResults.reserveCapacity(limitedToParse.count)
             for msg in limitedToParse {
                 if Task.isCancelled { return }
                 let body = await parser.loadBody(for: msg.id)
                 if Task.isCancelled { return }
                 if body.loadStatus == .ready {
-                    parsedResults.append((msg.id, body.verificationCode))
+                    let isPartial = body.sourcePath?.hasSuffix(".partial.emlx") ?? false
+                    parsedResults.append((msg.id, body.verificationCode, isPartial))
                 }
             }
             guard !Task.isCancelled, let self,
                   self.menuBarCodeGeneration == generation,
+                  self.menuBarPreviewGeneration == previewGeneration,
                   self.reader === activeReader else {
                 return
             }
             for item in parsedResults {
-                self.cacheVerificationCode(item.code, for: item.id)
+                // Never negative-cache `.partial.emlx` so full downloaded bodies are parsed once available.
+                if item.code != nil || !item.isPartial {
+                    self.cacheVerificationCode(item.code, for: item.id)
+                }
+            }
+            if self.localListMutationVersion != mutationVersionAtStart {
+                self.refreshMenuBarUnreadPreview()
+                return
             }
             let liveCandidates = candidates.filter { !self.pendingRemovedIDs.contains($0.id) }
             self.commitMenuBarVerificationCodes(
                 candidates: liveCandidates,
                 topUnreadIDs: topUnreadIDs,
-                recentWindowCutoff: recentWindowCutoff
+                recentWindowCutoff: Date().addingTimeInterval(-15 * 60)
             )
         }
     }
@@ -1176,6 +1228,7 @@ final class AppViewModel: ObservableObject {
             let discovered = try EnvelopeIndexReader.discoverDefault()
             self.reader = discovered
             self.emlxParser = EmlxParser(mailRootURL: discovered.mailVersionURL)
+            self.clearVerificationCodeCache()
             self.accessError = nil
 
             let mailDataDir = discovered.databaseURL.deletingLastPathComponent()
@@ -1865,7 +1918,9 @@ final class AppViewModel: ObservableObject {
                     self.finishReadOverride(rowID: id, token: readToken, succeeded: true, fallbackIsRead: false)
                     self.refreshNow()
                 } catch {
-                    self.sessionKeptUnreadMessages.removeValue(forKey: id)
+                    if self.pendingReadOverrides[id]?.token == readToken {
+                        self.sessionKeptUnreadMessages.removeValue(forKey: id)
+                    }
                     self.finishReadOverride(rowID: id, token: readToken, succeeded: false, fallbackIsRead: false)
                     self.showToast("自动标已读失败：请在系统设置 → 自动化中允许控制「邮件」")
                 }
