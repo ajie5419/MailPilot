@@ -233,15 +233,23 @@ public actor EmlxParser {
 
     private func fastBucketLookup(rowID: Int64) -> String? {
         let relPaths = Self.bucketRelativePaths(for: rowID)
+        guard relPaths.count == 2 else { return nil }
+        let fullRel = relPaths[0]
+        let partialRel = relPaths[1]
+        var partialFallback: String?
         for root in dataRootPaths {
-            for rel in relPaths {
-                let candidate = "\(root)/\(rel)"
-                if access(candidate, F_OK) == 0 {
-                    return candidate
+            let fullCandidate = "\(root)/\(fullRel)"
+            if access(fullCandidate, F_OK) == 0 {
+                return fullCandidate
+            }
+            if partialFallback == nil {
+                let partialCandidate = "\(root)/\(partialRel)"
+                if access(partialCandidate, F_OK) == 0 {
+                    partialFallback = partialCandidate
                 }
             }
         }
-        return nil
+        return partialFallback
     }
 
     /// Discovers mailbox `Data/` directories WITHOUT descending into them (`skipDescendants()`),
