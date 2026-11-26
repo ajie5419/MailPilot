@@ -387,7 +387,7 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
                 object: window,
                 queue: .main
             ) { [weak self] _ in
-                Task { @MainActor [weak self] in
+                MainActor.assumeIsolated {
                     guard let self, let deferred = self.pendingMainWindowMode else { return }
                     self.pendingMainWindowMode = nil
                     self.applyMainWindowMode(isOnboarding: deferred.isOnboarding, animate: deferred.animate)
