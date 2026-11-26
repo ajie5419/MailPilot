@@ -7,7 +7,7 @@ import SwiftUI
 struct VisualEffectBackdrop: NSViewRepresentable {
     var material: NSVisualEffectView.Material
     var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
-    var state: NSVisualEffectView.State = .active
+    var state: NSVisualEffectView.State = .followsWindowActiveState
     var isEmphasized: Bool = false
 
     func makeNSView(context: Context) -> NSVisualEffectView {
@@ -227,17 +227,21 @@ struct MainWindowResolver: NSViewRepresentable {
 
     func updateNSView(_ nsView: WindowResolverNSView, context: Context) {
         nsView.onResolve = onResolve
-        if let window = nsView.window {
-            onResolve(window)
-        }
+        nsView.resolveIfNeeded()
     }
 
     final class WindowResolverNSView: NSView {
         var onResolve: (@MainActor (NSWindow) -> Void)?
+        private weak var lastResolvedWindow: NSWindow?
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            guard let window else { return }
+            resolveIfNeeded()
+        }
+
+        func resolveIfNeeded() {
+            guard let window, window !== lastResolvedWindow else { return }
+            lastResolvedWindow = window
             let callback = onResolve
             Task { @MainActor in
                 callback?(window)

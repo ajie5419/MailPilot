@@ -8,6 +8,7 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
     @MainActor static weak var shared: MailPilotAppDelegate?
     @MainActor private weak var mainWindow: NSWindow?
     @MainActor private var mainWindowOriginalChrome: MainWindowChromeSnapshot?
+    @MainActor private var appliedMainWindowOnboarding: Bool?
     @MainActor private var pendingMainWindowMode: (isOnboarding: Bool, animate: Bool)?
     @MainActor private weak var boundViewModel: AppViewModel?
     @MainActor private var closeInterceptor: WindowCloseInterceptor?
@@ -268,8 +269,17 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
     func setSettingsWindowVisible(_ visible: Bool, viewModel: AppViewModel) {
         boundViewModel = viewModel
         if !visible {
-            if let window = settingsWindow, window.isVisible {
-                window.orderOut(nil)
+            viewModel.showIconPickerSheet = false
+            if let window = settingsWindow {
+                if let sheet = window.attachedSheet {
+                    window.endSheet(sheet)
+                    // Wait for `handleSettingsWindowDidEndSheet` before hiding & tearing down `contentViewController`.
+                    return
+                }
+                if window.isVisible {
+                    window.orderOut(nil)
+                }
+                window.contentViewController = nil
             }
             return
         }
@@ -277,6 +287,14 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
         let window: NSWindow
         if let existing = settingsWindow {
             window = existing
+            if window.contentViewController == nil {
+                let savedFrame = window.frame
+                window.contentViewController = NSHostingController(
+                    rootView: SettingsView(viewModel: viewModel)
+                        .ignoresSafeArea(.container, edges: .top)
+                )
+                window.setFrame(savedFrame, display: false)
+            }
         } else {
             let hosting = NSHostingController(
                 rootView: SettingsView(viewModel: viewModel)
@@ -301,12 +319,21 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
             created.center()
 
             let delegate = SettingsWindowDelegate { [weak viewModel] in
-                Task { @MainActor in
+                MainActor.assumeIsolated {
+                    viewModel?.showIconPickerSheet = false
                     viewModel?.showSettings = false
+                    MailPilotAppDelegate.shared?.detachHiddenSettingsContentIfIdle()
                 }
             }
             settingsWindowDelegate = delegate
             created.delegate = delegate
+            NotificationCenter.default.removeObserver(self, name: NSWindow.didEndSheetNotification, object: created)
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleSettingsWindowDidEndSheet(_:)),
+                name: NSWindow.didEndSheetNotification,
+                object: created
+            )
             settingsWindow = created
             window = created
         }
@@ -319,6 +346,23 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @MainActor
+    func detachHiddenSettingsContentIfIdle() {
+        guard let window = settingsWindow, !(boundViewModel?.showSettings ?? false) else { return }
+        if let sheet = window.attachedSheet {
+            window.endSheet(sheet)
+            return
+        }
+        if window.isVisible {
+            window.orderOut(nil)
+        }
+        window.contentViewController = nil
+    }
+
+    @MainActor @objc private func handleSettingsWindowDidEndSheet(_ notification: Notification) {
+        detachHiddenSettingsContentIfIdle()
     }
 
     // MARK: - Application Lifecycle & Main Window
@@ -358,7 +402,11 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
     func registerMainWindow(_ window: NSWindow) {
         guard !isSettingsWindow(window), !window.isSheet, window.sheetParent == nil else { return }
         if mainWindow !== window {
+            if let previousWindow = mainWindow {
+                NotificationCenter.default.removeObserver(self, name: NSWindow.didEndSheetNotification, object: previousWindow)
+            }
             mainWindow = window
+            appliedMainWindowOnboarding = nil
             mainWindowOriginalChrome = MainWindowChromeSnapshot(
                 hadFullSizeContentView: window.styleMask.contains(.fullSizeContentView),
                 titleVisibility: window.titleVisibility,
@@ -375,7 +423,7 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
                 closeInterceptor = proxy
                 window.delegate = proxy
             }
-            NotificationCenter.default.removeObserver(self, name: NSWindow.didEndSheetNotification, object: nil)
+            NotificationCenter.default.removeObserver(self, name: NSWindow.didEndSheetNotification, object: window)
             NotificationCenter.default.addObserver(
                 self,
                 selector: #selector(handleMainWindowDidEndSheet(_:)),
@@ -388,18 +436,22 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
     @MainActor @objc private func handleMainWindowDidEndSheet(_ notification: Notification) {
         guard let deferred = pendingMainWindowMode else { return }
         pendingMainWindowMode = nil
-        applyMainWindowMode(isOnboarding: deferred.isOnboarding, animate: deferred.animate)
+        applyMainWindowMode(isOnboarding: deferred.isOnboarding, animate: deferred.animate, force: true)
     }
 
     @MainActor
-    func applyMainWindowMode(isOnboarding: Bool, animate: Bool) {
+    func applyMainWindowMode(isOnboarding: Bool, animate: Bool, force: Bool = false) {
         guard let window = mainWindow else { return }
+        if !force && appliedMainWindowOnboarding == isOnboarding && pendingMainWindowMode == nil {
+            return
+        }
         // Never mutate styleMask or frame while a sheet is attached; defer until `didEndSheetNotification`.
         if window.attachedSheet != nil {
             pendingMainWindowMode = (isOnboarding: isOnboarding, animate: animate)
             return
         }
         pendingMainWindowMode = nil
+        appliedMainWindowOnboarding = isOnboarding
         let original = mainWindowOriginalChrome
 
         if isOnboarding {
