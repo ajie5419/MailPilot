@@ -22,7 +22,7 @@ extension AppViewModel {
         let old = messages[idx]
         guard old.isRead != isRead else { return }
         if pendingReadOverrides[rowID] != nil, pendingReadOriginals[rowID] == nil {
-            let isInbox = (old.mailboxName == "收件箱" || sidebarSelection == .allInbox || sidebarSelection == .unread)
+            let isInbox = (old.mailboxName == "收件箱" || isShowingInboxScopedView)
             pendingReadOriginals[rowID] = (message: old, isInbox: isInbox)
         }
         localListMutationVersion &+= 1
@@ -60,8 +60,7 @@ extension AppViewModel {
                 if items.count != before { changed = true }
             }
             if let msg = updatedMessage, !msg.isRead, !pendingRemovedIDs.contains(msg.id) {
-                let isInboxView = (sidebarSelection == .allInbox || sidebarSelection == .unread)
-                if forceInbox || msg.mailboxName == "收件箱" || isInboxView {
+                if forceInbox || msg.mailboxName == "收件箱" || isShowingInboxScopedView {
                     items.removeAll { $0.id == msg.id }
                     items.append(msg)
                     items.sort {
@@ -154,26 +153,27 @@ extension AppViewModel {
         } else if showMenuBarExtra {
             refreshMenuBarUnreadPreview()
         }
-        if selectedMessageID == rowID {
-            if wasPinnedJump {
-                suppressAutoSelectFirstMessage = true
-                autoMarkReadTask?.cancel()
-                autoMarkReadTask = nil
-                autoMarkReadTargetID = nil
-                selectedMessageID = nil
-                if !selectedMessageIDs.isEmpty {
-                    selectedMessageIDs = []
-                }
-            } else {
-                let nextID: Int64? = idx < messages.count ? messages[idx].id : messages.last?.id
-                selectedMessageID = nextID
-                let nextSelection: Set<Int64> = nextID.map { [$0] } ?? []
-                if selectedMessageIDs != nextSelection {
-                    selectedMessageIDs = nextSelection
-                }
+        if wasPinnedJump && (selectedMessageID == rowID || selectedMessageID == nil) {
+            suppressAutoSelectFirstMessage = true
+            autoMarkReadTask?.cancel()
+            autoMarkReadTask = nil
+            autoMarkReadTargetID = nil
+            selectedMessageID = nil
+            if !selectedMessageIDs.isEmpty {
+                selectedMessageIDs = []
+            }
+        } else if selectedMessageID == rowID {
+            let nextID: Int64? = idx < messages.count ? messages[idx].id : messages.last?.id
+            selectedMessageID = nextID
+            let nextSelection: Set<Int64> = nextID.map { [$0] } ?? []
+            if selectedMessageIDs != nextSelection {
+                selectedMessageIDs = nextSelection
             }
         } else {
             selectedMessageIDs.remove(rowID)
+            if messages.isEmpty && !selectedMessageIDs.isEmpty {
+                selectedMessageIDs = []
+            }
         }
     }
 

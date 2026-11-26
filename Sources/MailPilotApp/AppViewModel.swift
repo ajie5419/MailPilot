@@ -808,6 +808,15 @@ final class AppViewModel: ObservableObject {
         appLifecycleObservers = [finishLaunching, becomeActive]
     }
 
+    var isShowingInboxScopedView: Bool {
+        switch sidebarSelection {
+        case .allInbox, .unread, .smartTag:
+            return true
+        case .flagged, .mailbox:
+            return false
+        }
+    }
+
     var isUnifiedView: Bool {
         if case .mailbox = sidebarSelection {
             return false
@@ -1198,6 +1207,13 @@ final class AppViewModel: ObservableObject {
                     }
                 } else if let current = self.selectedMessageID {
                     self.scheduleAutoMarkReadIfNeeded(for: current)
+                }
+
+                // Prune any vanished IDs from multi-selection after committing single selection.
+                let validFilteredIDs = Set(filtered.map(\.id))
+                let prunedSelection = self.selectedMessageIDs.intersection(validFilteredIDs)
+                if self.selectedMessageIDs != prunedSelection {
+                    self.selectedMessageIDs = prunedSelection
                 }
 
                 // Incrementally hydrate missing/pending snippets in the background without blocking list display.
