@@ -55,6 +55,12 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     }
 }
 
+enum MenuBarUnreadPreviewState: Equatable {
+    case loading
+    case loaded([MailMessageSummary])
+    case failed
+}
+
 struct CachedAccountMeta {
     let title: String
     let shortName: String
@@ -80,13 +86,17 @@ final class AppViewModel: ObservableObject {
             if sidebarSelection != oldValue {
                 sessionKeptUnreadMessages.removeAll()
             }
+            guard !suppressFilterReload else { return }
+            pendingJumpMessageID = nil
             currentPageLimit = 200
             reloadMessages()
         }
     }
     @Published var searchQuery: String = "" {
         didSet {
+            guard !suppressFilterReload else { return }
             if searchQuery != oldValue {
+                pendingJumpMessageID = nil
                 reloadGeneration &+= 1
                 reloadTask?.cancel()
                 snippetFetchTask?.cancel()
@@ -97,6 +107,7 @@ final class AppViewModel: ObservableObject {
     }
     @Published var filterUnreadOnly: Bool = false {
         didSet {
+            guard !suppressFilterReload else { return }
             if filterUnreadOnly != oldValue {
                 currentPageLimit = 200
                 reloadMessages()
@@ -105,6 +116,7 @@ final class AppViewModel: ObservableObject {
     }
     @Published var filterHasAttachments: Bool = false {
         didSet {
+            guard !suppressFilterReload else { return }
             if filterHasAttachments != oldValue {
                 currentPageLimit = 200
                 reloadMessages()
@@ -113,6 +125,7 @@ final class AppViewModel: ObservableObject {
     }
     @Published var filterDateRange: SearchDateRange = .all {
         didSet {
+            guard !suppressFilterReload else { return }
             if filterDateRange != oldValue {
                 currentPageLimit = 200
                 reloadMessages()
@@ -241,7 +254,7 @@ final class AppViewModel: ObservableObject {
             updateDockUnreadBadge()
         }
     }
-    @Published var menuBarUnreadMessages: [MailMessageSummary] = []
+    @Published var menuBarUnreadPreviewState: MenuBarUnreadPreviewState = .loading
     @Published var launchAtLoginEnabled: Bool = false
 
     @Published var accounts: [MailAccountInfo] = [] {
@@ -312,6 +325,9 @@ final class AppViewModel: ObservableObject {
     private var recipientsLoadTask: Task<Void, Never>?
     private var reloadTask: Task<Void, Never>?
     private var menuBarPreviewTask: Task<Void, Never>?
+    private var menuBarPreviewGeneration: UInt64 = 0
+    private var pendingJumpMessageID: Int64?
+    private var suppressFilterReload = false
     private var reloadGeneration: UInt64 = 0
     private var snippetFetchTask: Task<Void, Never>?
     private var snippetGeneration: UInt64 = 0
@@ -380,12 +396,7 @@ final class AppViewModel: ObservableObject {
 
         notificationManager.onSelectMessage = { [weak self] rowID in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                MailPilotAppDelegate.shared?.showMainWindow()
-                self.sidebarSelection = .allInbox
-                self.searchQuery = ""
-                self.reloadMessages()
-                self.selectedMessageID = rowID
+                self?.jumpToMessage(rowID: rowID)
             }
         }
         ai.startInitialLoads()
@@ -625,47 +636,124 @@ final class AppViewModel: ObservableObject {
     }
 
     func refreshMenuBarUnreadPreview() {
-        guard let reader else {
-            menuBarUnreadMessages = []
+        guard let activeReader = reader else {
+            menuBarPreviewGeneration &+= 1
+            menuBarPreviewTask?.cancel()
+            menuBarPreviewTask = nil
+            menuBarUnreadPreviewState = accessError != nil ? .loaded([]) : .loading
             return
         }
+        menuBarPreviewGeneration &+= 1
+        let generation = menuBarPreviewGeneration
+        let mutationVersionAtStart = localListMutationVersion
+        let locallyUnreadIDs = pendingReadOverrides.compactMap { $0.value.isRead ? nil : $0.key }
         menuBarPreviewTask?.cancel()
         menuBarPreviewTask = Task { [weak self] in
-            guard let self else { return }
-            let fetched: [MailMessageSummary]? = await Task.detached(priority: .utility) {
-                try? reader.fetchMessagePage(
-                    mailboxID: nil,
-                    onlyInbox: true,
-                    onlyUnread: true,
-                    onlyFlagged: false,
-                    onlyWithAttachments: false,
-                    sinceDate: nil,
-                    searchQuery: "",
-                    bodyHitIDs: [],
-                    fallbackAttachmentRowIDs: nil,
-                    limit: 12,
-                    predicate: nil
-                ).messages
-            }.value
-            guard !Task.isCancelled, let fetched else { return }
-            let filtered = fetched.filter { msg in
-                if self.pendingRemovedIDs.contains(msg.id) { return false }
-                if let override = self.pendingReadOverrides[msg.id], override.isRead { return false }
-                return true
-            }
-            let topFive = Array(filtered.prefix(5))
-            if self.menuBarUnreadMessages != topFive {
-                self.menuBarUnreadMessages = topFive
+            do {
+                let (fetched, localUnreadExtras) = try await Self.runCancellableDetached(priority: .utility) {
+                    try Task.checkCancellation()
+                    let page = try activeReader.fetchMessagePage(
+                        mailboxID: nil,
+                        onlyInbox: true,
+                        onlyUnread: true,
+                        onlyFlagged: false,
+                        onlyWithAttachments: false,
+                        sinceDate: nil,
+                        searchQuery: "",
+                        bodyHitIDs: [],
+                        fallbackAttachmentRowIDs: nil,
+                        limit: 15,
+                        predicate: nil
+                    )
+                    try Task.checkCancellation()
+                    let extras: [MailMessageSummary]
+                    if locallyUnreadIDs.isEmpty {
+                        extras = []
+                    } else {
+                        extras = try activeReader.fetchMessages(byRowIDs: locallyUnreadIDs, onlyInbox: true)
+                    }
+                    try Task.checkCancellation()
+                    return (page.messages, extras)
+                }
+                guard !Task.isCancelled, let self,
+                      self.menuBarPreviewGeneration == generation,
+                      self.reader === activeReader else {
+                    return
+                }
+                if self.localListMutationVersion != mutationVersionAtStart {
+                    self.refreshMenuBarUnreadPreview()
+                    return
+                }
+
+                var byID: [Int64: MailMessageSummary] = [:]
+                for msg in fetched {
+                    guard !self.pendingRemovedIDs.contains(msg.id) else { continue }
+                    if let override = self.pendingReadOverrides[msg.id], override.isRead { continue }
+                    byID[msg.id] = msg
+                }
+                for msg in localUnreadExtras {
+                    guard !self.pendingRemovedIDs.contains(msg.id) else { continue }
+                    if let override = self.pendingReadOverrides[msg.id], override.isRead { continue }
+                    byID[msg.id] = MailMessageSummary(
+                        id: msg.id,
+                        messageIDHeader: msg.messageIDHeader,
+                        subject: msg.subject,
+                        senderAddress: msg.senderAddress,
+                        senderName: msg.senderName,
+                        dateReceived: msg.dateReceived,
+                        isRead: false,
+                        isFlagged: msg.isFlagged,
+                        mailboxID: msg.mailboxID,
+                        mailboxName: msg.mailboxName,
+                        accountID: msg.accountID
+                    )
+                }
+
+                let merged = byID.values.sorted {
+                    if $0.dateReceived != $1.dateReceived {
+                        return $0.dateReceived > $1.dateReceived
+                    }
+                    return $0.id > $1.id
+                }
+                let nextState: MenuBarUnreadPreviewState = .loaded(Array(merged.prefix(5)))
+                if self.menuBarUnreadPreviewState != nextState {
+                    self.menuBarUnreadPreviewState = nextState
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled, let self,
+                      self.menuBarPreviewGeneration == generation,
+                      self.reader === activeReader else {
+                    return
+                }
+                self.menuBarUnreadPreviewState = .failed
             }
         }
     }
 
     func openMessageFromMenuBar(_ rowID: Int64) {
+        jumpToMessage(rowID: rowID)
+    }
+
+    func jumpToMessage(rowID: Int64) {
         MailPilotAppDelegate.shared?.showMainWindow()
+        autoMarkReadTask?.cancel()
+        autoMarkReadTask = nil
+        autoMarkReadTargetID = nil
+        searchDebounceTask?.cancel()
+        pendingJumpMessageID = rowID
+
+        suppressFilterReload = true
         sidebarSelection = .allInbox
         searchQuery = ""
+        filterUnreadOnly = false
+        filterHasAttachments = false
+        filterDateRange = .all
+        currentPageLimit = 200
+        suppressFilterReload = false
+
         reloadMessages()
-        selectedMessageID = rowID
     }
 
     private func observeAppLifecycle() {
@@ -879,6 +967,7 @@ final class AppViewModel: ObservableObject {
         reloadGeneration &+= 1
         let generation = reloadGeneration
         let mutationVersionAtStart = localListMutationVersion
+        let jumpTargetID = pendingJumpMessageID
         reloadTask?.cancel()
         snippetFetchTask?.cancel()
 
@@ -896,7 +985,7 @@ final class AppViewModel: ObservableObject {
                     : nil
                 guard !Task.isCancelled, self.reloadGeneration == generation else { return }
 
-                let (page, precomputedTags) = try await Self.runCancellableDetached(priority: .userInitiated) {
+                let (page, precomputedTags, jumpFetchedMessage) = try await Self.runCancellableDetached(priority: .userInitiated) {
                     try Task.checkCancellation()
                     let tagPredicate: ((MailMessageSummary) -> Bool)? = filterTag.map { tag in
                         { MailTagClassifier.classify($0, settings: currentTagSettings).contains(tag) }
@@ -915,12 +1004,20 @@ final class AppViewModel: ObservableObject {
                         predicate: tagPredicate
                     )
                     try Task.checkCancellation()
+                    var jumpMsg: MailMessageSummary?
+                    if let jumpTargetID, !result.messages.contains(where: { $0.id == jumpTargetID }) {
+                        jumpMsg = try? reader.fetchMessages(byRowIDs: [jumpTargetID], onlyInbox: onlyInbox).first
+                    }
+                    try Task.checkCancellation()
                     var tagMap: [Int64: [MailSmartTag]] = [:]
-                    tagMap.reserveCapacity(result.messages.count)
+                    tagMap.reserveCapacity(result.messages.count + (jumpMsg == nil ? 0 : 1))
                     for msg in result.messages {
                         tagMap[msg.id] = MailTagClassifier.classify(msg, settings: currentTagSettings)
                     }
-                    return (result, tagMap)
+                    if let jumpMsg {
+                        tagMap[jumpMsg.id] = MailTagClassifier.classify(jumpMsg, settings: currentTagSettings)
+                    }
+                    return (result, tagMap, jumpMsg)
                 }
                 guard !Task.isCancelled, self.reloadGeneration == generation else { return }
 
@@ -950,6 +1047,38 @@ final class AppViewModel: ObservableObject {
                         )
                     }
                     return msg
+                }
+
+                // Include the requested jump target (e.g. older than top 200) inside the same atomic list commit.
+                if let jumpTargetID,
+                   !filtered.contains(where: { $0.id == jumpTargetID }),
+                   let jumpFetchedMessage,
+                   !self.pendingRemovedIDs.contains(jumpTargetID) {
+                    let adjustedJump: MailMessageSummary
+                    if let overrideEntry = self.pendingReadOverrides[jumpTargetID], overrideEntry.isRead != jumpFetchedMessage.isRead {
+                        adjustedJump = MailMessageSummary(
+                            id: jumpFetchedMessage.id,
+                            messageIDHeader: jumpFetchedMessage.messageIDHeader,
+                            subject: jumpFetchedMessage.subject,
+                            senderAddress: jumpFetchedMessage.senderAddress,
+                            senderName: jumpFetchedMessage.senderName,
+                            dateReceived: jumpFetchedMessage.dateReceived,
+                            isRead: overrideEntry.isRead,
+                            isFlagged: jumpFetchedMessage.isFlagged,
+                            mailboxID: jumpFetchedMessage.mailboxID,
+                            mailboxName: jumpFetchedMessage.mailboxName,
+                            accountID: jumpFetchedMessage.accountID
+                        )
+                    } else {
+                        adjustedJump = jumpFetchedMessage
+                    }
+                    filtered.append(adjustedJump)
+                    filtered.sort {
+                        if $0.dateReceived != $1.dateReceived {
+                            return $0.dateReceived > $1.dateReceived
+                        }
+                        return $0.id > $1.id
+                    }
                 }
 
                 if self.sidebarSelection == .unread && trimmedQuery.isEmpty && !self.sessionKeptUnreadMessages.isEmpty {
@@ -983,7 +1112,21 @@ final class AppViewModel: ObservableObject {
                 if self.hasMoreMessages != page.hasMore {
                     self.hasMoreMessages = page.hasMore
                 }
-                if let current = self.selectedMessageID, !filtered.contains(where: { $0.id == current }) {
+                if let jumpTargetID {
+                    if self.pendingJumpMessageID == jumpTargetID {
+                        self.pendingJumpMessageID = nil
+                    }
+                    if filtered.contains(where: { $0.id == jumpTargetID }) {
+                        self.selectedMessageID = jumpTargetID
+                        self.scheduleAutoMarkReadIfNeeded(for: jumpTargetID)
+                    } else {
+                        self.autoMarkReadTask?.cancel()
+                        self.autoMarkReadTask = nil
+                        self.autoMarkReadTargetID = nil
+                        self.selectedMessageID = nil
+                        self.showToast("该邮件已不在收件箱中或已被删除")
+                    }
+                } else if let current = self.selectedMessageID, !filtered.contains(where: { $0.id == current }) {
                     self.selectedMessageID = filtered.first?.id
                 } else if self.selectedMessageID == nil {
                     self.selectedMessageID = filtered.first?.id

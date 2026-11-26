@@ -7,6 +7,7 @@ import SwiftUI
 final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @MainActor static weak var shared: MailPilotAppDelegate?
     @MainActor private weak var mainWindow: NSWindow?
+    @MainActor private var mainWindowOriginalChrome: MainWindowChromeSnapshot?
     @MainActor private weak var boundViewModel: AppViewModel?
     @MainActor private var closeInterceptor: WindowCloseInterceptor?
     @MainActor private var isQuitting = false
@@ -20,9 +21,18 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
     @MainActor var onMenuBarCompose: (() -> Void)?
     @MainActor var onMenuBarCheckMail: (() -> Void)?
 
-    // Standalone behindWindow Liquid-Glass Settings Window
+    // Standalone behindWindow Liquid-Glass Settings Window (single authoritative owner)
     @MainActor private var settingsWindow: NSWindow?
     @MainActor private var settingsWindowDelegate: SettingsWindowDelegate?
+
+    private struct MainWindowChromeSnapshot {
+        let hadFullSizeContentView: Bool
+        let titleVisibility: NSWindow.TitleVisibility
+        let titlebarAppearsTransparent: Bool
+        let isMovableByWindowBackground: Bool
+        let isOpaque: Bool
+        let backgroundColor: NSColor?
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated {
@@ -82,7 +92,6 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
             button.action = #selector(handleStatusBarButtonClick(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
-        item.menu = nil
     }
 
     @MainActor @objc private func handleStatusBarButtonClick(_ sender: NSStatusBarButton) {
@@ -96,7 +105,6 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
 
     @MainActor
     private func showStatusContextMenu(from button: NSStatusBarButton) {
-        guard let item = statusItem else { return }
         let menu = NSMenu()
         let statusTitle = lastMenuBarUnreadCount > 0
             ? "收件箱未读：\(lastMenuBarUnreadCount) 封"
@@ -127,9 +135,9 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
         quitItem.target = self
         menu.addItem(quitItem)
 
-        item.menu = menu
-        button.performClick(nil)
-        item.menu = nil
+        // Pop up directly from the button without mutating `statusItem.menu`,
+        // so concurrent unread badge refreshes cannot dismiss or clobber the menu.
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
     }
 
     @MainActor
@@ -142,6 +150,7 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
             showMainWindow()
             return
         }
+        guard button.window != nil else { return }
 
         viewModel.refreshMenuBarUnreadPreview()
 
@@ -188,15 +197,15 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
         hosting.sizingOptions = .preferredContentSize
         popover.contentViewController = hosting
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
-
-        installPopoverOutsideClickMonitor()
+        if popover.isShown {
+            popover.contentViewController?.view.window?.makeKey()
+        }
     }
 
     @MainActor
     private func closeStatusPopover() {
-        statusPopover?.performClose(nil)
         removePopoverOutsideClickMonitor()
+        statusPopover?.performClose(nil)
     }
 
     @MainActor
@@ -214,6 +223,12 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
         if let monitor = popoverClickMonitor {
             NSEvent.removeMonitor(monitor)
             popoverClickMonitor = nil
+        }
+    }
+
+    func popoverDidShow(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            installPopoverOutsideClickMonitor()
         }
     }
 
@@ -295,6 +310,9 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
             window = created
         }
 
+        if !viewModel.showSettings {
+            viewModel.showSettings = true
+        }
         if window.isMiniaturized {
             window.deminiaturize(nil)
         }
@@ -319,7 +337,10 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         MainActor.assumeIsolated {
-            if !flag, let window = mainWindow {
+            // Check the registered main window explicitly instead of relying only on `hasVisibleWindows`,
+            // because an open standalone Settings window makes `hasVisibleWindows == true` while main is hidden.
+            let mainIsVisible = mainWindow?.isVisible ?? false
+            if !mainIsVisible, let window = mainWindow {
                 if window.isMiniaturized {
                     window.deminiaturize(nil)
                 }
@@ -333,21 +354,83 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
 
     @MainActor
     func registerMainWindow(_ window: NSWindow) {
-        guard !isSettingsWindow(window), mainWindow !== window else { return }
-        mainWindow = window
-        // Intercept red close button (`⌘W` / `×`) to hide the window via `orderOut` instead of destroying
-        // the SwiftUI view tree & WKWebView, making reopening from Dock instantaneous (<16ms).
-        if !(window.delegate is WindowCloseInterceptor) {
-            let proxy = WindowCloseInterceptor(forwardingTo: window.delegate)
-            proxy.isQuitting = isQuitting
-            closeInterceptor = proxy
-            window.delegate = proxy
+        guard !isSettingsWindow(window), !window.isSheet, window.sheetParent == nil else { return }
+        if mainWindow !== window {
+            mainWindow = window
+            mainWindowOriginalChrome = MainWindowChromeSnapshot(
+                hadFullSizeContentView: window.styleMask.contains(.fullSizeContentView),
+                titleVisibility: window.titleVisibility,
+                titlebarAppearsTransparent: window.titlebarAppearsTransparent,
+                isMovableByWindowBackground: window.isMovableByWindowBackground,
+                isOpaque: window.isOpaque,
+                backgroundColor: window.backgroundColor
+            )
+            // Intercept red close button (`⌘W` / `×`) to hide the window via `orderOut` instead of destroying
+            // the SwiftUI view tree & WKWebView, making reopening from Dock instantaneous (<16ms).
+            if !(window.delegate is WindowCloseInterceptor) {
+                let proxy = WindowCloseInterceptor(forwardingTo: window.delegate)
+                proxy.isQuitting = isQuitting
+                closeInterceptor = proxy
+                window.delegate = proxy
+            }
+        }
+    }
+
+    @MainActor
+    func applyMainWindowMode(isOnboarding: Bool, animate: Bool) {
+        guard let window = mainWindow else { return }
+        let original = mainWindowOriginalChrome
+
+        if isOnboarding {
+            window.styleMask.insert(.fullSizeContentView)
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            window.isMovableByWindowBackground = true
+            window.isOpaque = false
+            window.backgroundColor = .clear
+        } else {
+            if let original {
+                if original.hadFullSizeContentView {
+                    window.styleMask.insert(.fullSizeContentView)
+                } else {
+                    window.styleMask.remove(.fullSizeContentView)
+                }
+                window.titleVisibility = original.titleVisibility
+                window.titlebarAppearsTransparent = original.titlebarAppearsTransparent
+                window.isMovableByWindowBackground = original.isMovableByWindowBackground
+                window.isOpaque = original.isOpaque
+                window.backgroundColor = original.backgroundColor ?? .windowBackgroundColor
+            } else {
+                window.styleMask.remove(.fullSizeContentView)
+                window.titleVisibility = .visible
+                window.titlebarAppearsTransparent = false
+                window.isMovableByWindowBackground = false
+                window.isOpaque = true
+                window.backgroundColor = .windowBackgroundColor
+            }
+        }
+
+        let targetSize = isOnboarding ? NSSize(width: 468, height: 536) : NSSize(width: 1120, height: 700)
+        let current = window.frame
+        let needsResize = isOnboarding
+            ? (abs(current.width - targetSize.width) > 36 || abs(current.height - targetSize.height) > 36)
+            : (current.width < 880 || current.height < 560)
+        guard needsResize else { return }
+
+        let newOrigin = NSPoint(
+            x: current.midX - targetSize.width / 2,
+            y: current.midY - targetSize.height / 2
+        )
+        let targetFrame = NSRect(origin: newOrigin, size: targetSize)
+        window.setFrame(targetFrame, display: true, animate: animate && window.attachedSheet == nil)
+        if !animate && window.attachedSheet == nil {
+            window.center()
         }
     }
 
     @MainActor
     func showMainWindow() {
-        guard let window = mainWindow ?? NSApp.windows.first(where: { !$0.isSheet && $0.canBecomeMain && !isSettingsWindow($0) }) else {
+        guard let window = mainWindow ?? NSApp.windows.first(where: { !$0.isSheet && $0.sheetParent == nil && $0.canBecomeMain && !isSettingsWindow($0) }) else {
             return
         }
         if window.isMiniaturized {
@@ -417,8 +500,7 @@ struct MailPilotApp: App {
         WindowGroup("MailPilot") {
             MainWindowRoot(
                 viewModel: viewModel,
-                compose: viewModel.compose,
-                configureMainWindow: configureMainWindow
+                compose: viewModel.compose
             )
         }
         .defaultSize(width: 1120, height: 700)
@@ -494,77 +576,41 @@ struct MailPilotApp: App {
                 .keyboardShortcut("j", modifiers: [.command])
             }
         }
-
-        Settings {
-            SettingsView(viewModel: viewModel)
-                .frame(width: 790, height: 580)
-        }
-    }
-
-    @MainActor
-    private func configureMainWindow(isOnboarding: Bool, animate: Bool) {
-        DispatchQueue.main.async {
-            let delegate = MailPilotAppDelegate.shared
-            guard let window = NSApp.windows.first(where: { $0.isVisible && !$0.isSheet && $0.canBecomeMain && !(delegate?.isSettingsWindow($0) ?? false) })
-                    ?? NSApp.windows.first(where: { !$0.isSheet && $0.canBecomeMain && !(delegate?.isSettingsWindow($0) ?? false) }) else {
-                return
-            }
-            delegate?.registerMainWindow(window)
-
-            // Apply Canapé-style frameless frosted-glass chrome during onboarding;
-            // restore crisp native macOS toolbar chrome once authorized.
-            if isOnboarding {
-                window.styleMask.insert(.fullSizeContentView)
-                window.titleVisibility = .hidden
-                window.titlebarAppearsTransparent = true
-                window.isMovableByWindowBackground = true
-                window.isOpaque = false
-                window.backgroundColor = .clear
-            } else {
-                window.titleVisibility = .visible
-                window.titlebarAppearsTransparent = false
-                window.isMovableByWindowBackground = false
-                window.isOpaque = true
-                window.backgroundColor = .windowBackgroundColor
-            }
-
-            let targetSize = isOnboarding ? NSSize(width: 468, height: 536) : NSSize(width: 1120, height: 700)
-            let current = window.frame
-            let needsResize = isOnboarding
-                ? (abs(current.width - targetSize.width) > 36 || abs(current.height - targetSize.height) > 36)
-                : (current.width < 880 || current.height < 560)
-            guard needsResize else { return }
-
-            let newOrigin = NSPoint(
-                x: current.midX - targetSize.width / 2,
-                y: current.midY - targetSize.height / 2
-            )
-            let targetFrame = NSRect(origin: newOrigin, size: targetSize)
-            window.setFrame(targetFrame, display: true, animate: animate)
-            if !animate {
-                window.center()
-            }
-        }
     }
 }
 
 private struct MainWindowRoot: View {
     @ObservedObject var viewModel: AppViewModel
     @ObservedObject var compose: ComposeCoordinator
-    let configureMainWindow: @MainActor (Bool, Bool) -> Void
 
     var body: some View {
         ContentView(viewModel: viewModel)
+            .background(
+                MainWindowResolver { window in
+                    MailPilotAppDelegate.shared?.registerMainWindow(window)
+                    MailPilotAppDelegate.shared?.applyMainWindowMode(
+                        isOnboarding: viewModel.accessError != nil,
+                        animate: false
+                    )
+                }
+                .frame(width: 0, height: 0)
+            )
             .frame(
                 minWidth: viewModel.accessError != nil ? 460 : 880,
                 minHeight: viewModel.accessError != nil ? 520 : 560
             )
             .onAppear {
                 MailPilotAppDelegate.shared?.bind(viewModel: viewModel)
-                configureMainWindow(viewModel.accessError != nil, false)
+                MailPilotAppDelegate.shared?.applyMainWindowMode(
+                    isOnboarding: viewModel.accessError != nil,
+                    animate: false
+                )
             }
             .onChange(of: viewModel.accessError == nil) { _, isAuthorized in
-                configureMainWindow(!isAuthorized, true)
+                MailPilotAppDelegate.shared?.applyMainWindowMode(
+                    isOnboarding: !isAuthorized,
+                    animate: true
+                )
             }
             .onChange(of: viewModel.showSettings) { _, isVisible in
                 MailPilotAppDelegate.shared?.setSettingsWindowVisible(isVisible, viewModel: viewModel)

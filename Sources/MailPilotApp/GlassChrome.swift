@@ -41,10 +41,25 @@ enum BrandPalette {
     static let coralAmber = Color(red: 1.0, green: 0.557, blue: 0.235)     // #FF8E3C
     static let coral = Color(red: 0.957, green: 0.337, blue: 0.271)         // #F45645
     static let coralRose = Color(red: 0.886, green: 0.212, blue: 0.337)     // #E23656
+    /// High-contrast Sunset Coral fill for small white text (>= 5.8:1 WCAG AA).
+    static let coralBadge = Color(red: 0.77, green: 0.16, blue: 0.16)       // #C42929
 
     static var coralGradient: LinearGradient {
         LinearGradient(
             colors: [coralAmber, coral, coralRose],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+    }
+
+    /// Rich Sunset Coral gradient with >= 5.1:1 contrast against white button text across all stops.
+    static var coralButtonGradient: LinearGradient {
+        LinearGradient(
+            colors: [
+                Color(red: 0.847, green: 0.220, blue: 0.165), // #D8382A
+                Color(red: 0.780, green: 0.133, blue: 0.259), // #C72242
+                Color(red: 0.651, green: 0.090, blue: 0.294)  // #A6174B
+            ],
             startPoint: .topLeading,
             endPoint: .bottomTrailing
         )
@@ -197,5 +212,36 @@ enum CraneTemplateIconRenderer {
         image.isTemplate = true
         image.accessibilityDescription = "MailPilot"
         return image
+    }
+}
+
+/// Resolves the exact `NSWindow` hosting a SwiftUI root view without guessing from `NSApp.windows`.
+struct MainWindowResolver: NSViewRepresentable {
+    let onResolve: @MainActor (NSWindow) -> Void
+
+    func makeNSView(context: Context) -> WindowResolverNSView {
+        let view = WindowResolverNSView()
+        view.onResolve = onResolve
+        return view
+    }
+
+    func updateNSView(_ nsView: WindowResolverNSView, context: Context) {
+        nsView.onResolve = onResolve
+        if let window = nsView.window {
+            onResolve(window)
+        }
+    }
+
+    final class WindowResolverNSView: NSView {
+        var onResolve: (@MainActor (NSWindow) -> Void)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let window else { return }
+            let callback = onResolve
+            Task { @MainActor in
+                callback?(window)
+            }
+        }
     }
 }

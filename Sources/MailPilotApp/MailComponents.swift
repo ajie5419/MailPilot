@@ -533,7 +533,7 @@ struct PermissionGuideView: View {
                     .frame(maxWidth: 268)
                     .padding(.vertical, 11)
                     .background(
-                        BrandPalette.coralGradient,
+                        BrandPalette.coralButtonGradient,
                         in: RoundedRectangle(cornerRadius: 11, style: .continuous)
                     )
                     .overlay(

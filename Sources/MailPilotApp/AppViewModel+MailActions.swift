@@ -12,7 +12,7 @@ extension AppViewModel {
         let old = messages[idx]
         guard old.isRead != isRead else { return }
         localListMutationVersion &+= 1
-        messages[idx] = MailMessageSummary(
+        let updated = MailMessageSummary(
             id: old.id,
             messageIDHeader: old.messageIDHeader,
             subject: old.subject,
@@ -25,9 +25,40 @@ extension AppViewModel {
             mailboxName: old.mailboxName,
             accountID: old.accountID
         )
+        messages[idx] = updated
+        applyOptimisticMenuBarPreviewMutation(updatedMessage: updated, removedRowID: isRead ? rowID : nil)
         adjustLocalUnreadCount(for: old, delta: isRead ? -1 : 1)
         if isRead {
             notificationManager.removeDeliveredNotification(for: rowID)
+        }
+    }
+
+    private func applyOptimisticMenuBarPreviewMutation(updatedMessage: MailMessageSummary?, removedRowID: Int64?) {
+        if case .loaded(var items) = menuBarUnreadPreviewState {
+            var changed = false
+            if let removedRowID {
+                let before = items.count
+                items.removeAll { $0.id == removedRowID }
+                if items.count != before { changed = true }
+            }
+            if let msg = updatedMessage, !msg.isRead, !pendingRemovedIDs.contains(msg.id) {
+                let isInboxView = (sidebarSelection == .allInbox || sidebarSelection == .unread)
+                if msg.mailboxName == "收件箱" || isInboxView {
+                    items.removeAll { $0.id == msg.id }
+                    items.append(msg)
+                    items.sort {
+                        if $0.dateReceived != $1.dateReceived {
+                            return $0.dateReceived > $1.dateReceived
+                        }
+                        return $0.id > $1.id
+                    }
+                    items = Array(items.prefix(5))
+                    changed = true
+                }
+            }
+            if changed {
+                menuBarUnreadPreviewState = .loaded(items)
+            }
         }
     }
 
@@ -85,12 +116,20 @@ extension AppViewModel {
 
     func removeMessageLocally(rowID: Int64) {
         sessionKeptUnreadMessages.removeValue(forKey: rowID)
-        guard let idx = messages.firstIndex(where: { $0.id == rowID }) else { return }
+        applyOptimisticMenuBarPreviewMutation(updatedMessage: nil, removedRowID: rowID)
+        guard let idx = messages.firstIndex(where: { $0.id == rowID }) else {
+            if showMenuBarExtra {
+                refreshMenuBarUnreadPreview()
+            }
+            return
+        }
         localListMutationVersion &+= 1
         let removed = messages.remove(at: idx)
         if !removed.isRead {
             adjustLocalUnreadCount(for: removed, delta: -1)
             notificationManager.removeDeliveredNotification(for: rowID)
+        } else if showMenuBarExtra {
+            refreshMenuBarUnreadPreview()
         }
         if selectedMessageID == rowID {
             if idx < messages.count {
@@ -128,6 +167,8 @@ extension AppViewModel {
         localListMutationVersion &+= 1
         if !succeeded {
             updateLocalReadState(rowID: rowID, isRead: fallbackIsRead)
+        } else if showMenuBarExtra {
+            refreshMenuBarUnreadPreview()
         }
     }
 

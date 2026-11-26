@@ -5,7 +5,6 @@ import MailPilotCore
 import SwiftUI
 
 /// Frosted-glass mini inbox hosted inside the menu bar `NSPopover`.
-/// Uses zero `@State` (bare `swiftc` builds without SwiftUI macro plugins).
 struct MenuBarPopoverView: View {
     @ObservedObject var viewModel: AppViewModel
     let onOpenMain: () -> Void
@@ -19,14 +18,6 @@ struct MenuBarPopoverView: View {
 
     private var unreadCount: Int {
         viewModel.totalInboxUnreadCount
-    }
-
-    private var previewItems: [MailMessageSummary] {
-        let cached = viewModel.menuBarUnreadMessages
-        if !cached.isEmpty {
-            return Array(cached.prefix(5))
-        }
-        return Array(viewModel.messages.filter { !$0.isRead }.prefix(5))
     }
 
     var body: some View {
@@ -59,14 +50,14 @@ struct MenuBarPopoverView: View {
                 Text("\(unreadCount) 未读")
                     .font(.system(size: 10.5, weight: .semibold))
                     .foregroundStyle(.white)
-                    .padding(.horizontal, 7)
+                    .padding(.horizontal, 7.5)
                     .padding(.vertical, 2.5)
-                    .background(BrandPalette.coral, in: Capsule())
+                    .background(BrandPalette.coralBadge, in: Capsule())
             } else {
                 Text("全部已读")
                     .font(.system(size: 10.5, weight: .medium))
                     .foregroundStyle(.secondary)
-                    .padding(.horizontal, 7)
+                    .padding(.horizontal, 7.5)
                     .padding(.vertical, 2.5)
                     .background(BrandPalette.sidebarPillFill(for: colorScheme), in: Capsule())
             }
@@ -115,47 +106,79 @@ struct MenuBarPopoverView: View {
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 20)
             .padding(.vertical, 24)
-        } else if previewItems.isEmpty {
-            VStack(spacing: 8) {
-                Image(systemName: "checkmark.seal.fill")
-                    .font(.system(size: 26))
-                    .foregroundStyle(BrandPalette.coral.opacity(0.85))
-                Text("收件箱很清爽")
-                    .font(.callout.weight(.semibold))
-                Text("当前没有待处理的未读邮件")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 28)
         } else {
-            VStack(spacing: 4) {
-                ForEach(previewItems) { msg in
-                    Button {
-                        onSelectMessage(msg.id)
-                    } label: {
-                        unreadRow(for: msg)
-                    }
-                    .buttonStyle(.plain)
+            switch viewModel.menuBarUnreadPreviewState {
+            case .loading:
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在读取收件箱未读…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 28)
 
-                if unreadCount > previewItems.count {
-                    Button(action: onOpenMain) {
-                        HStack(spacing: 4) {
-                            Text("查看其余 \(unreadCount - previewItems.count) 封未读邮件")
-                                .font(.caption.weight(.medium))
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 9, weight: .semibold))
-                        }
-                        .foregroundStyle(BrandPalette.coral)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 6)
+            case .failed:
+                VStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 22))
+                        .foregroundStyle(.orange)
+                    Text("暂时无法读取未读预览")
+                        .font(.callout.weight(.semibold))
+                    Button("重试") {
+                        viewModel.refreshMenuBarUnreadPreview()
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 24)
+
+            case .loaded(let items):
+                if items.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "checkmark.seal.fill")
+                            .font(.system(size: 26))
+                            .foregroundStyle(BrandPalette.coral.opacity(0.88))
+                        Text("收件箱很清爽")
+                            .font(.callout.weight(.semibold))
+                        Text("当前没有待处理的未读邮件")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 28)
+                } else {
+                    VStack(spacing: 4) {
+                        ForEach(items) { msg in
+                            Button {
+                                onSelectMessage(msg.id)
+                            } label: {
+                                unreadRow(for: msg)
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        if unreadCount > items.count {
+                            Button(action: onOpenMain) {
+                                HStack(spacing: 4) {
+                                    Text("查看其余 \(unreadCount - items.count) 封未读邮件")
+                                        .font(.caption.weight(.medium))
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 9, weight: .semibold))
+                                }
+                                .foregroundStyle(BrandPalette.coral)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 6)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 8)
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 8)
         }
     }
 
