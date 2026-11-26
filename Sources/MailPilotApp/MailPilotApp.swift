@@ -9,7 +9,6 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
     @MainActor private weak var mainWindow: NSWindow?
     @MainActor private var mainWindowOriginalChrome: MainWindowChromeSnapshot?
     @MainActor private var pendingMainWindowMode: (isOnboarding: Bool, animate: Bool)?
-    @MainActor private var mainWindowSheetObserver: NSObjectProtocol?
     @MainActor private weak var boundViewModel: AppViewModel?
     @MainActor private var closeInterceptor: WindowCloseInterceptor?
     @MainActor private var isQuitting = false
@@ -333,10 +332,7 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
             isQuitting = true
             closeInterceptor?.isQuitting = true
             removePopoverOutsideClickMonitor()
-            if let observer = mainWindowSheetObserver {
-                NotificationCenter.default.removeObserver(observer)
-                mainWindowSheetObserver = nil
-            }
+            NotificationCenter.default.removeObserver(self, name: NSWindow.didEndSheetNotification, object: nil)
         }
         return .terminateNow
     }
@@ -379,21 +375,20 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
                 closeInterceptor = proxy
                 window.delegate = proxy
             }
-            if let oldObserver = mainWindowSheetObserver {
-                NotificationCenter.default.removeObserver(oldObserver)
-            }
-            mainWindowSheetObserver = NotificationCenter.default.addObserver(
-                forName: NSWindow.didEndSheetNotification,
-                object: window,
-                queue: .main
-            ) { [weak self] _ in
-                MainActor.assumeIsolated {
-                    guard let self, let deferred = self.pendingMainWindowMode else { return }
-                    self.pendingMainWindowMode = nil
-                    self.applyMainWindowMode(isOnboarding: deferred.isOnboarding, animate: deferred.animate)
-                }
-            }
+            NotificationCenter.default.removeObserver(self, name: NSWindow.didEndSheetNotification, object: nil)
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleMainWindowDidEndSheet(_:)),
+                name: NSWindow.didEndSheetNotification,
+                object: window
+            )
         }
+    }
+
+    @MainActor @objc private func handleMainWindowDidEndSheet(_ notification: Notification) {
+        guard let deferred = pendingMainWindowMode else { return }
+        pendingMainWindowMode = nil
+        applyMainWindowMode(isOnboarding: deferred.isOnboarding, animate: deferred.animate)
     }
 
     @MainActor
