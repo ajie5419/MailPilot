@@ -37,8 +37,9 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case ai = "AI 与订阅"
     case accounts = "邮箱账号"
     case tags = "智能标签"
-    case notifications = "桌面通知"
+    case notifications = "通知与状态栏"
     case permissions = "系统权限"
+    case about = "关于"
 
     var id: String { rawValue }
 
@@ -49,8 +50,15 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .tags: return "tag.fill"
         case .notifications: return "bell.badge.fill"
         case .permissions: return "lock.shield.fill"
+        case .about: return "info.circle.fill"
         }
     }
+}
+
+enum MenuBarUnreadPreviewState: Equatable {
+    case loading
+    case loaded([MailMessageSummary])
+    case failed
 }
 
 struct CachedAccountMeta {
@@ -78,13 +86,21 @@ final class AppViewModel: ObservableObject {
             if sidebarSelection != oldValue {
                 sessionKeptUnreadMessages.removeAll()
             }
+            guard !suppressFilterReload else { return }
+            pendingJumpMessageID = nil
+            pinnedJumpMessageID = nil
+            suppressAutoSelectFirstMessage = false
             currentPageLimit = 200
             reloadMessages()
         }
     }
     @Published var searchQuery: String = "" {
         didSet {
+            guard !suppressFilterReload else { return }
             if searchQuery != oldValue {
+                pendingJumpMessageID = nil
+                pinnedJumpMessageID = nil
+                suppressAutoSelectFirstMessage = false
                 reloadGeneration &+= 1
                 reloadTask?.cancel()
                 snippetFetchTask?.cancel()
@@ -95,7 +111,10 @@ final class AppViewModel: ObservableObject {
     }
     @Published var filterUnreadOnly: Bool = false {
         didSet {
+            guard !suppressFilterReload else { return }
             if filterUnreadOnly != oldValue {
+                pinnedJumpMessageID = nil
+                suppressAutoSelectFirstMessage = false
                 currentPageLimit = 200
                 reloadMessages()
             }
@@ -103,7 +122,10 @@ final class AppViewModel: ObservableObject {
     }
     @Published var filterHasAttachments: Bool = false {
         didSet {
+            guard !suppressFilterReload else { return }
             if filterHasAttachments != oldValue {
+                pinnedJumpMessageID = nil
+                suppressAutoSelectFirstMessage = false
                 currentPageLimit = 200
                 reloadMessages()
             }
@@ -111,7 +133,10 @@ final class AppViewModel: ObservableObject {
     }
     @Published var filterDateRange: SearchDateRange = .all {
         didSet {
+            guard !suppressFilterReload else { return }
             if filterDateRange != oldValue {
+                pinnedJumpMessageID = nil
+                suppressAutoSelectFirstMessage = false
                 currentPageLimit = 200
                 reloadMessages()
             }
@@ -177,8 +202,14 @@ final class AppViewModel: ObservableObject {
     }
     @Published var selectedMessageID: Int64? {
         didSet {
-            if let id = selectedMessageID, selectedMessageIDs.count <= 1, selectedMessageIDs != [id] {
-                selectedMessageIDs = [id]
+            if let id = selectedMessageID {
+                suppressAutoSelectFirstMessage = false
+                if let pinned = pinnedJumpMessageID, pinned != id {
+                    pinnedJumpMessageID = nil
+                }
+                if selectedMessageIDs.count <= 1, selectedMessageIDs != [id] {
+                    selectedMessageIDs = [id]
+                }
             }
             loadSelectedMessageBody()
         }
@@ -239,6 +270,7 @@ final class AppViewModel: ObservableObject {
             updateDockUnreadBadge()
         }
     }
+    @Published var menuBarUnreadPreviewState: MenuBarUnreadPreviewState = .loading
     @Published var launchAtLoginEnabled: Bool = false
 
     @Published var accounts: [MailAccountInfo] = [] {
@@ -294,6 +326,7 @@ final class AppViewModel: ObservableObject {
     var cachedAccountLookup: [String: CachedAccountMeta] = [:]
     var pendingRemovedIDs: Set<Int64> = []
     var pendingReadOverrides: [Int64: (isRead: Bool, token: UInt64)] = [:]
+    var pendingReadOriginals: [Int64: (message: MailMessageSummary, isInbox: Bool)] = [:]
     var nextReadOpToken: UInt64 = 0
     var localListMutationVersion: UInt64 = 0
     var isFetchingAccounts = false
@@ -308,13 +341,19 @@ final class AppViewModel: ObservableObject {
     private var bodyLoadTask: Task<Void, Never>?
     private var recipientsLoadTask: Task<Void, Never>?
     private var reloadTask: Task<Void, Never>?
+    private var menuBarPreviewTask: Task<Void, Never>?
+    private var menuBarPreviewGeneration: UInt64 = 0
+    private var pendingJumpMessageID: Int64?
+    var pinnedJumpMessageID: Int64?
+    var suppressAutoSelectFirstMessage = false
+    private var suppressFilterReload = false
     private var reloadGeneration: UInt64 = 0
     private var snippetFetchTask: Task<Void, Never>?
     private var snippetGeneration: UInt64 = 0
     private var pendingSnippetRefreshIDs: Set<Int64> = []
     private var searchDebounceTask: Task<Void, Never>?
-    private var autoMarkReadTask: Task<Void, Never>?
-    private var autoMarkReadTargetID: Int64?
+    var autoMarkReadTask: Task<Void, Never>?
+    var autoMarkReadTargetID: Int64?
     private var watcher: MailDirectoryWatcher?
     private var wakeObserver: NSObjectProtocol?
     private var appLifecycleObservers: [NSObjectProtocol] = []
@@ -376,12 +415,7 @@ final class AppViewModel: ObservableObject {
 
         notificationManager.onSelectMessage = { [weak self] rowID in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                MailPilotAppDelegate.shared?.showMainWindow()
-                self.sidebarSelection = .allInbox
-                self.searchQuery = ""
-                self.reloadMessages()
-                self.selectedMessageID = rowID
+                self?.jumpToMessage(rowID: rowID)
             }
         }
         ai.startInitialLoads()
@@ -607,6 +641,7 @@ final class AppViewModel: ObservableObject {
     func updateDockUnreadBadge() {
         let count = totalInboxUnreadCount
         notificationManager.syncBadgeCount(count)
+        MailPilotAppDelegate.shared?.bind(viewModel: self)
         MailPilotAppDelegate.shared?.onMenuBarCompose = { [weak self] in
             self?.openComposeNew()
         }
@@ -614,6 +649,137 @@ final class AppViewModel: ObservableObject {
             self?.triggerNativeMailFetch()
         }
         MailPilotAppDelegate.shared?.updateMenuBarStatus(visible: showMenuBarExtra, unreadCount: count)
+        if showMenuBarExtra {
+            refreshMenuBarUnreadPreview()
+        }
+    }
+
+    func refreshMenuBarUnreadPreview() {
+        guard let activeReader = reader else {
+            menuBarPreviewGeneration &+= 1
+            menuBarPreviewTask?.cancel()
+            menuBarPreviewTask = nil
+            menuBarUnreadPreviewState = accessError != nil ? .loaded([]) : .loading
+            return
+        }
+        if case .failed = menuBarUnreadPreviewState {
+            menuBarUnreadPreviewState = .loading
+        }
+        menuBarPreviewGeneration &+= 1
+        let generation = menuBarPreviewGeneration
+        let mutationVersionAtStart = localListMutationVersion
+        let locallyUnreadIDs = pendingReadOverrides.compactMap { $0.value.isRead ? nil : $0.key }
+        let locallyExcludedCount = pendingRemovedIDs.count + pendingReadOverrides.values.filter(\.isRead).count
+        let fetchLimit = max(15, 5 + locallyExcludedCount)
+        menuBarPreviewTask?.cancel()
+        menuBarPreviewTask = Task { [weak self] in
+            do {
+                let (fetched, localUnreadExtras) = try await Self.runCancellableDetached(priority: .utility) {
+                    try Task.checkCancellation()
+                    let page = try activeReader.fetchMessagePage(
+                        mailboxID: nil,
+                        onlyInbox: true,
+                        onlyUnread: true,
+                        onlyFlagged: false,
+                        onlyWithAttachments: false,
+                        sinceDate: nil,
+                        searchQuery: "",
+                        bodyHitIDs: [],
+                        fallbackAttachmentRowIDs: nil,
+                        limit: fetchLimit,
+                        predicate: nil
+                    )
+                    try Task.checkCancellation()
+                    let extras: [MailMessageSummary]
+                    if locallyUnreadIDs.isEmpty {
+                        extras = []
+                    } else {
+                        extras = try activeReader.fetchMessages(byRowIDs: locallyUnreadIDs, onlyInbox: true)
+                    }
+                    try Task.checkCancellation()
+                    return (page.messages, extras)
+                }
+                guard !Task.isCancelled, let self,
+                      self.menuBarPreviewGeneration == generation,
+                      self.reader === activeReader else {
+                    return
+                }
+                if self.localListMutationVersion != mutationVersionAtStart {
+                    self.refreshMenuBarUnreadPreview()
+                    return
+                }
+
+                var byID: [Int64: MailMessageSummary] = [:]
+                for msg in fetched {
+                    guard !self.pendingRemovedIDs.contains(msg.id) else { continue }
+                    if let override = self.pendingReadOverrides[msg.id], override.isRead { continue }
+                    byID[msg.id] = msg
+                }
+                for msg in localUnreadExtras {
+                    guard !self.pendingRemovedIDs.contains(msg.id) else { continue }
+                    if let override = self.pendingReadOverrides[msg.id], override.isRead { continue }
+                    byID[msg.id] = MailMessageSummary(
+                        id: msg.id,
+                        messageIDHeader: msg.messageIDHeader,
+                        subject: msg.subject,
+                        senderAddress: msg.senderAddress,
+                        senderName: msg.senderName,
+                        dateReceived: msg.dateReceived,
+                        isRead: false,
+                        isFlagged: msg.isFlagged,
+                        mailboxID: msg.mailboxID,
+                        mailboxName: msg.mailboxName,
+                        accountID: msg.accountID
+                    )
+                }
+
+                let merged = byID.values.sorted {
+                    if $0.dateReceived != $1.dateReceived {
+                        return $0.dateReceived > $1.dateReceived
+                    }
+                    return $0.id > $1.id
+                }
+                let nextState: MenuBarUnreadPreviewState = .loaded(Array(merged.prefix(5)))
+                if self.menuBarUnreadPreviewState != nextState {
+                    self.menuBarUnreadPreviewState = nextState
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled, let self,
+                      self.menuBarPreviewGeneration == generation,
+                      self.reader === activeReader else {
+                    return
+                }
+                self.menuBarUnreadPreviewState = .failed
+            }
+        }
+    }
+
+    func openMessageFromMenuBar(_ rowID: Int64) {
+        jumpToMessage(rowID: rowID)
+    }
+
+    func jumpToMessage(rowID: Int64) {
+        MailPilotAppDelegate.shared?.showMainWindow()
+        autoMarkReadTask?.cancel()
+        autoMarkReadTask = nil
+        autoMarkReadTargetID = nil
+        searchDebounceTask?.cancel()
+        pendingJumpMessageID = rowID
+        pinnedJumpMessageID = rowID
+        suppressAutoSelectFirstMessage = false
+
+        suppressFilterReload = true
+        sidebarSelection = .allInbox
+        searchQuery = ""
+        filterUnreadOnly = false
+        filterHasAttachments = false
+        filterDateRange = .all
+        currentPageLimit = 200
+        suppressFilterReload = false
+
+        reloadMessages()
     }
 
     private func observeAppLifecycle() {
@@ -640,6 +806,15 @@ final class AppViewModel: ObservableObject {
             }
         }
         appLifecycleObservers = [finishLaunching, becomeActive]
+    }
+
+    var isShowingInboxScopedView: Bool {
+        switch sidebarSelection {
+        case .allInbox, .unread, .smartTag:
+            return true
+        case .flagged, .mailbox:
+            return false
+        }
     }
 
     var isUnifiedView: Bool {
@@ -827,6 +1002,12 @@ final class AppViewModel: ObservableObject {
         reloadGeneration &+= 1
         let generation = reloadGeneration
         let mutationVersionAtStart = localListMutationVersion
+        let jumpTargetID = pendingJumpMessageID
+        let pinnedIDToInclude: Int64? = jumpTargetID ?? (
+            (sidebarSelection == .allInbox && trimmedQuery.isEmpty && !hasActiveSearchFilters)
+                ? pinnedJumpMessageID
+                : nil
+        )
         reloadTask?.cancel()
         snippetFetchTask?.cancel()
 
@@ -844,7 +1025,7 @@ final class AppViewModel: ObservableObject {
                     : nil
                 guard !Task.isCancelled, self.reloadGeneration == generation else { return }
 
-                let (page, precomputedTags) = try await Self.runCancellableDetached(priority: .userInitiated) {
+                let (page, precomputedTags, pinnedFetchedMessage) = try await Self.runCancellableDetached(priority: .userInitiated) {
                     try Task.checkCancellation()
                     let tagPredicate: ((MailMessageSummary) -> Bool)? = filterTag.map { tag in
                         { MailTagClassifier.classify($0, settings: currentTagSettings).contains(tag) }
@@ -863,12 +1044,20 @@ final class AppViewModel: ObservableObject {
                         predicate: tagPredicate
                     )
                     try Task.checkCancellation()
+                    var pinnedMsg: MailMessageSummary?
+                    if let pinnedIDToInclude, !result.messages.contains(where: { $0.id == pinnedIDToInclude }) {
+                        pinnedMsg = try? reader.fetchMessages(byRowIDs: [pinnedIDToInclude], onlyInbox: onlyInbox).first
+                    }
+                    try Task.checkCancellation()
                     var tagMap: [Int64: [MailSmartTag]] = [:]
-                    tagMap.reserveCapacity(result.messages.count)
+                    tagMap.reserveCapacity(result.messages.count + (pinnedMsg == nil ? 0 : 1))
                     for msg in result.messages {
                         tagMap[msg.id] = MailTagClassifier.classify(msg, settings: currentTagSettings)
                     }
-                    return (result, tagMap)
+                    if let pinnedMsg {
+                        tagMap[pinnedMsg.id] = MailTagClassifier.classify(pinnedMsg, settings: currentTagSettings)
+                    }
+                    return (result, tagMap, pinnedMsg)
                 }
                 guard !Task.isCancelled, self.reloadGeneration == generation else { return }
 
@@ -898,6 +1087,38 @@ final class AppViewModel: ObservableObject {
                         )
                     }
                     return msg
+                }
+
+                // Keep a jumped/pinned older inbox message present across both the initial jump and subsequent WAL reloads.
+                if let pinnedIDToInclude,
+                   !filtered.contains(where: { $0.id == pinnedIDToInclude }),
+                   let pinnedFetchedMessage,
+                   !self.pendingRemovedIDs.contains(pinnedIDToInclude) {
+                    let adjustedPinned: MailMessageSummary
+                    if let overrideEntry = self.pendingReadOverrides[pinnedIDToInclude], overrideEntry.isRead != pinnedFetchedMessage.isRead {
+                        adjustedPinned = MailMessageSummary(
+                            id: pinnedFetchedMessage.id,
+                            messageIDHeader: pinnedFetchedMessage.messageIDHeader,
+                            subject: pinnedFetchedMessage.subject,
+                            senderAddress: pinnedFetchedMessage.senderAddress,
+                            senderName: pinnedFetchedMessage.senderName,
+                            dateReceived: pinnedFetchedMessage.dateReceived,
+                            isRead: overrideEntry.isRead,
+                            isFlagged: pinnedFetchedMessage.isFlagged,
+                            mailboxID: pinnedFetchedMessage.mailboxID,
+                            mailboxName: pinnedFetchedMessage.mailboxName,
+                            accountID: pinnedFetchedMessage.accountID
+                        )
+                    } else {
+                        adjustedPinned = pinnedFetchedMessage
+                    }
+                    filtered.append(adjustedPinned)
+                    filtered.sort {
+                        if $0.dateReceived != $1.dateReceived {
+                            return $0.dateReceived > $1.dateReceived
+                        }
+                        return $0.id > $1.id
+                    }
                 }
 
                 if self.sidebarSelection == .unread && trimmedQuery.isEmpty && !self.sessionKeptUnreadMessages.isEmpty {
@@ -931,12 +1152,68 @@ final class AppViewModel: ObservableObject {
                 if self.hasMoreMessages != page.hasMore {
                     self.hasMoreMessages = page.hasMore
                 }
-                if let current = self.selectedMessageID, !filtered.contains(where: { $0.id == current }) {
-                    self.selectedMessageID = filtered.first?.id
+                if let jumpTargetID {
+                    if self.pendingJumpMessageID == jumpTargetID {
+                        self.pendingJumpMessageID = nil
+                    }
+                    if filtered.contains(where: { $0.id == jumpTargetID }) {
+                        self.suppressAutoSelectFirstMessage = false
+                        self.pinnedJumpMessageID = jumpTargetID
+                        self.selectedMessageID = jumpTargetID
+                        if self.selectedMessageIDs != [jumpTargetID] {
+                            self.selectedMessageIDs = [jumpTargetID]
+                        }
+                        self.scheduleAutoMarkReadIfNeeded(for: jumpTargetID)
+                    } else {
+                        self.pinnedJumpMessageID = nil
+                        self.suppressAutoSelectFirstMessage = true
+                        self.autoMarkReadTask?.cancel()
+                        self.autoMarkReadTask = nil
+                        self.autoMarkReadTargetID = nil
+                        self.selectedMessageID = nil
+                        if !self.selectedMessageIDs.isEmpty {
+                            self.selectedMessageIDs = []
+                        }
+                        self.showToast("该邮件已不在收件箱中或已被删除")
+                    }
+                } else if let current = self.selectedMessageID, !filtered.contains(where: { $0.id == current }) {
+                    if self.pinnedJumpMessageID == current {
+                        self.pinnedJumpMessageID = nil
+                        self.suppressAutoSelectFirstMessage = true
+                        self.autoMarkReadTask?.cancel()
+                        self.autoMarkReadTask = nil
+                        self.autoMarkReadTargetID = nil
+                        self.selectedMessageID = nil
+                        if !self.selectedMessageIDs.isEmpty {
+                            self.selectedMessageIDs = []
+                        }
+                    } else if let firstID = filtered.first?.id {
+                        self.selectedMessageID = firstID
+                        if self.selectedMessageIDs != [firstID] {
+                            self.selectedMessageIDs = [firstID]
+                        }
+                    } else {
+                        self.selectedMessageID = nil
+                        if !self.selectedMessageIDs.isEmpty {
+                            self.selectedMessageIDs = []
+                        }
+                    }
                 } else if self.selectedMessageID == nil {
-                    self.selectedMessageID = filtered.first?.id
+                    if !self.suppressAutoSelectFirstMessage, let firstID = filtered.first?.id {
+                        self.selectedMessageID = firstID
+                        if self.selectedMessageIDs != [firstID] {
+                            self.selectedMessageIDs = [firstID]
+                        }
+                    }
                 } else if let current = self.selectedMessageID {
                     self.scheduleAutoMarkReadIfNeeded(for: current)
+                }
+
+                // Prune any vanished IDs from multi-selection after committing single selection.
+                let validFilteredIDs = Set(filtered.map(\.id))
+                let prunedSelection = self.selectedMessageIDs.intersection(validFilteredIDs)
+                if self.selectedMessageIDs != prunedSelection {
+                    self.selectedMessageIDs = prunedSelection
                 }
 
                 // Incrementally hydrate missing/pending snippets in the background without blocking list display.

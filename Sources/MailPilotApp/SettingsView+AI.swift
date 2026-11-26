@@ -7,10 +7,7 @@ extension SettingsView {
     // MARK: - AI Tab
 
     var aiSettingsContent: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("AI 模型与订阅登录")
-                .font(.title3.weight(.semibold))
-
+        VStack(alignment: .leading, spacing: 14) {
             // Mode Cards
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                 modeCard(
@@ -325,11 +322,11 @@ extension SettingsView {
             HStack(spacing: 10) {
                 Image(systemName: icon)
                     .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                    .foregroundStyle(isSelected ? .white : .secondary)
                     .frame(width: 28, height: 28)
                     .background(
-                        isSelected ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.10),
-                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        isSelected ? BrandPalette.coral : Color.secondary.opacity(0.12),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                     )
 
                 VStack(alignment: .leading, spacing: 2) {
@@ -347,21 +344,25 @@ extension SettingsView {
 
                 if isSelected {
                     Image(systemName: "checkmark.circle.fill")
-                        .font(.caption)
-                        .foregroundStyle(Color.accentColor)
+                        .font(.callout)
+                        .foregroundStyle(BrandPalette.coral)
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 9)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
-                isSelected ? Color.accentColor.opacity(0.08) : Color.secondary.opacity(0.05),
-                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                BrandPalette.floatingCardFill(for: colorScheme),
+                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(isSelected ? Color.accentColor : Color.secondary.opacity(0.16), lineWidth: isSelected ? 1.4 : 0.75)
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(
+                        isSelected ? BrandPalette.coral : BrandPalette.floatingCardBorder(for: colorScheme),
+                        lineWidth: isSelected ? 1.5 : 0.85
+                    )
             )
+            .shadow(color: BrandPalette.floatingCardShadow(for: colorScheme), radius: 6, y: 2)
         }
         .buttonStyle(.plain)
     }
