@@ -138,8 +138,21 @@ extension AppViewModel {
             pinnedJumpMessageID = nil
         }
         applyOptimisticMenuBarPreviewMutation(updatedMessage: nil, removedRowID: rowID)
+        let clearedPinnedSelection = wasPinnedJump && (selectedMessageID == rowID || selectedMessageID == nil)
+        if clearedPinnedSelection {
+            suppressAutoSelectFirstMessage = true
+            autoMarkReadTask?.cancel()
+            autoMarkReadTask = nil
+            autoMarkReadTargetID = nil
+            selectedMessageID = nil
+            if !selectedMessageIDs.isEmpty {
+                selectedMessageIDs = []
+            }
+        }
         guard let idx = messages.firstIndex(where: { $0.id == rowID }) else {
-            selectedMessageIDs.remove(rowID)
+            if !clearedPinnedSelection {
+                selectedMessageIDs.remove(rowID)
+            }
             if showMenuBarExtra {
                 refreshMenuBarUnreadPreview()
             }
@@ -153,16 +166,10 @@ extension AppViewModel {
         } else if showMenuBarExtra {
             refreshMenuBarUnreadPreview()
         }
-        if wasPinnedJump && (selectedMessageID == rowID || selectedMessageID == nil) {
-            suppressAutoSelectFirstMessage = true
-            autoMarkReadTask?.cancel()
-            autoMarkReadTask = nil
-            autoMarkReadTargetID = nil
-            selectedMessageID = nil
-            if !selectedMessageIDs.isEmpty {
-                selectedMessageIDs = []
-            }
-        } else if selectedMessageID == rowID {
+        if clearedPinnedSelection {
+            return
+        }
+        if selectedMessageID == rowID {
             let nextID: Int64? = idx < messages.count ? messages[idx].id : messages.last?.id
             selectedMessageID = nextID
             let nextSelection: Set<Int64> = nextID.map { [$0] } ?? []
