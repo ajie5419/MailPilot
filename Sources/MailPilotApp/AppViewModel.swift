@@ -88,6 +88,8 @@ final class AppViewModel: ObservableObject {
             }
             guard !suppressFilterReload else { return }
             pendingJumpMessageID = nil
+            pinnedJumpMessageID = nil
+            suppressAutoSelectFirstMessage = false
             currentPageLimit = 200
             reloadMessages()
         }
@@ -97,6 +99,8 @@ final class AppViewModel: ObservableObject {
             guard !suppressFilterReload else { return }
             if searchQuery != oldValue {
                 pendingJumpMessageID = nil
+                pinnedJumpMessageID = nil
+                suppressAutoSelectFirstMessage = false
                 reloadGeneration &+= 1
                 reloadTask?.cancel()
                 snippetFetchTask?.cancel()
@@ -109,6 +113,8 @@ final class AppViewModel: ObservableObject {
         didSet {
             guard !suppressFilterReload else { return }
             if filterUnreadOnly != oldValue {
+                pinnedJumpMessageID = nil
+                suppressAutoSelectFirstMessage = false
                 currentPageLimit = 200
                 reloadMessages()
             }
@@ -118,6 +124,8 @@ final class AppViewModel: ObservableObject {
         didSet {
             guard !suppressFilterReload else { return }
             if filterHasAttachments != oldValue {
+                pinnedJumpMessageID = nil
+                suppressAutoSelectFirstMessage = false
                 currentPageLimit = 200
                 reloadMessages()
             }
@@ -127,6 +135,8 @@ final class AppViewModel: ObservableObject {
         didSet {
             guard !suppressFilterReload else { return }
             if filterDateRange != oldValue {
+                pinnedJumpMessageID = nil
+                suppressAutoSelectFirstMessage = false
                 currentPageLimit = 200
                 reloadMessages()
             }
@@ -192,8 +202,14 @@ final class AppViewModel: ObservableObject {
     }
     @Published var selectedMessageID: Int64? {
         didSet {
-            if let id = selectedMessageID, selectedMessageIDs.count <= 1, selectedMessageIDs != [id] {
-                selectedMessageIDs = [id]
+            if let id = selectedMessageID {
+                suppressAutoSelectFirstMessage = false
+                if let pinned = pinnedJumpMessageID, pinned != id {
+                    pinnedJumpMessageID = nil
+                }
+                if selectedMessageIDs.count <= 1, selectedMessageIDs != [id] {
+                    selectedMessageIDs = [id]
+                }
             }
             loadSelectedMessageBody()
         }
@@ -327,6 +343,8 @@ final class AppViewModel: ObservableObject {
     private var menuBarPreviewTask: Task<Void, Never>?
     private var menuBarPreviewGeneration: UInt64 = 0
     private var pendingJumpMessageID: Int64?
+    var pinnedJumpMessageID: Int64?
+    private var suppressAutoSelectFirstMessage = false
     private var suppressFilterReload = false
     private var reloadGeneration: UInt64 = 0
     private var snippetFetchTask: Task<Void, Never>?
@@ -643,10 +661,15 @@ final class AppViewModel: ObservableObject {
             menuBarUnreadPreviewState = accessError != nil ? .loaded([]) : .loading
             return
         }
+        if case .failed = menuBarUnreadPreviewState {
+            menuBarUnreadPreviewState = .loading
+        }
         menuBarPreviewGeneration &+= 1
         let generation = menuBarPreviewGeneration
         let mutationVersionAtStart = localListMutationVersion
         let locallyUnreadIDs = pendingReadOverrides.compactMap { $0.value.isRead ? nil : $0.key }
+        let locallyExcludedCount = pendingRemovedIDs.count + pendingReadOverrides.values.filter(\.isRead).count
+        let fetchLimit = max(15, 5 + locallyExcludedCount)
         menuBarPreviewTask?.cancel()
         menuBarPreviewTask = Task { [weak self] in
             do {
@@ -662,7 +685,7 @@ final class AppViewModel: ObservableObject {
                         searchQuery: "",
                         bodyHitIDs: [],
                         fallbackAttachmentRowIDs: nil,
-                        limit: 15,
+                        limit: fetchLimit,
                         predicate: nil
                     )
                     try Task.checkCancellation()
@@ -743,6 +766,8 @@ final class AppViewModel: ObservableObject {
         autoMarkReadTargetID = nil
         searchDebounceTask?.cancel()
         pendingJumpMessageID = rowID
+        pinnedJumpMessageID = rowID
+        suppressAutoSelectFirstMessage = false
 
         suppressFilterReload = true
         sidebarSelection = .allInbox
@@ -968,6 +993,11 @@ final class AppViewModel: ObservableObject {
         let generation = reloadGeneration
         let mutationVersionAtStart = localListMutationVersion
         let jumpTargetID = pendingJumpMessageID
+        let pinnedIDToInclude: Int64? = jumpTargetID ?? (
+            (sidebarSelection == .allInbox && trimmedQuery.isEmpty && !hasActiveSearchFilters)
+                ? pinnedJumpMessageID
+                : nil
+        )
         reloadTask?.cancel()
         snippetFetchTask?.cancel()
 
@@ -985,7 +1015,7 @@ final class AppViewModel: ObservableObject {
                     : nil
                 guard !Task.isCancelled, self.reloadGeneration == generation else { return }
 
-                let (page, precomputedTags, jumpFetchedMessage) = try await Self.runCancellableDetached(priority: .userInitiated) {
+                let (page, precomputedTags, pinnedFetchedMessage) = try await Self.runCancellableDetached(priority: .userInitiated) {
                     try Task.checkCancellation()
                     let tagPredicate: ((MailMessageSummary) -> Bool)? = filterTag.map { tag in
                         { MailTagClassifier.classify($0, settings: currentTagSettings).contains(tag) }
@@ -1004,20 +1034,20 @@ final class AppViewModel: ObservableObject {
                         predicate: tagPredicate
                     )
                     try Task.checkCancellation()
-                    var jumpMsg: MailMessageSummary?
-                    if let jumpTargetID, !result.messages.contains(where: { $0.id == jumpTargetID }) {
-                        jumpMsg = try? reader.fetchMessages(byRowIDs: [jumpTargetID], onlyInbox: onlyInbox).first
+                    var pinnedMsg: MailMessageSummary?
+                    if let pinnedIDToInclude, !result.messages.contains(where: { $0.id == pinnedIDToInclude }) {
+                        pinnedMsg = try? reader.fetchMessages(byRowIDs: [pinnedIDToInclude], onlyInbox: onlyInbox).first
                     }
                     try Task.checkCancellation()
                     var tagMap: [Int64: [MailSmartTag]] = [:]
-                    tagMap.reserveCapacity(result.messages.count + (jumpMsg == nil ? 0 : 1))
+                    tagMap.reserveCapacity(result.messages.count + (pinnedMsg == nil ? 0 : 1))
                     for msg in result.messages {
                         tagMap[msg.id] = MailTagClassifier.classify(msg, settings: currentTagSettings)
                     }
-                    if let jumpMsg {
-                        tagMap[jumpMsg.id] = MailTagClassifier.classify(jumpMsg, settings: currentTagSettings)
+                    if let pinnedMsg {
+                        tagMap[pinnedMsg.id] = MailTagClassifier.classify(pinnedMsg, settings: currentTagSettings)
                     }
-                    return (result, tagMap, jumpMsg)
+                    return (result, tagMap, pinnedMsg)
                 }
                 guard !Task.isCancelled, self.reloadGeneration == generation else { return }
 
@@ -1049,30 +1079,30 @@ final class AppViewModel: ObservableObject {
                     return msg
                 }
 
-                // Include the requested jump target (e.g. older than top 200) inside the same atomic list commit.
-                if let jumpTargetID,
-                   !filtered.contains(where: { $0.id == jumpTargetID }),
-                   let jumpFetchedMessage,
-                   !self.pendingRemovedIDs.contains(jumpTargetID) {
-                    let adjustedJump: MailMessageSummary
-                    if let overrideEntry = self.pendingReadOverrides[jumpTargetID], overrideEntry.isRead != jumpFetchedMessage.isRead {
-                        adjustedJump = MailMessageSummary(
-                            id: jumpFetchedMessage.id,
-                            messageIDHeader: jumpFetchedMessage.messageIDHeader,
-                            subject: jumpFetchedMessage.subject,
-                            senderAddress: jumpFetchedMessage.senderAddress,
-                            senderName: jumpFetchedMessage.senderName,
-                            dateReceived: jumpFetchedMessage.dateReceived,
+                // Keep a jumped/pinned older inbox message present across both the initial jump and subsequent WAL reloads.
+                if let pinnedIDToInclude,
+                   !filtered.contains(where: { $0.id == pinnedIDToInclude }),
+                   let pinnedFetchedMessage,
+                   !self.pendingRemovedIDs.contains(pinnedIDToInclude) {
+                    let adjustedPinned: MailMessageSummary
+                    if let overrideEntry = self.pendingReadOverrides[pinnedIDToInclude], overrideEntry.isRead != pinnedFetchedMessage.isRead {
+                        adjustedPinned = MailMessageSummary(
+                            id: pinnedFetchedMessage.id,
+                            messageIDHeader: pinnedFetchedMessage.messageIDHeader,
+                            subject: pinnedFetchedMessage.subject,
+                            senderAddress: pinnedFetchedMessage.senderAddress,
+                            senderName: pinnedFetchedMessage.senderName,
+                            dateReceived: pinnedFetchedMessage.dateReceived,
                             isRead: overrideEntry.isRead,
-                            isFlagged: jumpFetchedMessage.isFlagged,
-                            mailboxID: jumpFetchedMessage.mailboxID,
-                            mailboxName: jumpFetchedMessage.mailboxName,
-                            accountID: jumpFetchedMessage.accountID
+                            isFlagged: pinnedFetchedMessage.isFlagged,
+                            mailboxID: pinnedFetchedMessage.mailboxID,
+                            mailboxName: pinnedFetchedMessage.mailboxName,
+                            accountID: pinnedFetchedMessage.accountID
                         )
                     } else {
-                        adjustedJump = jumpFetchedMessage
+                        adjustedPinned = pinnedFetchedMessage
                     }
-                    filtered.append(adjustedJump)
+                    filtered.append(adjustedPinned)
                     filtered.sort {
                         if $0.dateReceived != $1.dateReceived {
                             return $0.dateReceived > $1.dateReceived
@@ -1117,19 +1147,47 @@ final class AppViewModel: ObservableObject {
                         self.pendingJumpMessageID = nil
                     }
                     if filtered.contains(where: { $0.id == jumpTargetID }) {
+                        self.suppressAutoSelectFirstMessage = false
+                        self.pinnedJumpMessageID = jumpTargetID
                         self.selectedMessageID = jumpTargetID
+                        if self.selectedMessageIDs != [jumpTargetID] {
+                            self.selectedMessageIDs = [jumpTargetID]
+                        }
                         self.scheduleAutoMarkReadIfNeeded(for: jumpTargetID)
                     } else {
+                        self.pinnedJumpMessageID = nil
+                        self.suppressAutoSelectFirstMessage = true
                         self.autoMarkReadTask?.cancel()
                         self.autoMarkReadTask = nil
                         self.autoMarkReadTargetID = nil
                         self.selectedMessageID = nil
+                        if !self.selectedMessageIDs.isEmpty {
+                            self.selectedMessageIDs = []
+                        }
                         self.showToast("该邮件已不在收件箱中或已被删除")
                     }
                 } else if let current = self.selectedMessageID, !filtered.contains(where: { $0.id == current }) {
-                    self.selectedMessageID = filtered.first?.id
+                    if self.pinnedJumpMessageID == current {
+                        self.pinnedJumpMessageID = nil
+                    }
+                    if let firstID = filtered.first?.id {
+                        self.selectedMessageID = firstID
+                        if self.selectedMessageIDs != [firstID] {
+                            self.selectedMessageIDs = [firstID]
+                        }
+                    } else {
+                        self.selectedMessageID = nil
+                        if !self.selectedMessageIDs.isEmpty {
+                            self.selectedMessageIDs = []
+                        }
+                    }
                 } else if self.selectedMessageID == nil {
-                    self.selectedMessageID = filtered.first?.id
+                    if !self.suppressAutoSelectFirstMessage, let firstID = filtered.first?.id {
+                        self.selectedMessageID = firstID
+                        if self.selectedMessageIDs != [firstID] {
+                            self.selectedMessageIDs = [firstID]
+                        }
+                    }
                 } else if let current = self.selectedMessageID {
                     self.scheduleAutoMarkReadIfNeeded(for: current)
                 }

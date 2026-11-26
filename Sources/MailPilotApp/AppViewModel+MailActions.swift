@@ -8,7 +8,17 @@ extension AppViewModel {
     // MARK: - Local Optimistic Message Mutations
 
     func updateLocalReadState(rowID: Int64, isRead: Bool) {
-        guard let idx = messages.firstIndex(where: { $0.id == rowID }) else { return }
+        guard let idx = messages.firstIndex(where: { $0.id == rowID }) else {
+            // Even if the user switched folders before a write failure rolled back,
+            // immediately reconcile the menu bar unread preview state.
+            if isRead {
+                applyOptimisticMenuBarPreviewMutation(updatedMessage: nil, removedRowID: rowID)
+            }
+            if showMenuBarExtra {
+                refreshMenuBarUnreadPreview()
+            }
+            return
+        }
         let old = messages[idx]
         guard old.isRead != isRead else { return }
         localListMutationVersion &+= 1
@@ -116,6 +126,9 @@ extension AppViewModel {
 
     func removeMessageLocally(rowID: Int64) {
         sessionKeptUnreadMessages.removeValue(forKey: rowID)
+        if pinnedJumpMessageID == rowID {
+            pinnedJumpMessageID = nil
+        }
         applyOptimisticMenuBarPreviewMutation(updatedMessage: nil, removedRowID: rowID)
         guard let idx = messages.firstIndex(where: { $0.id == rowID }) else {
             if showMenuBarExtra {
@@ -167,7 +180,11 @@ extension AppViewModel {
         localListMutationVersion &+= 1
         if !succeeded {
             updateLocalReadState(rowID: rowID, isRead: fallbackIsRead)
-        } else if showMenuBarExtra {
+            if fallbackIsRead {
+                applyOptimisticMenuBarPreviewMutation(updatedMessage: nil, removedRowID: rowID)
+            }
+        }
+        if showMenuBarExtra {
             refreshMenuBarUnreadPreview()
         }
     }
