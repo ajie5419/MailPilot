@@ -440,103 +440,123 @@ struct PermissionGuideView: View {
     @ObservedObject var viewModel: AppViewModel
 
     var body: some View {
-        VStack(spacing: 22) {
-            // Brand Mark + Headline (Sunset Coral Origami Crane)
-            VStack(spacing: 12) {
-                if let appIcon = NSApp.applicationIconImage {
-                    Image(nsImage: appIcon)
-                        .resizable()
-                        .interpolation(.high)
-                        .frame(width: 68, height: 68)
-                } else {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 15, style: .continuous)
-                            .fill(
-                                LinearGradient(
-                                    colors: [
-                                        Color(red: 1.0, green: 0.573, blue: 0.2),
-                                        Color(red: 0.957, green: 0.337, blue: 0.271),
-                                        Color(red: 0.82, green: 0.141, blue: 0.353)
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                            .frame(width: 58, height: 58)
-                            .shadow(color: Color.black.opacity(0.16), radius: 10, y: 4)
+        ZStack {
+            // Native macOS behindWindow dark frosted glass HUD canvas
+            VisualEffectBackdrop(material: .hudWindow, blendingMode: .behindWindow)
+                .ignoresSafeArea()
 
-                        Image(systemName: "paperplane.fill")
-                            .font(.system(size: 25, weight: .medium))
-                            .foregroundStyle(.white)
-                    }
-                }
-
-                VStack(spacing: 6) {
-                    Text("连接 macOS 原生邮件")
-                        .font(.title2.weight(.semibold))
-                    Text("只需授予一次「完全磁盘访问权限」，MailPilot 即可零同步故障地接管阅读与 AI 助理。")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            // Feature Guarantees
-            VStack(alignment: .leading, spacing: 12) {
-                guaranteeRow(
-                    icon: "lock.fill",
-                    color: .blue,
-                    title: "严格只读本地索引",
-                    subtitle: "仅以只读模式读取系统邮件库，绝不修改或损坏数据库"
-                )
-                guaranteeRow(
-                    icon: "bolt.horizontal.fill",
-                    color: .green,
-                    title: "原生 Mail.app 驱动收信与推送",
-                    subtitle: "零断连、支持休眠唤醒与多账号稳定同步"
-                )
-                guaranteeRow(
-                    icon: "checkmark.seal.fill",
-                    color: .purple,
-                    title: "写操作安全委托",
-                    subtitle: "标记已读、旗标与回复草稿均通过官方通道交由 Mail.app 执行"
+            // Subtle warm sunset glow behind the hero icon for depth without sacrificing glass translucency
+            ZStack {
+                Color.black.opacity(0.36)
+                RadialGradient(
+                    colors: [BrandPalette.coral.opacity(0.22), Color.clear],
+                    center: UnitPoint(x: 0.5, y: 0.22),
+                    startRadius: 16,
+                    endRadius: 230
                 )
             }
-            .padding(14)
-            .background(Color(nsColor: .controlBackgroundColor).opacity(0.75), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(.separator.opacity(0.45), lineWidth: 0.7)
-            )
+            .ignoresSafeArea()
 
-            // Action Hierarchy
-            VStack(spacing: 12) {
+            VStack(spacing: 0) {
+                Spacer(minLength: 26)
+
+                // Hero Sunset Coral Origami Crane App Icon + Display Wordmark
+                AppBrandIconView(size: 84, showShadow: true)
+                    .padding(.bottom, 12)
+
+                Text("MailPilot")
+                    .font(.system(size: 36, weight: .heavy, design: .rounded))
+                    .tracking(-0.8)
+                    .foregroundStyle(.white)
+                    .shadow(color: Color.black.opacity(0.24), radius: 10, y: 3)
+
+                Text("为 macOS 原生邮件注入 AI 领航能力，\n零同步故障，一切尽在掌控。")
+                    .font(.system(size: 13.5, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.84))
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(3.5)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 8)
+                    .padding(.bottom, 26)
+
+                // Horizontal 3-Column Frosted Glass Capability Bar (Canapé aesthetic)
+                HStack(spacing: 0) {
+                    capabilityColumn(
+                        icon: "lock.shield.fill",
+                        iconColor: Color(red: 0.14, green: 0.48, blue: 0.94),
+                        title: "严格只读",
+                        subtitle: "零损坏风险"
+                    )
+                    capabilityDivider
+                    capabilityColumn(
+                        icon: "bolt.horizontal.fill",
+                        iconColor: BrandPalette.coral,
+                        title: "原生同步",
+                        subtitle: "Mail.app 驱动"
+                    )
+                    capabilityDivider
+                    capabilityColumn(
+                        icon: "sparkles",
+                        iconColor: Color(red: 0.55, green: 0.32, blue: 0.94),
+                        title: "AI 领航",
+                        subtitle: "摘要 · 翻译"
+                    )
+                }
+                .padding(.vertical, 18)
+                .padding(.horizontal, 8)
+                .background(
+                    Color.white.opacity(0.085),
+                    in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.9)
+                )
+                .padding(.bottom, 22)
+
+                Text("只需授予一次完全磁盘访问权限即可开启。")
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.62))
+                    .padding(.bottom, 14)
+
+                // Vibrant Sunset Coral Gradient Primary CTA
                 Button {
                     viewModel.openFullDiskAccessSettings()
                 } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "gearshape.fill")
-                        Text("打开「完全磁盘访问权限」并勾选 MailPilot")
-                            .fontWeight(.medium)
+                    HStack(spacing: 7) {
+                        Image(systemName: "lock.open.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text("授予完全磁盘访问权限")
+                            .font(.system(size: 14, weight: .semibold))
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: 268)
+                    .padding(.vertical, 11)
+                    .background(
+                        BrandPalette.coralGradient,
+                        in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.24), lineWidth: 0.8)
+                    )
+                    .shadow(color: BrandPalette.coral.opacity(0.38), radius: 14, y: 6)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
+                .buttonStyle(.plain)
+                .padding(.bottom, 16)
 
-                HStack(spacing: 16) {
+                // Quiet Secondary Actions
+                HStack(spacing: 14) {
                     Button {
                         viewModel.connectToNativeMail()
                     } label: {
-                        Label("我已勾选，重新检测", systemImage: "arrow.clockwise")
+                        Label("我已授权，重新检测", systemImage: "arrow.clockwise")
                     }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(Color.accentColor)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.white.opacity(0.86))
 
                     Text("·")
-                        .foregroundStyle(.quaternary)
+                        .foregroundStyle(.white.opacity(0.32))
 
                     Button {
                         viewModel.settingsTab = .ai
@@ -544,32 +564,46 @@ struct PermissionGuideView: View {
                     } label: {
                         Label("先配置 AI 订阅", systemImage: "sparkles")
                     }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.white.opacity(0.66))
                 }
-                .font(.callout)
+                .font(.system(size: 12, weight: .medium))
+
+                Spacer(minLength: 20)
             }
+            .padding(.horizontal, 28)
         }
-        .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .preferredColorScheme(.dark)
     }
 
-    private func guaranteeRow(icon: String, color: Color, title: String, subtitle: String) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: icon)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(color)
-                .frame(width: 28, height: 28)
-                .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.callout.weight(.medium))
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+    private func capabilityColumn(icon: String, iconColor: Color, title: String, subtitle: String) -> some View {
+        VStack(spacing: 7) {
+            ZStack {
+                Circle()
+                    .fill(Color.white.opacity(0.96))
+                    .frame(width: 36, height: 36)
+                    .shadow(color: Color.black.opacity(0.18), radius: 5, y: 2)
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(iconColor)
             }
-            Spacer(minLength: 0)
+
+            VStack(spacing: 2) {
+                Text(title)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(.white)
+                Text(subtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.60))
+            }
         }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var capabilityDivider: some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.14))
+            .frame(width: 1, height: 46)
     }
 }

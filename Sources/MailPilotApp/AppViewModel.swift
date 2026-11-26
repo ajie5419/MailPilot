@@ -37,8 +37,9 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case ai = "AI 与订阅"
     case accounts = "邮箱账号"
     case tags = "智能标签"
-    case notifications = "桌面通知"
+    case notifications = "通知与状态栏"
     case permissions = "系统权限"
+    case about = "关于"
 
     var id: String { rawValue }
 
@@ -49,6 +50,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .tags: return "tag.fill"
         case .notifications: return "bell.badge.fill"
         case .permissions: return "lock.shield.fill"
+        case .about: return "info.circle.fill"
         }
     }
 }
@@ -239,6 +241,7 @@ final class AppViewModel: ObservableObject {
             updateDockUnreadBadge()
         }
     }
+    @Published var menuBarUnreadMessages: [MailMessageSummary] = []
     @Published var launchAtLoginEnabled: Bool = false
 
     @Published var accounts: [MailAccountInfo] = [] {
@@ -308,6 +311,7 @@ final class AppViewModel: ObservableObject {
     private var bodyLoadTask: Task<Void, Never>?
     private var recipientsLoadTask: Task<Void, Never>?
     private var reloadTask: Task<Void, Never>?
+    private var menuBarPreviewTask: Task<Void, Never>?
     private var reloadGeneration: UInt64 = 0
     private var snippetFetchTask: Task<Void, Never>?
     private var snippetGeneration: UInt64 = 0
@@ -607,6 +611,7 @@ final class AppViewModel: ObservableObject {
     func updateDockUnreadBadge() {
         let count = totalInboxUnreadCount
         notificationManager.syncBadgeCount(count)
+        MailPilotAppDelegate.shared?.bind(viewModel: self)
         MailPilotAppDelegate.shared?.onMenuBarCompose = { [weak self] in
             self?.openComposeNew()
         }
@@ -614,6 +619,53 @@ final class AppViewModel: ObservableObject {
             self?.triggerNativeMailFetch()
         }
         MailPilotAppDelegate.shared?.updateMenuBarStatus(visible: showMenuBarExtra, unreadCount: count)
+        if showMenuBarExtra {
+            refreshMenuBarUnreadPreview()
+        }
+    }
+
+    func refreshMenuBarUnreadPreview() {
+        guard let reader else {
+            menuBarUnreadMessages = []
+            return
+        }
+        menuBarPreviewTask?.cancel()
+        menuBarPreviewTask = Task { [weak self] in
+            guard let self else { return }
+            let fetched: [MailMessageSummary]? = await Task.detached(priority: .utility) {
+                try? reader.fetchMessagePage(
+                    mailboxID: nil,
+                    onlyInbox: true,
+                    onlyUnread: true,
+                    onlyFlagged: false,
+                    onlyWithAttachments: false,
+                    sinceDate: nil,
+                    searchQuery: "",
+                    bodyHitIDs: [],
+                    fallbackAttachmentRowIDs: nil,
+                    limit: 12,
+                    predicate: nil
+                ).messages
+            }.value
+            guard !Task.isCancelled, let fetched else { return }
+            let filtered = fetched.filter { msg in
+                if self.pendingRemovedIDs.contains(msg.id) { return false }
+                if let override = self.pendingReadOverrides[msg.id], override.isRead { return false }
+                return true
+            }
+            let topFive = Array(filtered.prefix(5))
+            if self.menuBarUnreadMessages != topFive {
+                self.menuBarUnreadMessages = topFive
+            }
+        }
+    }
+
+    func openMessageFromMenuBar(_ rowID: Int64) {
+        MailPilotAppDelegate.shared?.showMainWindow()
+        sidebarSelection = .allInbox
+        searchQuery = ""
+        reloadMessages()
+        selectedMessageID = rowID
     }
 
     private func observeAppLifecycle() {

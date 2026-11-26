@@ -7,10 +7,7 @@ extension SettingsView {
     // MARK: - Accounts Tab
 
     var accountsSettingsContent: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("邮箱账号设置")
-                .font(.title3.weight(.semibold))
-
+        VStack(alignment: .leading, spacing: 14) {
             if viewModel.groupedMailboxes.isEmpty {
                 settingsCard {
                     Text("尚未检测到邮箱账号，请先在系统 Mail.app 登录邮箱并授予完全磁盘访问权限。")
@@ -37,22 +34,26 @@ extension SettingsView {
                                     size: 16
                                 )
                                 Text(group.title)
-                                    .font(.caption.weight(isSelected ? .semibold : .regular))
+                                    .font(.caption.weight(isSelected ? .semibold : .medium))
                                     .lineLimit(1)
                                 Spacer(minLength: 0)
                             }
                             .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
+                            .padding(.vertical, 8)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(
-                                isSelected ? Color.accentColor.opacity(0.16) : Color.primary.opacity(0.05),
-                                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                BrandPalette.floatingCardFill(for: colorScheme),
+                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
                             )
                             .overlay(
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .strokeBorder(isSelected ? Color.accentColor : Color.secondary.opacity(0.2), lineWidth: isSelected ? 1.2 : 0.6)
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .strokeBorder(
+                                        isSelected ? BrandPalette.coral : BrandPalette.floatingCardBorder(for: colorScheme),
+                                        lineWidth: isSelected ? 1.5 : 0.8
+                                    )
                             )
-                            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .shadow(color: BrandPalette.floatingCardShadow(for: colorScheme), radius: 5, y: 2)
+                            .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         }
                         .buttonStyle(.plain)
                     }
@@ -199,18 +200,7 @@ extension SettingsView {
     // MARK: - Tags Tab
 
     var tagSettingsContent: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                Text("智能邮件标签")
-                    .font(.title3.weight(.semibold))
-                Spacer()
-                Button("恢复默认") {
-                    viewModel.resetTagSettings()
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-
+        VStack(alignment: .leading, spacing: 14) {
             settingsCard {
                 Toggle(isOn: $viewModel.tagSettings.isEnabled) {
                     VStack(alignment: .leading, spacing: 2) {
