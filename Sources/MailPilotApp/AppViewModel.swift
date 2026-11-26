@@ -326,6 +326,7 @@ final class AppViewModel: ObservableObject {
     var cachedAccountLookup: [String: CachedAccountMeta] = [:]
     var pendingRemovedIDs: Set<Int64> = []
     var pendingReadOverrides: [Int64: (isRead: Bool, token: UInt64)] = [:]
+    var pendingReadOriginals: [Int64: (message: MailMessageSummary, isInbox: Bool)] = [:]
     var nextReadOpToken: UInt64 = 0
     var localListMutationVersion: UInt64 = 0
     var isFetchingAccounts = false
@@ -344,15 +345,15 @@ final class AppViewModel: ObservableObject {
     private var menuBarPreviewGeneration: UInt64 = 0
     private var pendingJumpMessageID: Int64?
     var pinnedJumpMessageID: Int64?
-    private var suppressAutoSelectFirstMessage = false
+    var suppressAutoSelectFirstMessage = false
     private var suppressFilterReload = false
     private var reloadGeneration: UInt64 = 0
     private var snippetFetchTask: Task<Void, Never>?
     private var snippetGeneration: UInt64 = 0
     private var pendingSnippetRefreshIDs: Set<Int64> = []
     private var searchDebounceTask: Task<Void, Never>?
-    private var autoMarkReadTask: Task<Void, Never>?
-    private var autoMarkReadTargetID: Int64?
+    var autoMarkReadTask: Task<Void, Never>?
+    var autoMarkReadTargetID: Int64?
     private var watcher: MailDirectoryWatcher?
     private var wakeObserver: NSObjectProtocol?
     private var appLifecycleObservers: [NSObjectProtocol] = []
@@ -1169,8 +1170,15 @@ final class AppViewModel: ObservableObject {
                 } else if let current = self.selectedMessageID, !filtered.contains(where: { $0.id == current }) {
                     if self.pinnedJumpMessageID == current {
                         self.pinnedJumpMessageID = nil
-                    }
-                    if let firstID = filtered.first?.id {
+                        self.suppressAutoSelectFirstMessage = true
+                        self.autoMarkReadTask?.cancel()
+                        self.autoMarkReadTask = nil
+                        self.autoMarkReadTargetID = nil
+                        self.selectedMessageID = nil
+                        if !self.selectedMessageIDs.isEmpty {
+                            self.selectedMessageIDs = []
+                        }
+                    } else if let firstID = filtered.first?.id {
                         self.selectedMessageID = firstID
                         if self.selectedMessageIDs != [firstID] {
                             self.selectedMessageIDs = [firstID]
