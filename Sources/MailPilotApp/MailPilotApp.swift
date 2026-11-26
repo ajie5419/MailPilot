@@ -273,15 +273,13 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
             if let window = settingsWindow {
                 if let sheet = window.attachedSheet {
                     window.endSheet(sheet)
+                    // Wait for `handleSettingsWindowDidEndSheet` before hiding & tearing down `contentViewController`.
+                    return
                 }
                 if window.isVisible {
                     window.orderOut(nil)
                 }
-                // Tear down hidden SettingsView hosting controller only once no sheet is attached,
-                // so ObservableObject subscriptions & behindWindow blur incur zero background overhead.
-                if window.attachedSheet == nil {
-                    window.contentViewController = nil
-                }
+                window.contentViewController = nil
             }
             return
         }
@@ -357,6 +355,9 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
             window.endSheet(sheet)
             return
         }
+        if window.isVisible {
+            window.orderOut(nil)
+        }
         window.contentViewController = nil
     }
 
@@ -401,6 +402,9 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
     func registerMainWindow(_ window: NSWindow) {
         guard !isSettingsWindow(window), !window.isSheet, window.sheetParent == nil else { return }
         if mainWindow !== window {
+            if let previousWindow = mainWindow {
+                NotificationCenter.default.removeObserver(self, name: NSWindow.didEndSheetNotification, object: previousWindow)
+            }
             mainWindow = window
             appliedMainWindowOnboarding = nil
             mainWindowOriginalChrome = MainWindowChromeSnapshot(
@@ -419,7 +423,7 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
                 closeInterceptor = proxy
                 window.delegate = proxy
             }
-            NotificationCenter.default.removeObserver(self, name: NSWindow.didEndSheetNotification, object: nil)
+            NotificationCenter.default.removeObserver(self, name: NSWindow.didEndSheetNotification, object: window)
             NotificationCenter.default.addObserver(
                 self,
                 selector: #selector(handleMainWindowDidEndSheet(_:)),
