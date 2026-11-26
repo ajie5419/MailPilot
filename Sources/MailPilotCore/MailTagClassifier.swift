@@ -110,6 +110,21 @@ public enum MailTagClassifier {
         "verify", "confirm", "password", "reset", "security", "ticket", "expir", "suspended"
     ]
 
+    private static let verificationKeywordBytes = encodeKeywords(verificationKeywords)
+    private static let billingKeywordBytes = encodeKeywords(billingKeywords)
+    private static let orderLogisticsKeywordBytes = encodeKeywords(orderLogisticsKeywords)
+    private static let meetingKeywordBytes = encodeKeywords(meetingKeywords)
+    private static let promotionKeywordBytes = encodeKeywords(promotionKeywords)
+    private static let automatedSenderKeywordBytes = encodeKeywords(automatedSenderKeywords)
+    private static let notificationKeywordBytes = encodeKeywords(notificationKeywords)
+
+    private static func encodeKeywords(_ keywords: [String]) -> [[UInt8]] {
+        keywords.compactMap { kw in
+            let bytes = Array(kw.utf8)
+            return bytes.isEmpty ? nil : bytes
+        }
+    }
+
     public static func classify(
         subject: String,
         senderName: String,
@@ -118,10 +133,16 @@ public enum MailTagClassifier {
     ) -> [MailSmartTag] {
         guard settings.isEnabled else { return [] }
 
-        let subj = subject.lowercased()
-        let addrLower = senderAddress.lowercased()
-        let sender = "\(senderName.lowercased()) \(addrLower)"
-        let combined = "\(subj) \(sender)"
+        let subjBytes = lowercasedUTF8Bytes(subject)
+        let addrBytes = lowercasedUTF8Bytes(senderAddress)
+        let nameBytes = lowercasedUTF8Bytes(senderName)
+        var combinedBytes: [UInt8] = []
+        combinedBytes.reserveCapacity(subjBytes.count + nameBytes.count + addrBytes.count + 2)
+        combinedBytes.append(contentsOf: subjBytes)
+        combinedBytes.append(0x20)
+        combinedBytes.append(contentsOf: nameBytes)
+        combinedBytes.append(0x20)
+        combinedBytes.append(contentsOf: addrBytes)
         let hasCustom = !settings.customKeywords.isEmpty
 
         var tags: [MailSmartTag] = []
@@ -129,49 +150,49 @@ public enum MailTagClassifier {
 
         // 1. Verification / Security Code
         if settings.isTagEnabled(.verification) {
-            if matchesAny(subj, verificationKeywords)
-                || (hasCustom && matchesAny(combined, settings.customKeywordList(for: .verification))) {
+            if matchesAnyUTF8(subjBytes, verificationKeywordBytes)
+                || (hasCustom && matchesAnyUTF8(combinedBytes, encodeKeywords(settings.customKeywordList(for: .verification)))) {
                 tags.append(.verification)
             }
         }
 
         // 2. Billing / Invoice / Payment
         if settings.isTagEnabled(.billing) {
-            if matchesAny(combined, billingKeywords)
-                || (hasCustom && matchesAny(combined, settings.customKeywordList(for: .billing))) {
+            if matchesAnyUTF8(combinedBytes, billingKeywordBytes)
+                || (hasCustom && matchesAnyUTF8(combinedBytes, encodeKeywords(settings.customKeywordList(for: .billing)))) {
                 tags.append(.billing)
             }
         }
 
         // 3. Order & Logistics
         if tags.count < 2 && settings.isTagEnabled(.orderLogistics) {
-            if matchesAny(combined, orderLogisticsKeywords)
-                || (hasCustom && matchesAny(combined, settings.customKeywordList(for: .orderLogistics))) {
+            if matchesAnyUTF8(combinedBytes, orderLogisticsKeywordBytes)
+                || (hasCustom && matchesAnyUTF8(combinedBytes, encodeKeywords(settings.customKeywordList(for: .orderLogistics)))) {
                 tags.append(.orderLogistics)
             }
         }
 
         // 4. Meeting & Calendar
         if tags.count < 2 && settings.isTagEnabled(.meeting) {
-            if matchesAny(subj, meetingKeywords)
-                || (hasCustom && matchesAny(combined, settings.customKeywordList(for: .meeting))) {
+            if matchesAnyUTF8(subjBytes, meetingKeywordBytes)
+                || (hasCustom && matchesAnyUTF8(combinedBytes, encodeKeywords(settings.customKeywordList(for: .meeting)))) {
                 tags.append(.meeting)
             }
         }
 
         // 5. Promotion / Newsletter
         if tags.count < 2 && settings.isTagEnabled(.promotion) {
-            if matchesAny(subj, promotionKeywords)
-                || (hasCustom && matchesAny(combined, settings.customKeywordList(for: .promotion))) {
+            if matchesAnyUTF8(subjBytes, promotionKeywordBytes)
+                || (hasCustom && matchesAnyUTF8(combinedBytes, encodeKeywords(settings.customKeywordList(for: .promotion)))) {
                 tags.append(.promotion)
             }
         }
 
         // 6. System Notification / Security / Welcome / Support
         if tags.count < 2 && settings.isTagEnabled(.notification) {
-            let hasNotifyKeyword = matchesAny(subj, notificationKeywords)
-            let matchedCustom = hasCustom && matchesAny(combined, settings.customKeywordList(for: .notification))
-            if matchedCustom || hasNotifyKeyword || (tags.isEmpty && matchesAny(addrLower, automatedSenderKeywords)) {
+            let hasNotifyKeyword = matchesAnyUTF8(subjBytes, notificationKeywordBytes)
+            let matchedCustom = hasCustom && matchesAnyUTF8(combinedBytes, encodeKeywords(settings.customKeywordList(for: .notification)))
+            if matchedCustom || hasNotifyKeyword || (tags.isEmpty && matchesAnyUTF8(addrBytes, automatedSenderKeywordBytes)) {
                 if !tags.contains(.promotion) {
                     tags.append(.notification)
                 }
@@ -181,12 +202,63 @@ public enum MailTagClassifier {
         return tags
     }
 
-    private static func matchesAny(_ text: String, _ keywords: [String]) -> Bool {
-        for kw in keywords {
-            if text.contains(kw) {
-                return true
+    /// Lowercases ASCII in-place directly on UTF-8 bytes; falls back to full Unicode `lowercased()`
+    /// only when non-ASCII Latin/script characters are present (CJK bytes pass through untouched).
+    private static func lowercasedUTF8Bytes(_ text: String) -> [UInt8] {
+        var bytes = Array(text.utf8)
+        var needsUnicodeLowercase = false
+        for i in bytes.indices {
+            let b = bytes[i]
+            if b >= 0x41 && b <= 0x5A {
+                bytes[i] = b &+ 32
+            } else if b >= 0xC0 && !(b >= 0xE3 && b <= 0xE9) {
+                // Non-CJK multi-byte UTF-8 lead byte (Latin Extended, Greek, Cyrillic, Fullwidth Latin, etc.).
+                needsUnicodeLowercase = true
+                break
             }
         }
-        return false
+        if needsUnicodeLowercase {
+            return Array(text.lowercased().utf8)
+        }
+        return bytes
+    }
+
+    private static func matchesAnyUTF8(_ haystack: [UInt8], _ needles: [[UInt8]]) -> Bool {
+        let hCount = haystack.count
+        guard hCount > 0 else { return false }
+        return haystack.withUnsafeBufferPointer { hBuf in
+            guard let hBase = hBuf.baseAddress else { return false }
+            for needle in needles {
+                let nCount = needle.count
+                if nCount == 0 || nCount > hCount { continue }
+                let first = needle[0]
+                let limit = hCount - nCount
+                if nCount == 1 {
+                    if memchr(hBase, Int32(first), hCount) != nil {
+                        return true
+                    }
+                    continue
+                }
+                let matched = needle.withUnsafeBufferPointer { nBuf -> Bool in
+                    guard let nBase = nBuf.baseAddress else { return false }
+                    var offset = 0
+                    while offset <= limit {
+                        guard let found = memchr(hBase.advanced(by: offset), Int32(first), limit - offset + 1) else {
+                            return false
+                        }
+                        let pos = hBase.distance(to: found.assumingMemoryBound(to: UInt8.self))
+                        if memcmp(hBase.advanced(by: pos + 1), nBase.advanced(by: 1), nCount - 1) == 0 {
+                            return true
+                        }
+                        offset = pos + 1
+                    }
+                    return false
+                }
+                if matched {
+                    return true
+                }
+            }
+            return false
+        }
     }
 }

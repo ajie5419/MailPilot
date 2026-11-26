@@ -8,6 +8,7 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
     @MainActor static weak var shared: MailPilotAppDelegate?
     @MainActor private weak var mainWindow: NSWindow?
     @MainActor private var mainWindowOriginalChrome: MainWindowChromeSnapshot?
+    @MainActor private var appliedMainWindowOnboarding: Bool?
     @MainActor private var pendingMainWindowMode: (isOnboarding: Bool, animate: Bool)?
     @MainActor private weak var boundViewModel: AppViewModel?
     @MainActor private var closeInterceptor: WindowCloseInterceptor?
@@ -268,8 +269,13 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
     func setSettingsWindowVisible(_ visible: Bool, viewModel: AppViewModel) {
         boundViewModel = viewModel
         if !visible {
-            if let window = settingsWindow, window.isVisible {
-                window.orderOut(nil)
+            if let window = settingsWindow {
+                if window.isVisible {
+                    window.orderOut(nil)
+                }
+                // Tear down hidden SettingsView hosting controller so its ObservableObject subscriptions
+                // and behindWindow NSVisualEffectView incur zero background overhead while closed.
+                window.contentViewController = nil
             }
             return
         }
@@ -277,6 +283,14 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
         let window: NSWindow
         if let existing = settingsWindow {
             window = existing
+            if window.contentViewController == nil {
+                let savedFrame = window.frame
+                window.contentViewController = NSHostingController(
+                    rootView: SettingsView(viewModel: viewModel)
+                        .ignoresSafeArea(.container, edges: .top)
+                )
+                window.setFrame(savedFrame, display: false)
+            }
         } else {
             let hosting = NSHostingController(
                 rootView: SettingsView(viewModel: viewModel)
@@ -301,8 +315,9 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
             created.center()
 
             let delegate = SettingsWindowDelegate { [weak viewModel] in
-                Task { @MainActor in
+                MainActor.assumeIsolated {
                     viewModel?.showSettings = false
+                    MailPilotAppDelegate.shared?.detachHiddenSettingsContent()
                 }
             }
             settingsWindowDelegate = delegate
@@ -319,6 +334,11 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @MainActor
+    func detachHiddenSettingsContent() {
+        settingsWindow?.contentViewController = nil
     }
 
     // MARK: - Application Lifecycle & Main Window
@@ -359,6 +379,7 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
         guard !isSettingsWindow(window), !window.isSheet, window.sheetParent == nil else { return }
         if mainWindow !== window {
             mainWindow = window
+            appliedMainWindowOnboarding = nil
             mainWindowOriginalChrome = MainWindowChromeSnapshot(
                 hadFullSizeContentView: window.styleMask.contains(.fullSizeContentView),
                 titleVisibility: window.titleVisibility,
@@ -394,12 +415,16 @@ final class MailPilotAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDele
     @MainActor
     func applyMainWindowMode(isOnboarding: Bool, animate: Bool) {
         guard let window = mainWindow else { return }
+        if appliedMainWindowOnboarding == isOnboarding && pendingMainWindowMode == nil {
+            return
+        }
         // Never mutate styleMask or frame while a sheet is attached; defer until `didEndSheetNotification`.
         if window.attachedSheet != nil {
             pendingMainWindowMode = (isOnboarding: isOnboarding, animate: animate)
             return
         }
         pendingMainWindowMode = nil
+        appliedMainWindowOnboarding = isOnboarding
         let original = mainWindowOriginalChrome
 
         if isOnboarding {
