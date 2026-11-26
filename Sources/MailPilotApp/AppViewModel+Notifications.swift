@@ -94,12 +94,15 @@ extension AppViewModel {
         }
 
         for msg in newlyArrived {
-            var code: String?
-            if let parser = emlxParser {
+            var code = EmlxParser.extractVerificationCode(from: msg.subject)
+            if code == nil, let parser = emlxParser {
                 let body = await parser.loadBody(for: msg.id)
                 if body.loadStatus == .ready {
                     code = body.verificationCode
                 }
+            }
+            if let code, !code.isEmpty {
+                recordIncomingVerificationCode(code, for: msg)
             }
             notificationManager.notifyNewMail(message: msg, verificationCode: code)
         }

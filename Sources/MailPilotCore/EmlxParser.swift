@@ -148,6 +148,19 @@ public actor EmlxParser {
 
     private func locateEmlxPath(rowID: Int64) -> String? {
         if let cached = pathCache[rowID], access(cached, F_OK) == 0 {
+            if cached.hasSuffix(".partial.emlx") {
+                let fullSibling = String(cached.dropLast(".partial.emlx".count)) + ".emlx"
+                if access(fullSibling, F_OK) == 0 {
+                    cachePath(fullSibling, for: rowID)
+                    missingCache.removeValue(forKey: rowID)
+                    return fullSibling
+                }
+                if let upgraded = fastBucketLookup(rowID: rowID), !upgraded.hasSuffix(".partial.emlx") {
+                    cachePath(upgraded, for: rowID)
+                    missingCache.removeValue(forKey: rowID)
+                    return upgraded
+                }
+            }
             missingCache.removeValue(forKey: rowID)
             return cached
         }
@@ -220,15 +233,23 @@ public actor EmlxParser {
 
     private func fastBucketLookup(rowID: Int64) -> String? {
         let relPaths = Self.bucketRelativePaths(for: rowID)
+        guard relPaths.count == 2 else { return nil }
+        let fullRel = relPaths[0]
+        let partialRel = relPaths[1]
+        var partialFallback: String?
         for root in dataRootPaths {
-            for rel in relPaths {
-                let candidate = "\(root)/\(rel)"
-                if access(candidate, F_OK) == 0 {
-                    return candidate
+            let fullCandidate = "\(root)/\(fullRel)"
+            if access(fullCandidate, F_OK) == 0 {
+                return fullCandidate
+            }
+            if partialFallback == nil {
+                let partialCandidate = "\(root)/\(partialRel)"
+                if access(partialCandidate, F_OK) == 0 {
+                    partialFallback = partialCandidate
                 }
             }
         }
-        return nil
+        return partialFallback
     }
 
     /// Discovers mailbox `Data/` directories WITHOUT descending into them (`skipDescendants()`),
@@ -308,7 +329,9 @@ public actor EmlxParser {
     private static let verificationCodeRegexes: [NSRegularExpression] = [
         #"(?:验证码|校验码|动态码|安全码|登录码)[^\dA-Za-z]{0,12}(\d{4,8})\b"#,
         #"(?i)(?:verification code|security code|sign-in code|login code|one-time password|OTP|passcode)[^\d]{0,20}(\d{4,8})\b"#,
-        #"(?i)\bcode\s*(?:is|:)\s*(\d{4,8})\b"#
+        #"(?i)\bcode\s*(?:is|:)\s*(\d{4,8})\b"#,
+        #"(?<![0-9A-Za-z.])(\d{4,8})(?![0-9A-Za-z.])[ \t]{0,4}(?:是您的|为您的|是你的|为你的|是本次|为本次|是|为)[^\r\n。！？!?;；\d]{0,10}(?:验证码|校验码|动态码|安全码|登录码)"#,
+        #"(?i)(?<![0-9A-Za-z.])(\d{4,8})(?![0-9A-Za-z.])[ \t]{1,4}is[ \t]{1,4}your[ \t]{1,4}(?:[A-Za-z0-9-]{1,24}[ \t]{1,4}){0,3}(?:(?:verification|security|sign-in|signin|login|log-in|one-time|confirmation|authentication|auth|2fa|mfa)[ \t]{1,4}code|passcode|one-time[ \t]{1,4}password|OTP)\b"#
     ].compactMap { try? NSRegularExpression(pattern: $0) }
     private static let parameterRegexes: [String: NSRegularExpression] = {
         let names = ["boundary", "charset", "filename\\*", "filename", "name\\*", "name"]

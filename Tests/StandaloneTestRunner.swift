@@ -1091,7 +1091,22 @@ struct StandaloneTestRunner {
             "CJK + ASCII fast path matches built-in billing keywords"
         )
 
-        print("ALL 42 CORE TEST SUITES PASSED")
+        // 43. Verification code extraction: Chinese/English positive, negative, CJK no-boundary & ReDoS guard
+        assertEqual(EmlxParser.extractVerificationCode(from: "【阿里云】您的验证码为 531820，5分钟内有效"), "531820", "Chinese keyword-before-code")
+        assertEqual(EmlxParser.extractVerificationCode(from: "842916 是您的登录验证码，请勿泄露"), "842916", "Chinese code-before-keyword")
+        assertEqual(EmlxParser.extractVerificationCode(from: "登录提醒842916是您的登录验证码"), "842916", "Chinese code-before-keyword without space before digits")
+        assertEqual(EmlxParser.extractVerificationCode(from: "Your GitHub verification code: 709412"), "709412", "English keyword-before-code")
+        assertEqual(EmlxParser.extractVerificationCode(from: "492817 is your OpenAI verification code."), "492817", "English code-before-keyword")
+        assertEqual(EmlxParser.extractVerificationCode(from: "492817 is your Microsoft Entra ID verification code."), "492817", "English code-before-keyword with 3-word brand")
+        assertEqual(EmlxParser.extractVerificationCode(from: "19.2026 is your order code."), nil, "Rejects decimal/order code false positive")
+        assertEqual(EmlxParser.extractVerificationCode(from: "123456 is your ZIP code."), nil, "Rejects ZIP code false positive")
+        let redosPayload = "123456 " + String(repeating: " ", count: 8000) + "is your verification"
+        let redosStart = DispatchTime.now().uptimeNanoseconds
+        assertEqual(EmlxParser.extractVerificationCode(from: redosPayload), nil, "ReDoS payload returns nil")
+        let redosElapsedMs = Double(DispatchTime.now().uptimeNanoseconds - redosStart) / 1_000_000.0
+        assertTrue(redosElapsedMs < 50.0, "English code-before-keyword regex stays linear under 8000 spaces (\(redosElapsedMs)ms)")
+
+        print("ALL 43 CORE TEST SUITES PASSED")
         try await ChatGPTTests.run()
     }
 }
