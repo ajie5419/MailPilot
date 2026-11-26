@@ -133,6 +133,10 @@ extension AppViewModel {
 
     func removeMessageLocally(rowID: Int64) {
         sessionKeptUnreadMessages.removeValue(forKey: rowID)
+        menuBarUnreadVerificationCodes.removeValue(forKey: rowID)
+        if menuBarRecentVerificationCode?.messageID == rowID {
+            menuBarRecentVerificationCode = nil
+        }
         let wasPinnedJump = (pinnedJumpMessageID == rowID)
         if wasPinnedJump {
             pinnedJumpMessageID = nil

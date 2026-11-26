@@ -1091,7 +1091,13 @@ struct StandaloneTestRunner {
             "CJK + ASCII fast path matches built-in billing keywords"
         )
 
-        print("ALL 42 CORE TEST SUITES PASSED")
+        // 43. Verification code extraction covers both keyword-before-code and code-before-keyword (Chinese & English)
+        assertEqual(EmlxParser.extractVerificationCode(from: "【阿里云】您的验证码为 531820，5分钟内有效"), "531820", "Chinese keyword-before-code")
+        assertEqual(EmlxParser.extractVerificationCode(from: "842916 是您的登录验证码，请勿泄露"), "842916", "Chinese code-before-keyword")
+        assertEqual(EmlxParser.extractVerificationCode(from: "Your GitHub verification code: 709412"), "709412", "English keyword-before-code")
+        assertEqual(EmlxParser.extractVerificationCode(from: "492817 is your OpenAI verification code."), "492817", "English code-before-keyword")
+
+        print("ALL 43 CORE TEST SUITES PASSED")
         try await ChatGPTTests.run()
     }
 }

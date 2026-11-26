@@ -27,6 +27,14 @@ struct MenuBarPopoverView: View {
             Divider()
                 .opacity(colorScheme == .dark ? 0.35 : 0.45)
 
+            if let feedback = viewModel.menuBarCopyFeedbackText {
+                copyFeedbackBanner(text: feedback)
+            }
+
+            if viewModel.accessError == nil, let recentCode = viewModel.menuBarRecentVerificationCode {
+                verificationCodeBanner(for: recentCode)
+            }
+
             contentSection
 
             Divider()
@@ -34,7 +42,7 @@ struct MenuBarPopoverView: View {
 
             footerBar
         }
-        .frame(width: 332)
+        .frame(width: 336)
         .tint(BrandPalette.coral)
     }
 
@@ -84,6 +92,113 @@ struct MenuBarPopoverView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 11)
+    }
+
+    private func copyFeedbackBanner(text: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white)
+            Text(text)
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Color(red: 0.14, green: 0.58, blue: 0.34), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .padding(.horizontal, 10)
+        .padding(.top, 8)
+    }
+
+    private func verificationCodeBanner(for item: RecentVerificationCode) -> some View {
+        let isCopied = viewModel.copiedVerificationMessageID == item.messageID
+        return HStack(spacing: 10) {
+            Button {
+                onSelectMessage(item.messageID)
+            } label: {
+                HStack(spacing: 9) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(BrandPalette.coralButtonGradient)
+                            .frame(width: 28, height: 28)
+                        Image(systemName: "key.fill")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(.white)
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 5) {
+                            Text("最新验证码")
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(BrandPalette.coral)
+                            Text("·")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                            Text(formatRelativeTime(item.dateReceived))
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.secondary)
+                        }
+                        Text(item.sender)
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(.primary.opacity(0.88))
+                            .lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("点击打开验证码邮件")
+
+            Button {
+                viewModel.copyVerificationCode(item.code, messageID: item.messageID)
+            } label: {
+                HStack(spacing: 6) {
+                    Text(item.code)
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .tracking(0.8)
+                        .foregroundStyle(.white)
+
+                    HStack(spacing: 3) {
+                        Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text(isCopied ? "已复制" : "复制")
+                            .font(.system(size: 10.5, weight: .semibold))
+                    }
+                    .foregroundStyle(.white.opacity(0.95))
+                    .padding(.horizontal, 6.5)
+                    .padding(.vertical, 3)
+                    .background(Color.black.opacity(0.18), in: Capsule())
+                }
+                .padding(.leading, 10)
+                .padding(.trailing, 6)
+                .padding(.vertical, 6)
+                .background(
+                    isCopied
+                        ? AnyShapeStyle(Color(red: 0.14, green: 0.60, blue: 0.34))
+                        : AnyShapeStyle(BrandPalette.coralButtonGradient),
+                    in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                )
+            }
+            .buttonStyle(.plain)
+            .help("一键复制验证码 \(item.code)")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(
+            colorScheme == .dark
+                ? BrandPalette.coral.opacity(0.14)
+                : BrandPalette.coral.opacity(0.08),
+            in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .strokeBorder(BrandPalette.coral.opacity(colorScheme == .dark ? 0.34 : 0.24), lineWidth: 0.8)
+        )
+        .padding(.horizontal, 10)
+        .padding(.top, 9)
     }
 
     @ViewBuilder
@@ -148,16 +263,11 @@ struct MenuBarPopoverView: View {
                             .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 28)
+                    .padding(.vertical, viewModel.menuBarRecentVerificationCode != nil ? 18 : 28)
                 } else {
                     VStack(spacing: 4) {
                         ForEach(items) { msg in
-                            Button {
-                                onSelectMessage(msg.id)
-                            } label: {
-                                unreadRow(for: msg)
-                            }
-                            .buttonStyle(.plain)
+                            unreadRow(for: msg)
                         }
 
                         if unreadCount > items.count {
@@ -184,37 +294,100 @@ struct MenuBarPopoverView: View {
 
     private func unreadRow(for message: MailMessageSummary) -> some View {
         let snippet = viewModel.snippet(for: message.id)
-        return HStack(alignment: .top, spacing: 9) {
-            Circle()
-                .fill(BrandPalette.coral)
-                .frame(width: 7, height: 7)
-                .padding(.top, 5)
+        let rowCode = viewModel.menuBarUnreadVerificationCodes[message.id]
+        let isCopied = viewModel.copiedVerificationMessageID == message.id
 
-            VStack(alignment: .leading, spacing: 2.5) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(message.displaySender)
-                        .font(.system(size: 12.5, weight: .semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
+        return VStack(alignment: .leading, spacing: 7) {
+            Button {
+                onSelectMessage(message.id)
+            } label: {
+                HStack(alignment: .top, spacing: 9) {
+                    Circle()
+                        .fill(BrandPalette.coral)
+                        .frame(width: 7, height: 7)
+                        .padding(.top, 5)
+
+                    VStack(alignment: .leading, spacing: 2.5) {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(message.displaySender)
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+
+                            Spacer(minLength: 4)
+
+                            Text(formatRelativeTime(message.dateReceived))
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Text(message.subject.isEmpty ? "(无主题)" : message.subject)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.primary.opacity(0.92))
+                            .lineLimit(1)
+
+                        if let snippet, !snippet.isEmpty {
+                            Text(snippet)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if let code = rowCode {
+                HStack(spacing: 8) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "key.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(BrandPalette.coral)
+                        Text(code)
+                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                            .tracking(0.8)
+                            .foregroundStyle(.primary)
+                    }
 
                     Spacer(minLength: 4)
 
-                    Text(formatRelativeTime(message.dateReceived))
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
+                    Button {
+                        viewModel.copyVerificationCode(code, messageID: message.id)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                                .font(.system(size: 9.5, weight: .semibold))
+                            Text(isCopied ? "已复制" : "复制")
+                                .font(.system(size: 10.5, weight: .semibold))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 4)
+                        .background(
+                            isCopied
+                                ? AnyShapeStyle(Color(red: 0.14, green: 0.60, blue: 0.34))
+                                : AnyShapeStyle(BrandPalette.coralButtonGradient),
+                            in: Capsule()
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help("一键复制验证码 \(code) 并标为已读")
                 }
-
-                Text(message.subject.isEmpty ? "(无主题)" : message.subject)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.primary.opacity(0.92))
-                    .lineLimit(1)
-
-                if let snippet, !snippet.isEmpty {
-                    Text(snippet)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5.5)
+                .background(
+                    colorScheme == .dark
+                        ? BrandPalette.coral.opacity(0.14)
+                        : BrandPalette.coral.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(BrandPalette.coral.opacity(colorScheme == .dark ? 0.30 : 0.20), lineWidth: 0.7)
+                )
+                .padding(.leading, 16)
             }
         }
         .padding(.horizontal, 10)
@@ -228,7 +401,6 @@ struct MenuBarPopoverView: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(BrandPalette.floatingCardBorder(for: colorScheme).opacity(0.55), lineWidth: 0.6)
         )
-        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private var footerBar: some View {
@@ -261,6 +433,14 @@ struct MenuBarPopoverView: View {
     }
 
     private func formatRelativeTime(_ date: Date) -> String {
+        let now = Date()
+        let delta = now.timeIntervalSince(date)
+        if delta >= -5 && delta < 60 {
+            return "刚刚"
+        }
+        if delta >= 60 && delta < 3600 {
+            return "\(Int(delta / 60)) 分钟前"
+        }
         let calendar = Calendar.current
         if calendar.isDateInToday(date) {
             return Self.timeFormatter.string(from: date)

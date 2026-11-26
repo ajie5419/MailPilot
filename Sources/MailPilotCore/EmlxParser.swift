@@ -308,7 +308,9 @@ public actor EmlxParser {
     private static let verificationCodeRegexes: [NSRegularExpression] = [
         #"(?:验证码|校验码|动态码|安全码|登录码)[^\dA-Za-z]{0,12}(\d{4,8})\b"#,
         #"(?i)(?:verification code|security code|sign-in code|login code|one-time password|OTP|passcode)[^\d]{0,20}(\d{4,8})\b"#,
-        #"(?i)\bcode\s*(?:is|:)\s*(\d{4,8})\b"#
+        #"(?i)\bcode\s*(?:is|:)\s*(\d{4,8})\b"#,
+        #"\b(\d{4,8})\s*(?:是您的|为您的|是你的|为你的|是本次|为本次|是|为)[^\r\n。！？!?;；]{0,10}?(?:验证码|校验码|动态码|安全码|登录码)"#,
+        #"(?i)\b(\d{4,8})\s+is\s+your\s+(?:[A-Za-z0-9-]+\s+){0,3}(?:verification|security|sign-in|login|one-time|confirmation|authentication|auth)?\s*(?:code|passcode|OTP)\b"#
     ].compactMap { try? NSRegularExpression(pattern: $0) }
     private static let parameterRegexes: [String: NSRegularExpression] = {
         let names = ["boundary", "charset", "filename\\*", "filename", "name\\*", "name"]
