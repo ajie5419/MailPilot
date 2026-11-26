@@ -107,14 +107,14 @@ final class SenderAvatarLoader: ObservableObject {
         let cacheDir = cacheDirectory
         let diskURL = cacheDir.appendingPathComponent("\(domain).png")
         Task.detached(priority: .utility) {
-            // Fast disk cache hit off the main thread (never block SwiftUI view body with disk I/O).
-            if let diskData = try? Data(contentsOf: diskURL), diskData.count > 120 {
+            // Fast disk cache hit off the main thread; validate dimensions locally so corrupt/tiny files fall back to network.
+            if let diskData = try? Data(contentsOf: diskURL),
+               diskData.count > 120,
+               let probe = NSImage(data: diskData),
+               probe.size.width >= 16,
+               probe.size.height >= 16 {
                 await MainActor.run {
-                    if let diskImage = NSImage(data: diskData), diskImage.size.width >= 16 {
-                        SenderAvatarLoader.shared.enqueueLoaded(domain: domain, image: diskImage)
-                    } else {
-                        SenderAvatarLoader.shared.enqueueLoaded(domain: domain, image: nil)
-                    }
+                    SenderAvatarLoader.shared.enqueueLoaded(domain: domain, image: NSImage(data: diskData))
                 }
                 return
             }

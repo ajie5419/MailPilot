@@ -7,7 +7,7 @@ import MailPilotCore
 extension AppViewModel {
     // MARK: - Local Optimistic Message Mutations
 
-    func updateLocalReadState(rowID: Int64, isRead: Bool) {
+    func updateLocalReadState(rowID: Int64, isRead: Bool, forceInbox: Bool = false) {
         guard let idx = messages.firstIndex(where: { $0.id == rowID }) else {
             // Even if the user switched folders before a write failure rolled back,
             // immediately reconcile the menu bar unread preview state.
@@ -22,7 +22,7 @@ extension AppViewModel {
         let old = messages[idx]
         guard old.isRead != isRead else { return }
         if pendingReadOverrides[rowID] != nil, pendingReadOriginals[rowID] == nil {
-            let isInbox = (old.mailboxName == "收件箱" || isShowingInboxScopedView)
+            let isInbox = (forceInbox || old.mailboxName == "收件箱" || isShowingInboxScopedView)
             pendingReadOriginals[rowID] = (message: old, isInbox: isInbox)
         }
         localListMutationVersion &+= 1
@@ -40,8 +40,8 @@ extension AppViewModel {
             accountID: old.accountID
         )
         messages[idx] = updated
-        applyOptimisticMenuBarPreviewMutation(updatedMessage: updated, removedRowID: isRead ? rowID : nil)
-        adjustLocalUnreadCount(for: old, delta: isRead ? -1 : 1)
+        applyOptimisticMenuBarPreviewMutation(updatedMessage: updated, removedRowID: isRead ? rowID : nil, forceInbox: forceInbox)
+        adjustLocalUnreadCount(for: old, delta: isRead ? -1 : 1, forceInbox: forceInbox)
         if isRead {
             notificationManager.removeDeliveredNotification(for: rowID)
         }
@@ -216,7 +216,7 @@ extension AppViewModel {
         localListMutationVersion &+= 1
         if !succeeded {
             let wasInMessages = messages.contains(where: { $0.id == rowID })
-            updateLocalReadState(rowID: rowID, isRead: fallbackIsRead)
+            updateLocalReadState(rowID: rowID, isRead: fallbackIsRead, forceInbox: original?.isInbox ?? false)
             if !wasInMessages, let original {
                 adjustLocalUnreadCount(for: original.message, delta: fallbackIsRead ? -1 : 1, forceInbox: original.isInbox)
             }

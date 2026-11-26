@@ -280,7 +280,11 @@ final class AppViewModel: ObservableObject {
         }
     }
     @Published var menuBarUnreadPreviewState: MenuBarUnreadPreviewState = .loading
-    @Published var menuBarRecentVerificationCode: RecentVerificationCode?
+    @Published var menuBarRecentVerificationCode: RecentVerificationCode? {
+        didSet {
+            scheduleRecentVerificationCodeExpiryIfNeeded()
+        }
+    }
     @Published var menuBarUnreadVerificationCodes: [Int64: String] = [:]
     @Published var copiedVerificationMessageID: Int64?
     @Published var menuBarCopyFeedbackText: String?
@@ -360,6 +364,8 @@ final class AppViewModel: ObservableObject {
     private var menuBarCodeTask: Task<Void, Never>?
     private var menuBarCodeGeneration: UInt64 = 0
     private var copiedCodeResetTask: Task<Void, Never>?
+    private var activeCopyMessageID: Int64?
+    private var recentCodeExpiryTask: Task<Void, Never>?
     /// Maps message ROWID -> extracted OTP code (`nil` means parsed full `.emlx` and confirmed no code).
     var cachedVerificationCodes: [Int64: String?] = [:]
     var cachedVerificationOrder: [Int64] = []
@@ -896,7 +902,28 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    private func scheduleRecentVerificationCodeExpiryIfNeeded() {
+        recentCodeExpiryTask?.cancel()
+        recentCodeExpiryTask = nil
+        guard let item = menuBarRecentVerificationCode else { return }
+        let remaining = (15 * 60.0) - Date().timeIntervalSince(item.dateReceived)
+        let targetID = item.messageID
+        if remaining <= 0 {
+            menuBarRecentVerificationCode = nil
+            return
+        }
+        recentCodeExpiryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(remaining))
+            guard !Task.isCancelled, let self,
+                  self.menuBarRecentVerificationCode?.messageID == targetID else {
+                return
+            }
+            self.menuBarRecentVerificationCode = nil
+        }
+    }
+
     private func showMenuBarCopyFeedback(_ text: String, messageID: Int64, isError: Bool = false) {
+        activeCopyMessageID = messageID
         copiedVerificationMessageID = isError ? nil : messageID
         menuBarCopyFeedbackText = text
         menuBarCopyFeedbackIsError = isError
@@ -961,7 +988,7 @@ final class AppViewModel: ObservableObject {
         }
 
         if messageInList != nil {
-            updateLocalReadState(rowID: rowID, isRead: true)
+            updateLocalReadState(rowID: rowID, isRead: true, forceInbox: true)
             if sidebarSelection == .unread,
                let updated = messages.first(where: { $0.id == rowID }) {
                 sessionKeptUnreadMessages[rowID] = updated
@@ -971,7 +998,7 @@ final class AppViewModel: ObservableObject {
                 pendingReadOriginals[rowID] = (message: previewMsg, isInbox: true)
                 adjustLocalUnreadCount(for: previewMsg, delta: -1, forceInbox: true)
             }
-            updateLocalReadState(rowID: rowID, isRead: true)
+            updateLocalReadState(rowID: rowID, isRead: true, forceInbox: true)
             notificationManager.removeDeliveredNotification(for: rowID)
         }
 
@@ -982,7 +1009,7 @@ final class AppViewModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(500))
                 let isCurrentToken = self.pendingReadOverrides[rowID]?.token == readToken
                 self.finishReadOverride(rowID: rowID, token: readToken, succeeded: true, fallbackIsRead: false)
-                if isCurrentToken && self.copiedVerificationMessageID == rowID {
+                if isCurrentToken && self.activeCopyMessageID == rowID {
                     self.showMenuBarCopyFeedback("已复制 \(copiedCode) · 已标为已读", messageID: rowID, isError: false)
                 }
                 self.refreshNow()
@@ -993,7 +1020,9 @@ final class AppViewModel: ObservableObject {
                 }
                 self.finishReadOverride(rowID: rowID, token: readToken, succeeded: false, fallbackIsRead: false)
                 if isCurrentToken {
-                    self.showMenuBarCopyFeedback("已复制 \(copiedCode) · 标已读失败", messageID: rowID, isError: true)
+                    if self.activeCopyMessageID == rowID {
+                        self.showMenuBarCopyFeedback("已复制 \(copiedCode) · 标已读失败", messageID: rowID, isError: true)
+                    }
                     self.showToast("标记已读失败：请在系统设置 → 自动化中允许控制「邮件」")
                 }
                 self.refreshNow()
@@ -1062,15 +1091,16 @@ final class AppViewModel: ObservableObject {
                   self.reader === activeReader else {
                 return
             }
+            if self.localListMutationVersion != mutationVersionAtStart {
+                self.refreshMenuBarUnreadPreview()
+                return
+            }
             for item in parsedResults {
+                guard !self.pendingRemovedIDs.contains(item.id) else { continue }
                 // Never negative-cache `.partial.emlx` so full downloaded bodies are parsed once available.
                 if item.code != nil || !item.isPartial {
                     self.cacheVerificationCode(item.code, for: item.id)
                 }
-            }
-            if self.localListMutationVersion != mutationVersionAtStart {
-                self.refreshMenuBarUnreadPreview()
-                return
             }
             let liveCandidates = candidates.filter { !self.pendingRemovedIDs.contains($0.id) }
             self.commitMenuBarVerificationCodes(

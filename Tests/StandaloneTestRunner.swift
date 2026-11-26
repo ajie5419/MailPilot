@@ -1097,6 +1097,7 @@ struct StandaloneTestRunner {
         assertEqual(EmlxParser.extractVerificationCode(from: "登录提醒842916是您的登录验证码"), "842916", "Chinese code-before-keyword without space before digits")
         assertEqual(EmlxParser.extractVerificationCode(from: "Your GitHub verification code: 709412"), "709412", "English keyword-before-code")
         assertEqual(EmlxParser.extractVerificationCode(from: "492817 is your OpenAI verification code."), "492817", "English code-before-keyword")
+        assertEqual(EmlxParser.extractVerificationCode(from: "492817 is your Microsoft Entra ID verification code."), "492817", "English code-before-keyword with 3-word brand")
         assertEqual(EmlxParser.extractVerificationCode(from: "19.2026 is your order code."), nil, "Rejects decimal/order code false positive")
         assertEqual(EmlxParser.extractVerificationCode(from: "123456 is your ZIP code."), nil, "Rejects ZIP code false positive")
         let redosPayload = "123456 " + String(repeating: " ", count: 8000) + "is your verification"
